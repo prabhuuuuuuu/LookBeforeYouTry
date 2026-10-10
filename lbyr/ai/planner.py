@@ -752,6 +752,21 @@ class QwenPlanner:
         prompt = build_planner_prompt(request, bbox_scale=scale)
         return self._run(prompt, image, max_new_tokens, max_time_s)
 
+    def generate_task(
+        self, prompt: str, image_bgr: np.ndarray | None, max_new_tokens: int, max_time_s: float
+    ) -> str:
+        """lbyr.demo language prompting ONLY (arm idle): free-form ``prompt`` + overhead image
+        (bounded to ``cfg.max_image_pixels``), greedy. Call via
+        :func:`lbyr.ai.task_planner.plan_task` (hard timeout + strict parse)."""
+        image: Any | None = None
+        if image_bgr is not None:
+            image = bgr_to_pil(image_bgr)
+            scale = self._image_scale(PlanRequest("", [], image_bgr))
+            if scale != 1.0:
+                w, h = image.size
+                image = image.resize((max(28, round(w * scale)), max(28, round(h * scale))))
+        return self._run(prompt, image, max_new_tokens, max_time_s)
+
     def language_prompt_for(self, request: PlanRequest) -> str:
         return build_language_prompt(request)
 

@@ -19,3 +19,18 @@ poses:
   place_pre: [30.0, -12.0, -24.0, 0.0, 0.0, 0.0]
   place: [30.0, -30.0, -20.0, 0.0, 0.0, 0.0]
 zones: {}
+# Language prompting (python -m lbyr.demo, text box / --task): the planner picks
+# "from"/"to" among these NAMES; pre/grasp name taught poses above. Each location is a
+# pick source or a place target. description = what the planner reads: say where it is on
+# the table as the operator sees it (e.g. "left side of the table"). Optional
+# polygon_px (overhead pixels, >= 3 points) lets the block detector report the block's
+# location. To add location B: teach zone_B_pre / zone_B_grasp, then add an entry.
+locations:
+  A:
+    description: zone A, where the block starts (base turned -30 deg)
+    pre: zone_A_pre
+    grasp: zone_A_grasp
+  place:
+    description: the place zone, where the block is put down (base turned +30 deg)
+    pre: place_pre
+    grasp: place

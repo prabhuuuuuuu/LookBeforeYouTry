@@ -376,8 +376,13 @@ class DemoConfig:
     qwen_dtype: str = "bf16"
     # Demo intro plan ONLY (before the motion sequence, arm idle). Not an in-loop call.
     qwen_timeout_s: float = 30.0
+    # Language prompting (web text box / --task): one JSON move/none answer, under
+    # qwen_timeout_s. ~60 tokens for the JSON + one-sentence reason.
+    task_max_new_tokens: int = 96
     moondream_path: Path = Path("~/models/moondream2")
-    min_free_ram_mb: float = 1024.0  # after Moondream loads: below this, Qwen is freed
+    # After Moondream loads: below this, Qwen is unloaded after each plan and reloaded per
+    # instruction ("loading planner...", costs the logged Qwen load time each instruction).
+    min_free_ram_mb: float = 1024.0
     regrasp_step_pct: float = 15.0  # bible 13: +15% closure per re-grasp
     # --induce-slip: gripper angle of the FIRST grasp only, zero-relative degrees (poses.yaml
     # gripper: open -40, closed 0). Operator range "clearly loose": -20 .. -25.

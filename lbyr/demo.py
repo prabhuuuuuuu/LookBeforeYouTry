@@ -8,9 +8,19 @@
     python -m lbyr.demo --critic-off         # baseline: verify states pass through
     python -m lbyr.demo --dry-run            # MockArm + fake cameras + scripted Critic
 
-Keys at the prompts: Enter = run, s = run with induced slip, w = wrist snapshot
-(runs/<ts>/snap_<n>_{full,crop}.jpg, also GET /snapshot?crop=x0,y0,x1,y1), q = quit.
-Web view: http://<jetson>:8000 (overhead + wrist MJPEG, FSM state, plan, verdicts).
+    python -m lbyr.demo --task "move the block from A to the place zone"
+
+Language prompting: type an instruction in the web page (Run) or at the console, or pass
+--task (Enter runs it). Qwen2.5-VL-3B sees the overhead image, the instruction, the
+poses.yaml ``locations`` (name + description) and the detector's block location, and answers
+strict JSON move(from, to) | none (lbyr/ai/task_planner.py, 30 s, greedy). Planning happens
+BEFORE any motion; invalid / "none" -> nothing moves. While an episode runs, new
+instructions are ignored ("busy"). NOTE: anyone who can reach the web page can start motion.
+
+Keys (console, between episodes): Enter = run, s = run with induced slip, w = wrist snapshot
+(runs/<ts>/snap_<n>_{full,crop}.jpg, also GET /snapshot?crop=x0,y0,x1,y1), q = quit, any
+other text = an instruction.
+Web view: http://<jetson>:8000 (overhead + wrist MJPEG, instruction box, state, plan, verdicts).
 
 Sequence (one ``m`` per segment, DONE awaited via the MotionController, PP-1):
 home -> zone_A_pre -> zone_A_grasp -> close -> VERIFY_GRASP -> lift (zone_A_pre) ->
@@ -30,6 +40,8 @@ import gc
 import glob
 import json
 import logging
+import queue
+import select
 import sys
 import threading
 import time
@@ -52,6 +64,14 @@ from lbyr.ai.planner import (
     plan_demo_intro,
     plan_with_timeout,
 )
+from lbyr.ai.task_planner import (
+    UNKNOWN,
+    RulesTaskPlanner,
+    TaskPlanResult,
+    build_task_prompt,
+    clean_instruction,
+    plan_task,
+)
 from lbyr.arm.calib import JointsCalib, load_joints, mock_joints
 from lbyr.arm.interface import ArmInterface
 from lbyr.config import (
@@ -62,10 +82,11 @@ from lbyr.config import (
     mock_profile,
     require,
 )
-from lbyr.errors import CalibrationError, LBYRError
+from lbyr.errors import CalibrationError, LBYRError, PlanValidationError
 from lbyr.log_setup import setup_logging
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor, make_record, read_system_ram
 from lbyr.motion.controller import FAULT, MotionController
+from lbyr.motion.taught import point_in_polygon
 from lbyr.perception.buffers import LatestFrameBuffer
 from lbyr.perception.detector import Detection
 from lbyr.perception.overhead import FakeObject, FakeOverheadCamera, FakeScene, RGBDFrame
@@ -84,6 +105,24 @@ class DemoAbort(LBYRError):
 
 # ------------------------------------------------------------------ poses
 @dataclass(frozen=True)
+class Location:
+    """Named table location (poses.yaml ``locations.<name>``): pick source or place target.
+    ``pre`` / ``grasp`` name taught poses; ``polygon_px`` (optional, overhead pixels) lets
+    the block detector say where the block is."""
+
+    name: str
+    description: str
+    pre: str
+    grasp: str
+    polygon_px: tuple[tuple[float, float], ...] | None = None
+
+
+# The default episode (Enter, no instruction): zone A -> place, the original pose names.
+DEFAULT_SRC = Location("A", "", "zone_A_pre", "zone_A_grasp")
+DEFAULT_DST = Location("place", "", "place_pre", "place")
+
+
+@dataclass(frozen=True)
 class DemoPoses:
     """Taught poses in ZERO-RELATIVE degrees (poses.yaml / arm_gui slider values)."""
 
@@ -91,6 +130,7 @@ class DemoPoses:
     open_deg: float
     closed_deg: float
     place_polygon_px: tuple[tuple[float, float], ...] | None = None
+    locations: dict[str, Location] = field(default_factory=dict)
 
     def gripper_deg(self, closure_pct: float) -> float:
         """0 % = open_deg, 100 % = closed_deg (closed on the block); > 100 % squeezes further
@@ -130,6 +170,7 @@ def load_demo_poses(path: Path) -> DemoPoses:
         float(g["open_deg"]),
         float(g["closed_deg"]),
         tuple((float(a), float(b)) for a, b in poly) if poly else None,
+        parse_locations(data.get("locations"), poses, path),
     )
     if p.gripper_deg(130.0) == p.closed_deg:
         log.info(
@@ -140,6 +181,38 @@ def load_demo_poses(path: Path) -> DemoPoses:
     return p
 
 
+def parse_locations(
+    raw: Any, poses: dict[str, tuple[float, ...]], path: Path | None = None
+) -> dict[str, Location]:
+    """poses.yaml ``locations``: ``<name>: {description, pre, grasp, polygon_px?}``; pre /
+    grasp must name taught poses. Missing section: A and place from the original poses."""
+    if not raw:
+        return {loc.name: loc for loc in (DEFAULT_SRC, DEFAULT_DST)}
+    if not isinstance(raw, dict):
+        raise CalibrationError(f"{path}: locations must be a mapping name -> {{pre, grasp}}")
+    out: dict[str, Location] = {}
+    for name, v in raw.items():
+        v = v or {}
+        bad = [k for k in ("pre", "grasp") if v.get(k) not in poses]
+        if bad:
+            what = ", ".join(f"{k}={v.get(k)!r}" for k in bad)
+            raise CalibrationError(f"{path}: locations.{name}: {what} is not a taught pose")
+        poly = v.get("polygon_px")
+        if poly is not None and len(poly) < 3:
+            raise CalibrationError(f"{path}: locations.{name}.polygon_px needs >= 3 points")
+        desc = str(v.get("description") or "").strip()
+        if not desc:
+            log.warning("poses.yaml locations.%s has no description (the planner sees none)", name)
+        out[str(name)] = Location(
+            str(name),
+            desc,
+            str(v["pre"]),
+            str(v["grasp"]),
+            tuple((float(a), float(b)) for a, b in poly) if poly else None,
+        )
+    return out
+
+
 def mock_demo_poses() -> DemoPoses:
     """SIMULATION-ONLY (FAKE) poses for --dry-run."""
     fake: dict[str, tuple[float, ...]] = {
@@ -148,8 +221,15 @@ def mock_demo_poses() -> DemoPoses:
         "zone_A_grasp": (15.0, 25.0, 55.0, 50.0, 0.0, 0.0),
         "place_pre": (-25.0, 10.0, 60.0, 40.0, 0.0, 0.0),
         "place": (-25.0, 25.0, 55.0, 50.0, 0.0, 0.0),
+        "zone_B_pre": (40.0, 10.0, 60.0, 40.0, 0.0, 0.0),
+        "zone_B_grasp": (40.0, 25.0, 55.0, 50.0, 0.0, 0.0),
     }
-    return DemoPoses(fake, open_deg=-40.0, closed_deg=0.0)  # same gripper map as the arm
+    locs = {
+        "A": replace(DEFAULT_SRC, description="FAKE: left side of the table"),
+        "B": Location("B", "FAKE: back of the table", "zone_B_pre", "zone_B_grasp"),
+        "place": replace(DEFAULT_DST, description="FAKE: right side of the table"),
+    }
+    return DemoPoses(fake, open_deg=-40.0, closed_deg=0.0, locations=locs)  # arm's gripper map
 
 
 # ------------------------------------------------------------------ live status (web panel)
@@ -165,6 +245,8 @@ class DemoStatus:
     outcome: str | None = None
     episode: int = 0
     mode: str = ""
+    busy: bool = False  # an episode is queued / running: new instructions are ignored
+    task: str = ""  # the instruction being run ("" = default episode)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set(self, **kw: Any) -> None:
@@ -428,17 +510,29 @@ body{background:#111;color:#ddd;font:14px monospace;margin:10px}
 img{width:49%;border:1px solid #444}#st{font-size:28px;color:#4f4}
 .box{border:1px solid #444;padding:6px;margin:6px 0;white-space:pre-wrap}
 .SLIPPING,.EMPTY,.ABORT{color:#f55}.GRASPED,.DONE{color:#4f4}.OCCLUDED,.TIMEOUT{color:#fa0}
+input{background:#222;color:#eee;border:1px solid #555;font:16px monospace;width:60%}
+button{font:16px monospace}#tmsg{color:#fa0}
 </style></head><body><img src="/overhead.mjpg"><img src="/wrist.mjpg">
+<div><input id="task" placeholder="e.g. move the block from A to the place zone"
+maxlength="300"> <button id="go" onclick="runTask()">Run</button> <span id="tmsg"></span></div>
 <div><a href="/snapshot" target="_blank" style="color:#8cf">snapshot</a> &nbsp;
 <span id="mode"></span></div><div>State: <span id="st">?</span> &nbsp; closure <span
 id="cl"></span> &nbsp; RAM <span id="ram"></span></div><div class="box" id="plan"></div>
 <div class="box" id="ver"></div>
 <div class="box" id="rec"></div><div class="box" id="ev"></div><script>
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function runTask(){try{const r=await fetch('/task',{method:'POST',
+headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:task.value})});
+const j=await r.json();tmsg.textContent=j.busy?'busy: episode running, ignored':
+(j.error?'error: '+j.error:'accepted')}catch(e){tmsg.textContent='error: '+e}}
+task.addEventListener('keydown',e=>{if(e.key==='Enter')runTask()});
 async function tick(){try{const s=await (await fetch('/state.json')).json();
+go.disabled=s.busy;if(s.busy)tmsg.textContent='busy: '+(s.task||'default episode');
+else if(tmsg.textContent.startsWith('busy'))tmsg.textContent='ready';
 st.textContent=s.state+(s.outcome?' ('+s.outcome+')':'');st.className=s.state;
 mode.textContent=s.mode;cl.textContent=s.closure_pct==null?'-':s.closure_pct.toFixed(0)+'%';ram.textContent=s.ram;
 const p=s.plan||{};plan.innerHTML='<b>PLAN</b> ['+esc(p.backend||'-')+'] '+
+(p.instruction?'instruction: '+esc(p.instruction)+'\\n':'')+
 esc(p.note||'')+'\\nraw: '+esc(p.raw||'-')+'\\nparsed: '+esc(p.parsed||'-');
 ver.innerHTML='<b>CRITIC</b>\\n'+s.verdicts.map(v=>esc(v.state)+': <span class="'+
 v.verdict+'">'+v.verdict+'</span> ('+v.latency_ms.toFixed(0)+' ms) raw='+esc(v.raw)).join('\\n');
@@ -457,9 +551,11 @@ class DemoWeb:
         status: DemoStatus,
         frames: dict[str, Callable[[], tuple[int, np.ndarray] | None]],
         actions: dict[str, Callable[[dict[str, str]], dict[str, Any]]] | None = None,
+        posts: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] | None = None,
     ) -> None:
         web = self
         acts: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = actions or {}
+        post_acts: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = posts or {}
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, fmt: str, *args: Any) -> None:
@@ -482,6 +578,29 @@ class DemoWeb:
                     self._send(json.dumps(out).encode(), "application/json")
                 else:
                     self.send_error(404)
+
+            def do_POST(self) -> None:  # noqa: N802 (stdlib name)
+                """JSON body (or form-encoded) -> posts[path] -> JSON reply. Body <= 4 KB."""
+                path = self.path.split("?")[0]
+                if path[1:] not in post_acts:
+                    self.send_error(404)
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > 4096:
+                    self.send_error(413)
+                    return
+                raw = self.rfile.read(n).decode("utf-8", "replace")
+                try:
+                    if "json" in (self.headers.get("Content-Type") or ""):
+                        body = json.loads(raw or "{}")
+                    else:
+                        body = {k: v[0] for k, v in parse_qs(raw).items()}
+                    if not isinstance(body, dict):
+                        raise ValueError("body must be a JSON object")
+                    out = post_acts[path[1:]](body)
+                except Exception as e:
+                    out = {"error": str(e)}
+                self._send(json.dumps(out).encode(), "application/json")
 
             def _send(self, body: bytes, ctype: str) -> None:
                 self.send_response(200)
@@ -560,6 +679,10 @@ class Rig:
     stoppers: list[Callable[[], None]] = field(default_factory=list)
     wrist_fresh: Callable[[], np.ndarray | None] | None = None  # on-demand decode (real)
     preprocess: Callable[[np.ndarray], np.ndarray] | None = None  # Critic dewarp (if any)
+    # Qwen RAM policy: factory set = Qwen mode; keep False = unload after each plan and
+    # reload per instruction (free RAM < DemoConfig.min_free_ram_mb with Moondream loaded).
+    qwen_factory: Callable[[], QwenPlanner] | None = None
+    qwen_keep: bool = True
 
     def wrist_frame(self) -> np.ndarray | None:
         """Newest full wrist frame: decoded on demand on the real Trinet."""
@@ -581,6 +704,7 @@ class Demo:
         self.episode_id = ""
         self.planner_ms: float | None = None
         self.frame_n = 0
+        self.end_fields: dict[str, Any] = {}  # instruction / parsed action for episode_end
 
     # ---- logging
     def rec(self, event: str, **kw: Any) -> None:
@@ -696,6 +820,110 @@ class Demo:
                 return verdict
         return verdict
 
+    # ---- planner residency (DemoConfig.min_free_ram_mb policy)
+    def acquire_qwen(self) -> QwenPlanner | None:
+        """Loaded Qwen, reloading it if the RAM policy unloaded it. Raises on load failure."""
+        r = self.r
+        if r.qwen is not None or r.qwen_factory is None:
+            return r.qwen
+        self.s.set(plan={"backend": "qwen", "note": "loading planner…"})
+        self.s.event("loading planner… (Qwen2.5-VL-3B, unloaded to keep RAM for Moondream)")
+        r.qwen = r.qwen_factory()
+        ram(self.s, "after planner reload")
+        return r.qwen
+
+    def release_qwen(self) -> None:
+        r = self.r
+        if r.qwen is not None and r.qwen_factory is not None and not r.qwen_keep:
+            r.qwen = None
+            free_torch("Qwen2.5-VL (reloaded per instruction)")
+            ram(self.s, "after planner unload")
+
+    def block_location(self, frame: RGBDFrame | None) -> str:
+        """The detector's block location: the location whose polygon_px contains the block
+        centre, else "unknown" (no frame, not detected, or outside every polygon)."""
+        if frame is None:
+            return UNKNOWN
+        try:
+            det = next((x for x in self.r.detect(frame) if x.id == BLOCK_ID), None)
+        except Exception as e:
+            self.s.event(f"block detector failed ({e})", logging.WARNING)
+            return UNKNOWN
+        if det is None:
+            return UNKNOWN
+        u, v = det.centroid
+        for loc in self.r.poses.locations.values():
+            if loc.polygon_px and point_in_polygon(u, v, loc.polygon_px):
+                return loc.name
+        return UNKNOWN
+
+    # ---- language prompting: instruction -> move(from, to) | none (arm idle, BEFORE motion)
+    def plan_task(self, instruction: str) -> TaskPlanResult:
+        r, d = self.r, self.r.dcfg
+        self.state("PLAN", f"instruction: {instruction}")
+        item = r.overhead.get() if r.overhead is not None else None
+        frame = item.value if item is not None else None
+        image = frame.color if frame is not None else None
+        if image is not None:
+            self.frame(image, "task_overhead")
+        block_at = self.block_location(frame)
+        locs = r.poses.locations
+        res: TaskPlanResult | None = None
+        qwen: QwenPlanner | None = None
+        try:
+            qwen = self.acquire_qwen()
+        except Exception as e:
+            log.exception("planner load failed")
+            res = TaskPlanResult("qwen", "", "", None, f"planner load failed: {e}", 0.0)
+        if res is None and qwen is not None:
+            prompt = build_task_prompt(
+                instruction,
+                {n: x.description for n, x in locs.items()},
+                block_at,
+                image is not None,
+            )
+            self.s.set(plan={"backend": "qwen", "instruction": instruction,
+                             "note": "Qwen2.5-VL-3B thinking…"})  # fmt: skip
+            q, n, t = qwen, d.task_max_new_tokens, max(1.0, d.qwen_timeout_s - 1.0)
+            res = plan_task(
+                lambda: q.generate_task(prompt, image, n, t), locs, d.qwen_timeout_s, "qwen", prompt
+            )
+            self.release_qwen()
+        elif res is None:  # --planner rules / rehearsal / dry-run: no model
+            rules = RulesTaskPlanner()
+            res = plan_task(
+                lambda: rules.generate(instruction, locs, block_at),
+                locs,
+                d.qwen_timeout_s,
+                "rules",
+                "(rules planner, no model)",
+            )
+        self.planner_ms = res.latency_ms
+        parsed = res.action.to_dict() if res.action is not None else None
+        why = res.error or (res.action.reason if res.action is not None else "")
+        self.s.set(
+            plan={
+                "backend": res.backend,
+                "instruction": instruction,
+                "note": f"{why} ({res.latency_ms:.0f} ms; block at: {block_at})",
+                "raw": res.raw_text or "-",
+                "parsed": json.dumps(parsed) if parsed is not None else f"REJECTED: {res.error}",
+            }
+        )
+        level = logging.ERROR if res.error else logging.INFO
+        self.s.event(f"task plan [{res.backend}]: {json.dumps(parsed) if parsed else why}", level)
+        self.rec(
+            "task_plan",
+            instruction=instruction,
+            planner=res.backend,
+            prompt=res.prompt,
+            raw_text=res.raw_text,
+            parsed_action=parsed,
+            plan_error=res.error,
+            block_at=block_at,
+        )
+        return res
+
     # ---- plan (once per episode, arm idle at home)
     def plan(self) -> PlanResult:
         r, d = self.r, self.r.dcfg
@@ -726,9 +954,15 @@ class Demo:
         req = PlanRequest(d.instruction, dets, image)
         qwen_raw = ""
         why = "rules planner (--no-planner or Qwen not loaded)"
-        if r.qwen is not None:
+        try:
+            qwen = self.acquire_qwen()
+        except Exception as e:
+            log.exception("planner load failed")
+            qwen, why = None, f"planner load failed ({e}) -> rules planner"
+        if qwen is not None:
             self.s.set(plan={"backend": "qwen", "note": "Qwen2.5-VL-3B thinking..."})
-            res = plan_demo_intro(r.qwen, req, d.qwen_timeout_s)
+            res = plan_demo_intro(qwen, req, d.qwen_timeout_s)
+            self.release_qwen()
             self.rec("reasoning_trace", plan_error=res.error, trace=_trace(res), planner="qwen")
             if res.chain is not None:
                 return self.show_plan(res, "qwen", "Qwen2.5-VL-3B OK", note)
@@ -759,23 +993,40 @@ class Demo:
         return res
 
     # ---- the episode
-    def run(self, induce_slip: bool) -> bool:
+    def run(self, induce_slip: bool, instruction: str | None = None) -> bool:
+        """One episode. ``instruction`` (language prompting): plan FIRST with the arm idle;
+        invalid output or "none" -> nothing moves. None: the default A -> place episode."""
         r, d = self.r, self.r.dcfg
         self.episode_id = time.strftime("%Y%m%d-%H%M%S")
         self.s.set(
             verdicts=[], recovery=[], outcome=None, closure_pct=0.0, episode=self.s.episode + 1
         )
-        self.rec("episode_start", induce_slip=induce_slip, instruction=d.instruction)
+        self.end_fields = {"instruction": instruction or d.instruction}
+        self.rec("episode_start", induce_slip=induce_slip, instruction=instruction or d.instruction)
+        src, dst = DEFAULT_SRC, DEFAULT_DST
+        if instruction is not None:
+            task = self.plan_task(instruction)
+            act = task.action
+            self.end_fields.update(
+                parsed_action=act.to_dict() if act is not None else None, raw_text=task.raw_text
+            )
+            if act is None or act.action != "move" or act.src is None or act.dst is None:
+                outcome = "rejected" if act is None else "none"
+                self.finish(outcome, task.error or (act.reason if act is not None else ""))
+                return False
+            src, dst = r.poses.locations[act.src], r.poses.locations[act.dst]
+            self.s.event(f"MOVE {src.name} -> {dst.name}: {act.reason}")
         closure = 0.0
         try:
             self.state("HOME")
             self.pose("home", 0.0)
-            res = self.plan()
-            if res.chain is None:
-                raise DemoAbort(f"no valid plan ({res.error})")
-            self.state("APPROACH")
-            self.pose("zone_A_pre", 0.0)
-            self.pose("zone_A_grasp", 0.0)
+            if instruction is None:
+                res = self.plan()
+                if res.chain is None:
+                    raise DemoAbort(f"no valid plan ({res.error})")
+            self.state("APPROACH", f"{src.name} -> {dst.name}")
+            self.pose(src.pre, 0.0)
+            self.pose(src.grasp, 0.0)
             base = 100.0  # closed_deg = "closed on the block"
             closure = base
             if induce_slip:
@@ -793,7 +1044,7 @@ class Demo:
                 v = self.verify("VERIFY_GRASP")
                 if v is Verdict.GRASPED:
                     self.state("LIFT")
-                    self.pose("zone_A_pre", closure)
+                    self.pose(src.pre, closure)
                     v = self.verify("VERIFY_HOLD")
                     if v is Verdict.GRASPED:
                         break
@@ -807,14 +1058,14 @@ class Demo:
                 self.s.add("recovery", step)
                 self.state("RECOVER", step)
                 self.rec("recover", action=step, attempt=regrasps)
-                at_grasp = r.poses.poses["zone_A_grasp"][:GRIPPER_INDEX]
+                at_grasp = r.poses.poses[src.grasp][:GRIPPER_INDEX]
                 if not np.allclose(self.q[:GRIPPER_INDEX], at_grasp):
-                    self.pose("zone_A_grasp", self.s.closure_pct or 0.0)  # back down, holding
+                    self.pose(src.grasp, self.s.closure_pct or 0.0)  # back down, holding
                 self.grip(0.0, "re-open")
             self.state("TRANSPORT")
-            self.pose("place_pre", closure)
+            self.pose(dst.pre, closure)
             self.state("PLACE")
-            self.pose("place", closure)
+            self.pose(dst.grasp, closure)
             self.grip(0.0, "release")
             self.state("HOME")
             self.pose("home", 0.0)
@@ -844,9 +1095,11 @@ class Demo:
         self.finish("abort", why)
 
     def finish(self, outcome: str, why: str = "") -> None:
-        self.s.set(outcome=outcome, state="DONE" if outcome == "success" else "ABORT")
+        """outcome: success | abort | none (planner declined) | rejected (invalid plan)."""
+        state = {"success": "DONE", "abort": "ABORT"}.get(outcome, "NO ACTION")
+        self.s.set(outcome=outcome, state=state)
         self.s.event(f"episode {outcome.upper()} {why}".strip())
-        self.rec("episode_end", outcome=outcome, report=why or None)
+        self.rec("episode_end", outcome=outcome, report=why or None, **self.end_fields)
 
 
 def _trace(res: PlanResult) -> dict[str, Any]:
@@ -1002,9 +1255,10 @@ def _build_real_rig(
     except Exception as e:
         status.event(f"block detector unavailable ({e})", logging.WARNING)
 
-    # models: Qwen first, plan later; Moondream next; free Qwen if RAM is short
+    # models: Qwen first, plan later; Moondream next; RAM short -> Qwen per instruction
     ram(status, "before model load")
     qwen: QwenPlanner | None = None
+    qwen_factory: Callable[[], QwenPlanner] | None = None
     if args.planner == "qwen":
         pcfg = replace(
             cfg.planner,
@@ -1012,9 +1266,14 @@ def _build_real_rig(
             model_path=dcfg.qwen_path.expanduser(),
             vl_dtype=dcfg.qwen_dtype,
         )
-        try:
+
+        def load_qwen() -> QwenPlanner:
             status.event("loading Qwen2.5-VL-3B (bf16)...")
-            qwen = QwenPlanner(pcfg)
+            return QwenPlanner(pcfg)
+
+        try:
+            qwen = load_qwen()
+            qwen_factory = load_qwen
         except Exception as e:
             log.exception("Qwen load failed")
             status.event(f"Qwen load failed ({e}): rules planner", logging.ERROR)
@@ -1029,14 +1288,20 @@ def _build_real_rig(
     elif args.critic == "scripted":
         backend = scripted_critic(args, dcfg)
     free = ram(status, f"after Critic ({args.critic}) setup")
+    keep = True
     if qwen is not None and free is not None and free < dcfg.min_free_ram_mb:
         status.event(
-            f"free RAM {free:.0f} MB < {dcfg.min_free_ram_mb:.0f} MB: freeing Qwen (rules plan)",
+            f"free RAM {free:.0f} MB < {dcfg.min_free_ram_mb:.0f} MB with the Critic loaded: "
+            "Qwen unloaded now, reloaded per instruction",
             logging.WARNING,
         )
+        keep = False
         qwen = None
         free_torch("Qwen2.5-VL")
-        ram(status, "after freeing Qwen")
+        ram(status, "after unloading Qwen")
+    elif qwen is not None:
+        f = "n/a" if free is None else f"{free:.0f} MB"
+        status.event(f"free RAM {f} (min {dcfg.min_free_ram_mb:.0f} MB): Qwen stays loaded")
     from lbyr.perception.wrist import build_wrist_preprocess
 
     item = wrist.buffer.get()
@@ -1047,6 +1312,10 @@ def _build_real_rig(
         backend, qwen, stoppers, pre,
     )  # fmt: skip
     rig.wrist_fresh = wrist.fresh
+    rig.qwen_factory, rig.qwen_keep = qwen_factory, keep
+    if qwen_factory is not None:
+        res = "resident" if keep else "reloaded per instruction"
+        status.set(mode=f"{status.mode} (Qwen {res})")
     return rig
 
 
@@ -1146,16 +1415,102 @@ class Snapshots:
         return out
 
 
-def ask(prompt: str, snaps: Snapshots) -> str:
-    """input() that handles 'w' (wrist snapshot) itself and asks again."""
-    while True:
-        ans = input(prompt).strip().lower()
-        if ans != "w":
-            return ans
-        try:
-            log.info("snapshot: %s", snaps.take())
-        except Exception as e:
-            log.error("snapshot failed: %s", e)
+QUIT = "__quit__"
+
+
+class Commands:
+    """Episode requests (web Run, keyboard, --task) -> the main thread, one at a time.
+    While one is queued or running, new submissions are refused ("busy")."""
+
+    def __init__(self, status: DemoStatus) -> None:
+        self.status = status
+        self.q: queue.Queue[tuple[str | None, bool] | str] = queue.Queue()
+        self._lock = threading.Lock()
+        self._busy = False
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def submit(self, instruction: str | None, induce_slip: bool = False) -> bool:
+        """``instruction`` None = the default A -> place episode. False = busy (ignored)."""
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+        self.status.set(busy=True, task=instruction or "")
+        self.q.put((instruction, induce_slip))
+        return True
+
+    def done(self) -> None:
+        with self._lock:
+            self._busy = False
+        self.status.set(busy=False)
+
+    def quit(self) -> None:
+        self.q.put(QUIT)
+
+
+class KeyboardInput:
+    """Operator keys, read in the MAIN thread between episodes with select() on stdin (no
+    input() thread: one blocked at exit can abort the interpreter). Lines typed during an
+    episode are discarded (busy). Enter = run (--task if given), s = default run with
+    induced slip, w = wrist snapshot, q = quit, anything else = an instruction."""
+
+    def __init__(self, cmds: Commands, snaps: Snapshots, task: str | None) -> None:
+        self.cmds, self.snaps, self.task = cmds, snaps, task
+        self.eof = False
+
+    def prompt(self) -> None:
+        run = f"run {self.task!r}" if self.task else "run A -> place"
+        log.info(
+            "[Enter] %s, [s] run with slip, [w] wrist snapshot, [q] quit, "
+            "or type an instruction (or use the web page)",
+            run,
+        )
+
+    def _line(self, timeout_s: float) -> str | None:
+        if self.eof:
+            time.sleep(timeout_s)
+            return None
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_s)
+        if not ready:
+            return None
+        line = sys.stdin.readline()
+        if line == "":
+            self.eof = True
+            log.warning("stdin closed: instructions from the web page only")
+            return None
+        return line.strip()
+
+    def drain(self) -> None:
+        while (line := self._line(0.0)) is not None:
+            log.warning("busy: ignored keyboard input %r typed during the episode", line)
+
+    def poll(self, timeout_s: float = 0.2) -> None:
+        ans = self._line(timeout_s)
+        if ans is None:
+            return
+        low = ans.lower()
+        if low == "q":
+            self.cmds.quit()
+        elif low == "w":
+            try:
+                log.info("snapshot: %s", self.snaps.take())
+            except Exception as e:
+                log.error("snapshot failed: %s", e)
+        elif low in ("", "s"):
+            if not self.cmds.submit(self.task if low == "" else None, low == "s"):
+                log.warning("busy: episode running, ignored")
+        else:
+            try:
+                ok = self.cmds.submit(clean_instruction(ans))
+            except PlanValidationError as e:
+                log.error("instruction refused: %s", e)
+                return
+            if not ok:
+                log.warning("busy: episode running, ignored")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1193,8 +1548,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--http-port", type=int, default=d.http_port)
     p.add_argument("--log-dir", type=Path, default=AppConfig().logging.episodes_dir)
     p.add_argument("--once", action="store_true", help="one episode, then exit")
+    p.add_argument(
+        "--task",
+        help='language instruction, e.g. "move the block from A to the place zone" (Enter runs '
+        "it; --dry-run runs it once)",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
+    if args.task is not None:
+        try:
+            args.task = clean_instruction(args.task)
+        except PlanValidationError as e:
+            p.error(f"--task: {e}")
     if args.no_planner or args.rehearsal or args.dry_run:
         args.planner = "rules"
     if args.critic is None:
@@ -1230,12 +1595,23 @@ def main(argv: list[str] | None = None) -> int:
             return get
 
         snaps = Snapshots(dcfg.snapshot_dir / time.strftime("%Y%m%d-%H%M%S"), rig_box)
+        cmds = Commands(status)
+
+        def web_task(body: dict[str, Any]) -> dict[str, Any]:
+            text = clean_instruction(str(body.get("instruction", "")))  # raises -> {"error"}
+            if not rig_box:
+                return {"error": "rig not ready"}
+            if not cmds.submit(text):
+                return {"busy": True}
+            return {"accepted": True, "instruction": text}
+
         web = DemoWeb(
             dcfg.http_host,
             dcfg.http_port,
             status,
             {"overhead": frame_of("overhead"), "wrist": frame_of("wrist")},
             {"snapshot": lambda q: snaps.take(q.get("crop"))},
+            {"task": web_task},
         )
         web.start()
         log.info("web view on http://%s:%d", dcfg.http_host, web.port)
@@ -1247,19 +1623,38 @@ def main(argv: list[str] | None = None) -> int:
             status.set(state="SETUP FAILED")
             status.event(f"setup refused: {e}", logging.ERROR)
             return 2
-        rig_box.append(rig)
         demo = Demo(rig)
+        rig_box.append(rig)
         once = args.once or args.dry_run
-        if not args.dry_run:
-            ask(f"Ready (web view on port {web.port}). [Enter] start, [w] wrist snapshot: ", snaps)
+        keys: KeyboardInput | None = None
+        if args.dry_run:  # no operator: run --task (or the default episode) once
+            cmds.submit(args.task, args.induce_slip)
+        else:  # nothing moves until Enter / an instruction (keyboard or web)
+            keys = KeyboardInput(cmds, snaps, args.task)
+            log.info("Ready (web view on port %d).", web.port)
+            keys.prompt()
+        first_slip, rc = args.induce_slip, 0
         while True:
-            ok = demo.run(args.induce_slip)
+            if keys is not None:
+                keys.poll(0.2)
+            try:
+                item = cmds.q.get(timeout=0.05 if keys is not None else 0.5)
+            except queue.Empty:
+                continue
+            if isinstance(item, str):  # QUIT
+                return rc
+            instruction, slip = item
+            try:
+                ok = demo.run(slip or first_slip, instruction)
+            finally:
+                first_slip = False
+                cmds.done()
+            rc = 0 if ok else 1
             if once:
-                return 0 if ok else 1
-            ans = ask("[Enter] run again, [s] again with slip, [w] snapshot, [q] quit: ", snaps)
-            if ans == "q":
-                return 0 if ok else 1
-            args.induce_slip = ans == "s"
+                return rc
+            if keys is not None:
+                keys.drain()
+                keys.prompt()
     except KeyboardInterrupt:
         log.warning("Ctrl-C: stopping the arm")
         if rig is not None:
