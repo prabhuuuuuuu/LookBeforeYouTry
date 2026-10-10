@@ -22,7 +22,7 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any
 
 from lbyr.config import NUM_JOINTS
 from lbyr.errors import ProtocolError
@@ -67,8 +67,8 @@ class StateResponse:
     status: str
 
 
-Command = Union[MoveCmd, TrajCmd, StateRequest, TorqueCmd, StopCmd]
-Message = Union[Command, StateResponse]
+Command = MoveCmd | TrajCmd | StateRequest | TorqueCmd | StopCmd
+Message = Command | StateResponse
 
 
 # ---------------------------------------------------------------- validation helpers
