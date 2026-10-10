@@ -113,6 +113,19 @@ def test_jammed_goes_straight_to_abort() -> None:
     assert "torque OFF" in result.report
 
 
+def test_link_fault_aborts_without_torque_off_or_safe_pose_move() -> None:
+    cfg = fast_cfg()
+    stack = build_mock_stack(cfg, HAPPY, critic_delay_s=0.01)
+    with stack:
+        stack.arm.set_link_dead(True)
+        result = stack.supervisor.run_episode(SPEC, timeout_s=30.0)
+    assert result.outcome == "abort" and result.failure is FailureClass.LINK
+    assert result.recoveries == 0
+    assert stack.arm.torque_on  # never released on a LINK fault (the arm would fall)
+    assert "LINK fault" in result.report and "no DONE" in result.report
+    assert len(stack.arm.moves) == 1  # no safe-pose segment after the fault
+
+
 def test_critic_off_baseline_passes_through() -> None:
     result, _ = run(HAPPY, critic_enabled=False)
     assert result.outcome == "success" and result.verdicts == []

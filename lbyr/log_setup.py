@@ -1,7 +1,7 @@
 """Non-blocking logging setup.
 
 All log records go through a ``QueueHandler`` so that ``logger.info(...)`` in any thread
-(including the 50 Hz motion streamer) only enqueues; the actual formatting and I/O run
+(including the motion controller) only enqueues; the actual formatting and I/O run
 on a ``QueueListener`` background thread.
 """
 

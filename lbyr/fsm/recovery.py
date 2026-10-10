@@ -11,7 +11,8 @@
 
 Software-added classes (NOT in the bible table; see docs/OPEN_QUESTIONS.md):
 CRITIC_UNAVAILABLE (TIMEOUT / no frame: re-query once), PLACE_FAILED, PLANNER_FAILED,
-PERCEPTION_FAILED, IK_FAILED (all 0 attempts -> ABORT).
+PERCEPTION_FAILED, IK_FAILED, LINK (bridge silent / ERR / write failed) (all 0 attempts ->
+ABORT).
 
 Interpretations (approved): "+15%" = +15 percentage points of closure, capped at 100;
 "wrist re-orient" = wrist roll; the 3rd SLIPPING step is unreachable while max = 2.
@@ -41,7 +42,8 @@ class FailureClass(str, Enum):
     PLACE_FAILED = "PLACE_FAILED"
     PLANNER_FAILED = "PLANNER_FAILED"
     PERCEPTION_FAILED = "PERCEPTION_FAILED"
-    IK_FAILED = "IK_FAILED"
+    IK_FAILED = "IK_FAILED"  # also: taught mode found no zone / pose for the target
+    LINK = "LINK"  # bridge: no DONE in time, ERR reply, serial write/read failed
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,7 @@ RECOVERY_TABLE: dict[FailureClass, RecoveryPolicy] = {
     FailureClass.PLANNER_FAILED: _abort_only("planner timeout / invalid JSON"),
     FailureClass.PERCEPTION_FAILED: _abort_only("no frame / no detections / no depth"),
     FailureClass.IK_FAILED: _abort_only("target unreachable"),
+    FailureClass.LINK: _abort_only("no DONE within predicted x 1.5 + 0.5 s, ERR, or I/O error"),
 }
 
 _VERDICT_MAP: dict[State, dict[Verdict, FailureClass | None]] = {

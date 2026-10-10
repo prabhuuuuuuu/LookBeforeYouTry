@@ -1,1 +1,1 @@
-"""IK, trapezoidal trajectories, and the 50 Hz motion streamer."""
+"""IK, trapezoidal trajectories (offline), and the motion controller (segment dispatcher)."""

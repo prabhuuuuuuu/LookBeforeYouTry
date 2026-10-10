@@ -83,9 +83,9 @@ def run_mock(args: argparse.Namespace) -> int:
     log.warning("MOCK MODE: simulated arm and cameras, FAKE geometry. No hardware is driven.")
     with stack:
         result = stack.supervisor.run_episode(EpisodeSpec(args.instruction))
-        stats = stack.streamer.stats()
+        stats = stack.motion.stats()
     log.info(
-        "Motion streamer: %d ticks, %d missed, jitter p50 %.2f ms / p99 %.2f ms / max %.2f ms",
+        "Motion poller: %d ticks, %d missed, jitter p50 %.2f ms / p99 %.2f ms / max %.2f ms",
         stats.ticks,
         stats.missed,
         stats.p50_ms,

@@ -2,14 +2,16 @@
 
 - Each state has an ``_enter_*`` (runs once) and an optional ``_tick_*`` (runs at 10 Hz).
   Both return ``None`` (stay) or ``(next_state, reason)``.
-- Motion: joint goals -> trapezoidal trajectories -> MotionStreamer (non-blocking hand-off).
-  Jam detection: bridge status, load threshold (if confirmed, A-4), commanded-vs-actual
-  position error, motion timeout.
+- Motion (PP-1): each joint goal is ONE segment handed to the MotionController (non-blocking);
+  the bridge firmware generates the trajectory and reports DONE. No DONE within the
+  predicted time x 1.5 + 0.5 s, an ERR reply or a serial error = LINK -> ABORT.
+  JAMMED: bridge status, and (only with measured feedback, i.e. the mock) load threshold
+  and measured-vs-commanded position error. The real arm has no feedback (OQ-5).
 - Verify states submit a Critic request and poll the verdict queue without blocking.
   INVALID (unparseable answer): re-query once with a fresh frame, then treat as OCCLUDED
   (logged as ``critic_invalid_retry``). TIMEOUT: re-query once, then ABORT.
 - PLAN calls the planner under its 3 s hard timeout. This blocks only the FSM thread
-  while the arm is idle; the streamer keeps holding position on its own thread.
+  while the arm is idle; the board holds position by itself.
 - Failures -> RECOVER(k) per the recovery table, else ABORT with a human-readable report.
 """
 
@@ -32,9 +34,8 @@ from lbyr.errors import IKError
 from lbyr.fsm.recovery import RECOVERY_TABLE, FailureClass, RecoveryBudget, classify
 from lbyr.fsm.states import VERIFY_STATES, State, next_in_pipeline
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor, make_record
+from lbyr.motion.controller import FAULT, MotionController
 from lbyr.motion.ik import CartesianTarget, IKSolver
-from lbyr.motion.streamer import MotionStreamer
-from lbyr.motion.trajectory import plan_capped
 from lbyr.perception.buffers import LatestValueBuffer
 from lbyr.perception.detector import Detection, Detector
 from lbyr.perception.geometry import locate_in_base
@@ -62,7 +63,7 @@ class EpisodeSpec:
 @dataclass
 class SupervisorDeps:
     arm: ArmInterface
-    streamer: MotionStreamer
+    motion: MotionController
     ik: IKSolver
     planner: Planner
     detector: Detector
@@ -139,8 +140,7 @@ class Supervisor:
         # motion bookkeeping
         self._goals: list[np.ndarray] = []
         self._goal_idx = 0
-        self._traj_id = -1
-        self._motion_deadline = 0.0
+        self._seg_id = -1
         # verify bookkeeping
         self._pending_rid: int | None = None
         self._verify_deadline = 0.0
@@ -192,7 +192,7 @@ class Supervisor:
             spec.instruction,
             "ON" if self.d.critic else "OFF",
         )
-        self.d.streamer.set_output_enabled(True)
+        self.d.motion.set_output_enabled(True)
         self.d.arm.torque(True)
         self._record("episode_start")
         period = 1.0 / self.cfg.fsm_rate_hz
@@ -473,33 +473,53 @@ class Supervisor:
         c = self.ctx
         self._goals = []
         if c.failure is FailureClass.JAMMED:
-            self.d.streamer.set_output_enabled(False)
+            self.d.motion.set_output_enabled(False)
             self.d.arm.stop()
             self.d.arm.torque(False)
             c.abort_actions += ["stop", "torque OFF (JAMMED) - support the arm by hand"]
             self._finish("abort")
             return None
-        safe = self.cfg.arm.safe_pose_deg
+        if c.failure is FailureClass.LINK:
+            # The link is unreliable: do not plan more motion and do not release torque
+            # (the arm would fall). PWM servos hold the last pulse by themselves.
+            self.d.motion.set_output_enabled(False)
+            try:
+                self.d.arm.stop()
+                c.abort_actions.append("stop sent (x), best effort")
+            except Exception as e:
+                c.abort_actions.append(f"stop could not be sent ({e})")
+            c.abort_actions.append(
+                "LINK fault: servos hold the last pulse; check the USB cable / bridge, keep "
+                "the E-stop in reach, support the arm before power-off"
+            )
+            self._finish("abort")
+            return None
+        safe = self._safe_pose()
         if safe is None:
-            self.d.streamer.hold(self._setpoint().tolist())
+            self.d.arm.stop()  # the board brakes and holds
             c.abort_actions.append("holding position (safe pose unconfirmed, A-3)")
             self._finish("abort")
             return None
-        goal = np.asarray(safe, dtype=float)
-        goal[GRIPPER_INDEX] = self._setpoint()[GRIPPER_INDEX]  # do not drop a held object
         c.abort_actions.append("moving to safe pose")
-        self._start_motion([goal])
+        self._start_motion([safe])
         return None
 
     def _tick_abort(self) -> Next:
         if self.ctx.finished:
             return None
         res = self._motion_tick()
-        if res is not None:  # jam while retreating: stop + torque off
-            self.d.streamer.set_output_enabled(False)
-            self.d.arm.stop()
-            self.d.arm.torque(False)
-            self.ctx.abort_actions.append(f"safe-pose move failed ({res[1]}): stop, torque OFF")
+        if res is not None:  # jam / link fault while retreating: stop, hold
+            self.d.motion.set_output_enabled(False)
+            try:
+                self.d.arm.stop()
+            except Exception:
+                log.exception("stop failed")
+            jammed = "JAMMED" in res[1]
+            if jammed:
+                self.d.arm.torque(False)
+            self.ctx.abort_actions.append(
+                f"safe-pose move failed ({res[1]}): stop" + (", torque OFF" if jammed else "")
+            )
             self._finish("abort")
         elif not self._motion_active():
             self.ctx.abort_actions.append("reached safe pose, holding")
@@ -522,7 +542,16 @@ class Supervisor:
 
     # ================================================================ motion engine
     def _setpoint(self) -> np.ndarray:
-        return np.asarray(self.d.streamer.current().setpoint, dtype=float)
+        """Goal of the latest segment (the board's target), host deg."""
+        return np.asarray(self.d.motion.current().goal, dtype=float)
+
+    def _safe_pose(self) -> np.ndarray | None:
+        safe = self.cfg.arm.safe_pose_deg
+        if safe is None:
+            return None
+        goal = np.asarray(safe, dtype=float)
+        goal[GRIPPER_INDEX] = self._setpoint()[GRIPPER_INDEX]  # do not drop a held object
+        return goal
 
     def _start_motion(self, goals: list[np.ndarray]) -> None:
         self._goals = list(goals)
@@ -536,39 +565,30 @@ class Supervisor:
         self._goal_idx += 1
         if self._goal_idx >= len(self._goals):
             return
-        traj = plan_capped(
-            self._setpoint().tolist(),
-            self._goals[self._goal_idx].tolist(),
-            self.cfg.arm,
-            self.cfg.motion,
-        )
-        self._traj_id = self.d.streamer.command(traj)
-        self._motion_deadline = (
-            time.perf_counter() + traj.duration_s + self.cfg.motion.motion_timeout_margin_s
-        )
+        self._seg_id = self.d.motion.command(self._goals[self._goal_idx])
 
     def _motion_tick(self) -> Next:
-        """Advance multi-goal motion; return a JAMMED failure if anything looks wrong."""
+        """Advance multi-segment motion; return a LINK / JAMMED failure if anything is wrong."""
         if not self._motion_active():
             return None
+        ms = self.d.motion.current()
+        if ms.seg_id != self._seg_id:
+            return None  # not dispatched yet (next poll tick)
+        if ms.phase == FAULT:
+            return self._fail(FailureClass.LINK, ms.fault or "motion fault")
         st = self.d.arm.read_state()
-        actual = np.asarray(st.joints)
         if not st.ok:
             return self._fail(FailureClass.JAMMED, f"bridge status {st.status!r}")
-        thr = self.cfg.arm.jam_load_threshold
-        if thr is not None and st.load is not None and max(st.load) > thr:
-            return self._fail(FailureClass.JAMMED, f"load {max(st.load):.2f} > {thr}")
-        ss = self.d.streamer.current()
-        err = float(np.max(np.abs(actual - np.asarray(ss.setpoint))))
-        if err > self.cfg.motion.jam_position_error_deg:
-            return self._fail(FailureClass.JAMMED, f"position error {err:.1f} deg")
-        if ss.traj_id == self._traj_id and ss.done:
-            goal_err = float(np.max(np.abs(actual - self._goals[self._goal_idx])))
-            if goal_err <= self.cfg.motion.position_tolerance_deg:
-                self._next_goal()
-                return None
-        if time.perf_counter() > self._motion_deadline:
-            return self._fail(FailureClass.JAMMED, "motion timeout")
+        if st.feedback == "measured":  # mock / future sensors only (OQ-5: none on the arm)
+            thr = self.cfg.arm.jam_load_threshold
+            if thr is not None and st.load is not None and max(st.load) > thr:
+                return self._fail(FailureClass.JAMMED, f"load {max(st.load):.2f} > {thr}")
+            if st.commanded is not None:
+                err = float(np.max(np.abs(np.asarray(st.joints) - np.asarray(st.commanded))))
+                if err > self.cfg.motion.jam_position_error_deg:
+                    return self._fail(FailureClass.JAMMED, f"position error {err:.1f} deg")
+        if ms.done:
+            self._next_goal()
         return None
 
     # ================================================================ logging

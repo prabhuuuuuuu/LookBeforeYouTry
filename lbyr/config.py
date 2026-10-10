@@ -40,6 +40,8 @@ WRIST_ROLL_INDEX = 4
 DATA_DIR = Path("data")
 
 PLANNER_BACKENDS: tuple[str, ...] = ("qwen", "rules")
+MOTION_MODES: tuple[str, ...] = ("taught", "ik")
+CALIB_DIR = DATA_DIR / "calib"
 CRITIC_DTYPES: tuple[str, ...] = ("fp16", "bf16")
 MODEL_DTYPES: tuple[str, ...] = ("bf16", "fp16")
 # Language mode (demo intro): "qwen3_text" (Qwen3 LLM) | "qwen_vl" (Qwen2.5-VL, text-only)
@@ -69,19 +71,20 @@ class GripperConfig:
 @dataclass
 class ArmConfig:
     simulated: bool = False
-    servo_bus: str | None = None  # OQ-1: "serial" (Feetech-style) or "pwm", unconfirmed
-    servo_ids: tuple[int, ...] | None = None  # OQ-2: servo IDs, unconfirmed
-    servo_baud: int | None = None  # OQ-2: servo bus baud rate, unconfirmed
-    servo_voltage_v: float | None = None  # OQ-3: servo PSU voltage, unconfirmed. NEVER assume 5 V.
-    serial_port: str | None = None  # OQ-10: USB port plan (/dev/ttyACM0?), unconfirmed
-    host_baud: int | None = None  # Bridge firmware TBD; bible Section 6 says >= 115200
+    servo_bus: str | None = "pwm"  # OQ-1 closed (bible v1.3): PWM servos
+    servo_ids: tuple[int, ...] | None = None  # OQ-2: not applicable (PWM)
+    servo_baud: int | None = None  # OQ-2: not applicable (PWM)
+    servo_voltage_v: float | None = 6.0  # OQ-3 closed (bible v1.3): 6.0 V rail. NEVER 5 V.
+    serial_port: str | None = None  # OQ-10: XIAO device name (/dev/ttyACM*?), unconfirmed
+    host_baud: int | None = 115200  # A-5 closed: firmware Serial.begin(115200)
+    joints_path: Path = CALIB_DIR / "joints.yaml"  # zeros/signs, verify vs board `list`
     joint_min_deg: tuple[float, ...] | None = None  # OQ-4 / bible 3.1 #4: joint limits
     joint_max_deg: tuple[float, ...] | None = None  # OQ-4 / bible 3.1 #4: joint limits
     link_lengths_mm: tuple[float, ...] | None = None  # OQ-4: URDF / measured link lengths
-    feedback_readable: bool | None = None  # OQ-5: position/load feedback readable?, unconfirmed
+    feedback_readable: bool | None = False  # OQ-5 closed: no feedback (commanded only)
     max_joint_speed_deg_s: float | None = None  # A-1: servo max speed, unconfirmed
     max_joint_accel_deg_s2: float | None = None  # A-1: safe joint acceleration, unconfirmed
-    max_delta_per_tick_deg: float | None = None  # A-2: per-tick clamp (bridge + mock), unconfirmed
+    max_delta_per_tick_deg: float | None = None  # A-2: superseded by PP-1 (no streaming)
     safe_pose_deg: tuple[float, ...] | None = None  # A-3: safe/home pose, unconfirmed
     jam_load_threshold: float | None = None  # A-4 / OQ-5: load units + jam threshold, unconfirmed
     gripper: GripperConfig = field(default_factory=GripperConfig)
@@ -228,13 +231,20 @@ class CriticConfig:
 
 @dataclass
 class MotionConfig:
-    rate_hz: float = 50.0  # bible 11.4
+    """PP-1 (2026-10-10): the bridge firmware is the trajectory generator. The host sends ONE
+    ``m`` per motion segment and waits for ``DONE``; the motion thread only dispatches
+    segments and polls status (``q``) at ``poll_hz``."""
+
+    mode: str = "taught"  # "taught" (poses.yaml, demo path) | "ik" (needs OQ-4 + hand-eye)
+    poses_path: Path = CALIB_DIR / "poses.yaml"
+    poll_hz: float = 20.0  # status poll / segment dispatch rate
+    done_timeout_factor: float = 1.5  # DONE timeout = predicted x factor + margin -> LINK
+    done_timeout_margin_s: float = 0.5
+    rate_hz: float = 50.0  # bible 11.4; only used by motion/trajectory.py (offline planning)
     dev_speed_cap: float = 0.30  # bible 8: development speed cap 30%
     stage_speed_cap: float = 0.50  # bible 8: stage speed cap 50%
     stage_mode: bool = False
-    position_tolerance_deg: float = 2.0  # tuning: "arrived" tolerance
-    motion_timeout_margin_s: float = 2.0  # tuning: extra time beyond profile duration -> JAMMED
-    jam_position_error_deg: float = 10.0  # tuning: commanded-vs-actual error -> JAMMED
+    jam_position_error_deg: float = 10.0  # measured-vs-commanded error -> JAMMED (mock only)
     jitter_window: int = 2000  # number of recent ticks kept for jitter stats
     spin_margin_s: float = 0.0015  # final busy-wait window for deadline scheduling
 
@@ -249,8 +259,15 @@ class MotionConfig:
     def validate(self) -> None:
         if self.dev_speed_cap > 0.30 or self.stage_speed_cap > 0.50:
             raise ConfigError("Speed caps exceed bible Section 8 (dev 30%, stage 50%)")
-        if self.rate_hz <= 0:
-            raise ConfigError("rate_hz must be > 0")
+        if self.rate_hz <= 0 or self.poll_hz <= 0:
+            raise ConfigError("rate_hz and poll_hz must be > 0")
+        if self.mode not in MOTION_MODES:
+            raise ConfigError(f"motion.mode must be one of {MOTION_MODES}")
+        if self.done_timeout_factor < 1.0 or self.done_timeout_margin_s < 0.0:
+            raise ConfigError("DONE timeout must be >= the predicted duration")
+
+    def done_timeout_s(self, predicted_s: float) -> float:
+        return predicted_s * self.done_timeout_factor + self.done_timeout_margin_s
 
 
 @dataclass

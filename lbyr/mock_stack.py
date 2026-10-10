@@ -16,8 +16,8 @@ from lbyr.arm.mock_arm import MockArm
 from lbyr.config import AppConfig, mock_profile
 from lbyr.fsm.supervisor import Supervisor, SupervisorDeps
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor
+from lbyr.motion.controller import MotionController
 from lbyr.motion.ik import MockIK
-from lbyr.motion.streamer import MotionStreamer
 from lbyr.perception.overhead import FakeOverheadCamera, FakeScene
 from lbyr.perception.wrist import FakeWristCamera
 
@@ -46,7 +46,7 @@ def _make_dewarp(width: int, height: int) -> Callable[[np.ndarray], np.ndarray] 
 class MockStack:
     cfg: AppConfig
     arm: MockArm
-    streamer: MotionStreamer
+    motion: MotionController
     overhead: FakeOverheadCamera
     wrist: FakeWristCamera
     critic_backend: ScriptedCritic
@@ -62,14 +62,14 @@ class MockStack:
         self.vram.start()
         self.overhead.start()
         self.wrist.start()
-        self.streamer.start()
+        self.motion.start()
         if self.critic is not None:
             self.critic.start()
 
     def stop(self) -> None:
         if self.critic is not None:
             self.critic.stop()
-        self.streamer.stop()
+        self.motion.stop()
         self.wrist.stop()
         self.overhead.stop()
         self.vram.stop()
@@ -99,7 +99,7 @@ def build_mock_stack(
     cfg.validate()
     arm = MockArm(cfg.arm)
     assert cfg.arm.safe_pose_deg is not None
-    streamer = MotionStreamer(arm, cfg.motion, cfg.arm.safe_pose_deg)
+    motion = MotionController(arm, cfg.motion, cfg.arm.safe_pose_deg)
     scene = scene or FakeScene()
     overhead = FakeOverheadCamera(scene)
     w, h = cfg.cameras.wrist.width or 640, cfg.cameras.wrist.height or 480
@@ -113,7 +113,7 @@ def build_mock_stack(
     vram = VramMonitor(cfg.logging.tegrastats_interval_ms)
     deps = SupervisorDeps(
         arm=arm,
-        streamer=streamer,
+        motion=motion,
         ik=MockIK(cfg.arm),
         planner=FakePlanner(cfg.skills.default_closure_pct, cfg.skills.default_standoff_mm),
         detector=scene.detector(),
@@ -125,4 +125,4 @@ def build_mock_stack(
         vram=vram,
     )
     sup = Supervisor(cfg, deps)
-    return MockStack(cfg, arm, streamer, overhead, wrist, backend, critic, logger, vram, sup)
+    return MockStack(cfg, arm, motion, overhead, wrist, backend, critic, logger, vram, sup)

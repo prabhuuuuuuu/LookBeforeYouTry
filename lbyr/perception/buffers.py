@@ -1,7 +1,7 @@
 """Thread-safe latest-value buffers and a generic capture thread.
 
 A latest-value buffer holds exactly one item. Writers overwrite; readers never wait.
-This is how data is handed to time-critical consumers (e.g. the 50 Hz streamer) and
+This is how data is handed to time-critical consumers (e.g. the motion controller) and
 how camera frames are shared without unbounded queues.
 """
 
