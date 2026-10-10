@@ -10,7 +10,7 @@
 # sign           +1 / -1: host-frame direction vs firmware degrees (A-7, unconfirmed)
 # zero_pose_deg  host-frame angle at the zero pulse (A-7, unconfirmed; only IK needs it)
 # Taught-pose mode only needs zero_us. host_deg = zero_pose_deg + sign * firmware_deg.
-verified: false   # verified by: <name>, <date>
+verified: true   # verified by: sentrix, 2026-10-11 (matches board zeros)
 us_per_deg: 11.1111   # firmware US_PER_DEG = 1000/90
 joints:
   - {name: base_yaw,       zero_us: 1477, sign: 1, zero_pose_deg: 0.0}
