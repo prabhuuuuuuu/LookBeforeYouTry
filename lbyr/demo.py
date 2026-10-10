@@ -14,7 +14,10 @@ Language prompting: type an instruction in the web page (Run) or at the console,
 --task (Enter runs it). Qwen2.5-VL-3B sees the overhead image, the instruction, the
 poses.yaml ``locations`` (name + description) and the detector's block location, and answers
 strict JSON move(from, to) | none (lbyr/ai/task_planner.py, 30 s, greedy). Planning happens
-BEFORE any motion; invalid / "none" -> nothing moves. While an episode runs, new
+BEFORE any motion; invalid / "none" -> nothing moves. Location-like names that are not
+taught ("zone C") are refused before Qwen is called; location polygons (if defined) are
+drawn and labelled on Qwen's image. Qwen is loaded ONCE and stays resident (unloading
+does not return memory on the Jetson; a reload costs ~11 s). While an episode runs, new
 instructions are ignored ("busy"). NOTE: anyone who can reach the web page can start motion.
 
 Keys (console, between episodes): Enter = run, s = run with induced slip, w = wrist snapshot
@@ -36,16 +39,16 @@ Exit codes: 0 = DONE, 1 = ABORT, 2 = setup refused (hardware / calibration / mod
 from __future__ import annotations
 
 import argparse
-import gc
 import glob
 import json
 import logging
 import queue
+import re
 import select
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -213,6 +216,41 @@ def parse_locations(
     return out
 
 
+_NAMED = re.compile(r"\b(?:zone|location|area|spot|position|point)\s+([A-Za-z]|\d+)\b", re.I)
+_LETTER = re.compile(r"\b([A-HJ-Z])\b")  # a lone capital letter (not "I") names a location
+
+
+def unknown_locations(instruction: str, locations: Mapping[str, Location]) -> list[str]:
+    """Location-like names in the instruction ("zone C", "C", "area 3") that are NOT taught
+    locations (case-insensitive). Checked BEFORE Qwen: an unknown place never reaches it."""
+    known = {n.lower() for n in locations}
+    found = _NAMED.findall(instruction) + _LETTER.findall(instruction)
+    return list(dict.fromkeys(x for x in found if x.lower() not in known))
+
+
+def label_locations(image: np.ndarray, locations: Mapping[str, Location]) -> np.ndarray:
+    """Overhead image for Qwen with every location polygon outlined and its NAME in large
+    letters (Qwen cannot know which area is "A" otherwise). No polygons: ``image`` itself.
+    Cost: a few cv2 draw calls on a copy (< 2 ms)."""
+    polys = [(n, x.polygon_px) for n, x in locations.items() if x.polygon_px]
+    if not polys:
+        return image
+    import cv2  # lazy
+
+    out = image.copy()
+    scale = max(1.0, out.shape[1] / 640)
+    for name, poly in polys:
+        pts = np.round(np.asarray(poly)).astype(np.int32)
+        cv2.polylines(out, [pts], True, (0, 255, 255), max(2, round(2 * scale)))
+        cx, cy = pts.mean(axis=0)
+        font, fs, th = cv2.FONT_HERSHEY_SIMPLEX, 1.6 * scale, max(3, round(4 * scale))
+        (w, h), _ = cv2.getTextSize(name, font, fs, th)
+        org = (int(cx - w / 2), int(cy + h / 2))
+        cv2.putText(out, name, org, font, fs, (0, 0, 0), th + 4, cv2.LINE_AA)
+        cv2.putText(out, name, org, font, fs, (0, 255, 255), th, cv2.LINE_AA)
+    return out
+
+
 def mock_demo_poses() -> DemoPoses:
     """SIMULATION-ONLY (FAKE) poses for --dry-run."""
     fake: dict[str, tuple[float, ...]] = {
@@ -247,6 +285,8 @@ class DemoStatus:
     mode: str = ""
     busy: bool = False  # an episode is queued / running: new instructions are ignored
     task: str = ""  # the instruction being run ("" = default episode)
+    result: str = ""  # big line on the PLAN panel: SUCCESS ... / NONE: reason / ERROR: ...
+    result_kind: str = ""  # running | success | abort | none | rejected (CSS class)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set(self, **kw: Any) -> None:
@@ -511,7 +551,9 @@ img{width:49%;border:1px solid #444}#st{font-size:28px;color:#4f4}
 .box{border:1px solid #444;padding:6px;margin:6px 0;white-space:pre-wrap}
 .SLIPPING,.EMPTY,.ABORT{color:#f55}.GRASPED,.DONE{color:#4f4}.OCCLUDED,.TIMEOUT{color:#fa0}
 input{background:#222;color:#eee;border:1px solid #555;font:16px monospace;width:60%}
-button{font:16px monospace}#tmsg{color:#fa0}
+button{font:16px monospace}#tmsg{color:#fa0}button:disabled{opacity:.4}
+.big{font-size:26px;font-weight:bold;white-space:pre-wrap}.running{color:#8cf}
+.success{color:#4f4}.none{color:#fa0}.abort,.rejected{color:#f55}
 </style></head><body><img src="/overhead.mjpg"><img src="/wrist.mjpg">
 <div><input id="task" placeholder="e.g. move the block from A to the place zone"
 maxlength="300"> <button id="go" onclick="runTask()">Run</button> <span id="tmsg"></span></div>
@@ -521,7 +563,8 @@ id="cl"></span> &nbsp; RAM <span id="ram"></span></div><div class="box" id="plan
 <div class="box" id="ver"></div>
 <div class="box" id="rec"></div><div class="box" id="ev"></div><script>
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-async function runTask(){try{const r=await fetch('/task',{method:'POST',
+async function runTask(){if(go.disabled)return;go.disabled=true;
+try{const r=await fetch('/task',{method:'POST',
 headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:task.value})});
 const j=await r.json();tmsg.textContent=j.busy?'busy: episode running, ignored':
 (j.error?'error: '+j.error:'accepted')}catch(e){tmsg.textContent='error: '+e}}
@@ -531,7 +574,8 @@ go.disabled=s.busy;if(s.busy)tmsg.textContent='busy: '+(s.task||'default episode
 else if(tmsg.textContent.startsWith('busy'))tmsg.textContent='ready';
 st.textContent=s.state+(s.outcome?' ('+s.outcome+')':'');st.className=s.state;
 mode.textContent=s.mode;cl.textContent=s.closure_pct==null?'-':s.closure_pct.toFixed(0)+'%';ram.textContent=s.ram;
-const p=s.plan||{};plan.innerHTML='<b>PLAN</b> ['+esc(p.backend||'-')+'] '+
+const p=s.plan||{};plan.innerHTML=(s.result?'<div class="big '+esc(s.result_kind)+'">'+
+esc(s.result)+'</div>':'')+'<b>PLAN</b> planner: '+esc(p.backend||'-')+' &nbsp; '+
 (p.instruction?'instruction: '+esc(p.instruction)+'\\n':'')+
 esc(p.note||'')+'\\nraw: '+esc(p.raw||'-')+'\\nparsed: '+esc(p.parsed||'-');
 ver.innerHTML='<b>CRITIC</b>\\n'+s.verdicts.map(v=>esc(v.state)+': <span class="'+
@@ -679,10 +723,7 @@ class Rig:
     stoppers: list[Callable[[], None]] = field(default_factory=list)
     wrist_fresh: Callable[[], np.ndarray | None] | None = None  # on-demand decode (real)
     preprocess: Callable[[np.ndarray], np.ndarray] | None = None  # Critic dewarp (if any)
-    # Qwen RAM policy: factory set = Qwen mode; keep False = unload after each plan and
-    # reload per instruction (free RAM < DemoConfig.min_free_ram_mb with Moondream loaded).
-    qwen_factory: Callable[[], QwenPlanner] | None = None
-    qwen_keep: bool = True
+    no_qwen_why: str = "--planner rules"  # shown when the rules planner is used
 
     def wrist_frame(self) -> np.ndarray | None:
         """Newest full wrist frame: decoded on demand on the real Trinet."""
@@ -705,6 +746,7 @@ class Demo:
         self.planner_ms: float | None = None
         self.frame_n = 0
         self.end_fields: dict[str, Any] = {}  # instruction / parsed action for episode_end
+        self.move_desc = ""
 
     # ---- logging
     def rec(self, event: str, **kw: Any) -> None:
@@ -820,25 +862,6 @@ class Demo:
                 return verdict
         return verdict
 
-    # ---- planner residency (DemoConfig.min_free_ram_mb policy)
-    def acquire_qwen(self) -> QwenPlanner | None:
-        """Loaded Qwen, reloading it if the RAM policy unloaded it. Raises on load failure."""
-        r = self.r
-        if r.qwen is not None or r.qwen_factory is None:
-            return r.qwen
-        self.s.set(plan={"backend": "qwen", "note": "loading planner…"})
-        self.s.event("loading planner… (Qwen2.5-VL-3B, unloaded to keep RAM for Moondream)")
-        r.qwen = r.qwen_factory()
-        ram(self.s, "after planner reload")
-        return r.qwen
-
-    def release_qwen(self) -> None:
-        r = self.r
-        if r.qwen is not None and r.qwen_factory is not None and not r.qwen_keep:
-            r.qwen = None
-            free_torch("Qwen2.5-VL (reloaded per instruction)")
-            ram(self.s, "after planner unload")
-
     def block_location(self, frame: RGBDFrame | None) -> str:
         """The detector's block location: the location whose polygon_px contains the block
         centre, else "unknown" (no frame, not detected, or outside every polygon)."""
@@ -868,34 +891,42 @@ class Demo:
             self.frame(image, "task_overhead")
         block_at = self.block_location(frame)
         locs = r.poses.locations
-        res: TaskPlanResult | None = None
-        qwen: QwenPlanner | None = None
-        try:
-            qwen = self.acquire_qwen()
-        except Exception as e:
-            log.exception("planner load failed")
-            res = TaskPlanResult("qwen", "", "", None, f"planner load failed: {e}", 0.0)
-        if res is None and qwen is not None:
+        unknown = unknown_locations(instruction, locs)
+        qwen = r.qwen
+        if unknown:  # never ask Qwen about a place the arm has no taught poses for
+            err = (
+                f"unknown location {', '.join(repr(u) for u in unknown)}: valid names are "
+                f"{', '.join(locs)} (poses.yaml locations)"
+            )
+            res = TaskPlanResult("check", "", "", None, err, 0.0)
+        elif qwen is not None:
+            labelled = label_locations(image, locs) if image is not None else None
+            if labelled is not None and labelled is not image:
+                self.frame(labelled, "task_overhead_labelled")
             prompt = build_task_prompt(
                 instruction,
                 {n: x.description for n, x in locs.items()},
                 block_at,
                 image is not None,
+                labelled is not None and labelled is not image,
             )
             self.s.set(plan={"backend": "qwen", "instruction": instruction,
                              "note": "Qwen2.5-VL-3B thinking…"})  # fmt: skip
             q, n, t = qwen, d.task_max_new_tokens, max(1.0, d.qwen_timeout_s - 1.0)
             res = plan_task(
-                lambda: q.generate_task(prompt, image, n, t), locs, d.qwen_timeout_s, "qwen", prompt
+                lambda: q.generate_task(prompt, labelled, n, t),
+                locs,
+                d.qwen_timeout_s,
+                "qwen",
+                prompt,
             )
-            self.release_qwen()
-        elif res is None:  # --planner rules / rehearsal / dry-run: no model
+        else:  # --planner rules / rehearsal / dry-run / Qwen load failed: no model
             rules = RulesTaskPlanner()
             res = plan_task(
                 lambda: rules.generate(instruction, locs, block_at),
                 locs,
                 d.qwen_timeout_s,
-                "rules",
+                f"rules ({r.no_qwen_why})",
                 "(rules planner, no model)",
             )
         self.planner_ms = res.latency_ms
@@ -953,16 +984,10 @@ class Demo:
         image = frame.color if frame is not None else None
         req = PlanRequest(d.instruction, dets, image)
         qwen_raw = ""
-        why = "rules planner (--no-planner or Qwen not loaded)"
-        try:
-            qwen = self.acquire_qwen()
-        except Exception as e:
-            log.exception("planner load failed")
-            qwen, why = None, f"planner load failed ({e}) -> rules planner"
-        if qwen is not None:
+        why = f"rules planner ({r.no_qwen_why})"
+        if r.qwen is not None:
             self.s.set(plan={"backend": "qwen", "note": "Qwen2.5-VL-3B thinking..."})
-            res = plan_demo_intro(qwen, req, d.qwen_timeout_s)
-            self.release_qwen()
+            res = plan_demo_intro(r.qwen, req, d.qwen_timeout_s)
             self.rec("reasoning_trace", plan_error=res.error, trace=_trace(res), planner="qwen")
             if res.chain is not None:
                 return self.show_plan(res, "qwen", "Qwen2.5-VL-3B OK", note)
@@ -972,7 +997,7 @@ class Demo:
         rules = RuleBasedPlanner(100.0, r.cfg.skills.default_standoff_mm)
         res = plan_with_timeout(rules, req, r.cfg.planner)
         self.rec("reasoning_trace", plan_error=res.error, trace=_trace(res), planner="rules")
-        return self.show_plan(res, "rules", why, note, qwen_raw)
+        return self.show_plan(res, "rules fallback" if qwen_raw else "rules", why, note, qwen_raw)
 
     def show_plan(
         self, res: PlanResult, backend: str, why: str, note: str, raw_prefix: str = ""
@@ -999,9 +1024,16 @@ class Demo:
         r, d = self.r, self.r.dcfg
         self.episode_id = time.strftime("%Y%m%d-%H%M%S")
         self.s.set(
-            verdicts=[], recovery=[], outcome=None, closure_pct=0.0, episode=self.s.episode + 1
+            verdicts=[],
+            recovery=[],
+            outcome=None,
+            closure_pct=0.0,
+            episode=self.s.episode + 1,
+            result=f"RUNNING: {instruction or 'default episode A -> place'}",
+            result_kind="running",
         )
         self.end_fields = {"instruction": instruction or d.instruction}
+        self.move_desc = f"{DEFAULT_SRC.name} -> {DEFAULT_DST.name}"
         self.rec("episode_start", induce_slip=induce_slip, instruction=instruction or d.instruction)
         src, dst = DEFAULT_SRC, DEFAULT_DST
         if instruction is not None:
@@ -1015,6 +1047,7 @@ class Demo:
                 self.finish(outcome, task.error or (act.reason if act is not None else ""))
                 return False
             src, dst = r.poses.locations[act.src], r.poses.locations[act.dst]
+            self.move_desc = f"{src.name} -> {dst.name}"
             self.s.event(f"MOVE {src.name} -> {dst.name}: {act.reason}")
         closure = 0.0
         try:
@@ -1097,7 +1130,9 @@ class Demo:
     def finish(self, outcome: str, why: str = "") -> None:
         """outcome: success | abort | none (planner declined) | rejected (invalid plan)."""
         state = {"success": "DONE", "abort": "ABORT"}.get(outcome, "NO ACTION")
-        self.s.set(outcome=outcome, state=state)
+        head = {"success": "SUCCESS", "abort": "ABORT", "none": "NONE"}.get(outcome, "ERROR")
+        text = f"{head}: {self.move_desc}" if outcome == "success" else f"{head}: {why}"
+        self.s.set(outcome=outcome, state=state, result=text, result_kind=outcome)
         self.s.event(f"episode {outcome.upper()} {why}".strip())
         self.rec("episode_end", outcome=outcome, report=why or None, **self.end_fields)
 
@@ -1115,18 +1150,6 @@ def ram(status: DemoStatus, when: str) -> float | None:
     status.set(ram=f"{r.used_mb:.0f}/{r.total_mb:.0f} MB ({r.free_mb:.0f} free)")
     status.event(f"RAM {when}: {r.used_mb:.0f}/{r.total_mb:.0f} MB used, {r.free_mb:.0f} MB free")
     return r.free_mb
-
-
-def free_torch(what: str) -> None:
-    gc.collect()
-    try:
-        import torch  # lazy
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
-    log.info("freed %s", what)
 
 
 def build_dry_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatus) -> Rig:
@@ -1255,10 +1278,10 @@ def _build_real_rig(
     except Exception as e:
         status.event(f"block detector unavailable ({e})", logging.WARNING)
 
-    # models: Qwen first, plan later; Moondream next; RAM short -> Qwen per instruction
+    # models: Qwen once (RESIDENT for the whole session), then Moondream
     ram(status, "before model load")
     qwen: QwenPlanner | None = None
-    qwen_factory: Callable[[], QwenPlanner] | None = None
+    no_qwen_why = "--planner rules"
     if args.planner == "qwen":
         pcfg = replace(
             cfg.planner,
@@ -1266,16 +1289,12 @@ def _build_real_rig(
             model_path=dcfg.qwen_path.expanduser(),
             vl_dtype=dcfg.qwen_dtype,
         )
-
-        def load_qwen() -> QwenPlanner:
-            status.event("loading Qwen2.5-VL-3B (bf16)...")
-            return QwenPlanner(pcfg)
-
         try:
-            qwen = load_qwen()
-            qwen_factory = load_qwen
+            status.event("loading Qwen2.5-VL-3B (bf16)...")
+            qwen = QwenPlanner(pcfg)
         except Exception as e:
             log.exception("Qwen load failed")
+            no_qwen_why = f"Qwen load failed: {e}"
             status.event(f"Qwen load failed ({e}): rules planner", logging.ERROR)
         ram(status, "after Qwen load")
     backend: CriticBackend | None = None
@@ -1288,20 +1307,12 @@ def _build_real_rig(
     elif args.critic == "scripted":
         backend = scripted_critic(args, dcfg)
     free = ram(status, f"after Critic ({args.critic}) setup")
-    keep = True
-    if qwen is not None and free is not None and free < dcfg.min_free_ram_mb:
+    if free is not None and free < dcfg.warn_free_ram_mb:  # warn only: Qwen stays resident
         status.event(
-            f"free RAM {free:.0f} MB < {dcfg.min_free_ram_mb:.0f} MB with the Critic loaded: "
-            "Qwen unloaded now, reloaded per instruction",
+            f"LOW RAM: {free:.0f} MB free < {dcfg.warn_free_ram_mb:.0f} MB with the models "
+            "loaded (continuing; Qwen stays resident)",
             logging.WARNING,
         )
-        keep = False
-        qwen = None
-        free_torch("Qwen2.5-VL")
-        ram(status, "after unloading Qwen")
-    elif qwen is not None:
-        f = "n/a" if free is None else f"{free:.0f} MB"
-        status.event(f"free RAM {f} (min {dcfg.min_free_ram_mb:.0f} MB): Qwen stays loaded")
     from lbyr.perception.wrist import build_wrist_preprocess
 
     item = wrist.buffer.get()
@@ -1312,10 +1323,7 @@ def _build_real_rig(
         backend, qwen, stoppers, pre,
     )  # fmt: skip
     rig.wrist_fresh = wrist.fresh
-    rig.qwen_factory, rig.qwen_keep = qwen_factory, keep
-    if qwen_factory is not None:
-        res = "resident" if keep else "reloaded per instruction"
-        status.set(mode=f"{status.mode} (Qwen {res})")
+    rig.no_qwen_why = no_qwen_why
     return rig
 
 
@@ -1366,7 +1374,7 @@ def _finish_rig(
     vram.start()
     stoppers = [*([critic.stop] if critic else []), vram.stop, logger.stop, *stoppers]
     status.event(f"episode log: {logger.jsonl_path}")
-    planner = "qwen" if qwen is not None else "rules"
+    planner = "qwen2.5-vl (resident)" if qwen is not None else "rules"
     status.set(mode=f"planner={planner} critic={args.critic} {'DRY RUN' if args.dry_run else ''}")
     return Rig(
         cfg, dcfg, arm, joints, poses, overhead, wrist, detect, critic, qwen, logger, vram,
@@ -1424,7 +1432,7 @@ class Commands:
 
     def __init__(self, status: DemoStatus) -> None:
         self.status = status
-        self.q: queue.Queue[tuple[str | None, bool] | str] = queue.Queue()
+        self.q: queue.Queue[tuple[str | None, bool, str] | str] = queue.Queue()
         self._lock = threading.Lock()
         self._busy = False
 
@@ -1433,14 +1441,17 @@ class Commands:
         with self._lock:
             return self._busy
 
-    def submit(self, instruction: str | None, induce_slip: bool = False) -> bool:
-        """``instruction`` None = the default A -> place episode. False = busy (ignored)."""
+    def submit(
+        self, instruction: str | None, induce_slip: bool = False, source: str = "web"
+    ) -> bool:
+        """``instruction`` None = the default A -> place episode; ``source`` web | terminal |
+        cli. False = busy (ignored)."""
         with self._lock:
             if self._busy:
                 return False
             self._busy = True
         self.status.set(busy=True, task=instruction or "")
-        self.q.put((instruction, induce_slip))
+        self.q.put((instruction, induce_slip, source))
         return True
 
     def done(self) -> None:
@@ -1501,11 +1512,11 @@ class KeyboardInput:
             except Exception as e:
                 log.error("snapshot failed: %s", e)
         elif low in ("", "s"):
-            if not self.cmds.submit(self.task if low == "" else None, low == "s"):
+            if not self.cmds.submit(self.task if low == "" else None, low == "s", "terminal"):
                 log.warning("busy: episode running, ignored")
         else:
             try:
-                ok = self.cmds.submit(clean_instruction(ans))
+                ok = self.cmds.submit(clean_instruction(ans), False, "terminal")
             except PlanValidationError as e:
                 log.error("instruction refused: %s", e)
                 return
@@ -1628,7 +1639,7 @@ def main(argv: list[str] | None = None) -> int:
         once = args.once or args.dry_run
         keys: KeyboardInput | None = None
         if args.dry_run:  # no operator: run --task (or the default episode) once
-            cmds.submit(args.task, args.induce_slip)
+            cmds.submit(args.task, args.induce_slip, "cli")
         else:  # nothing moves until Enter / an instruction (keyboard or web)
             keys = KeyboardInput(cmds, snaps, args.task)
             log.info("Ready (web view on port %d).", web.port)
@@ -1643,7 +1654,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             if isinstance(item, str):  # QUIT
                 return rc
-            instruction, slip = item
+            instruction, slip, source = item
             try:
                 ok = demo.run(slip or first_slip, instruction)
             finally:
@@ -1654,7 +1665,8 @@ def main(argv: list[str] | None = None) -> int:
                 return rc
             if keys is not None:
                 keys.drain()
-                keys.prompt()
+                if source == "terminal":  # web runs never re-print the terminal menu
+                    keys.prompt()
     except KeyboardInterrupt:
         log.warning("Ctrl-C: stopping the arm")
         if rig is not None:

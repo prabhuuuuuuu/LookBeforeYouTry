@@ -41,9 +41,9 @@ def test_demo_task_none_moves_nothing(tmp_path: Path) -> None:
     assert recs[-1]["outcome"] == "none"
 
 
-def test_demo_task_qwen_path_reload_policy(tmp_path: Path) -> None:
-    """Qwen path with a fake engine: the prompt carries image + locations; RAM policy
-    'reload per instruction' loads before and unloads after planning."""
+def test_demo_task_qwen_path_resident(tmp_path: Path) -> None:
+    """Qwen path with a fake engine (resident, never unloaded): the prompt carries image +
+    locations + the grounding rule; an unknown location is refused before Qwen."""
     from typing import Any
 
     from lbyr.ai.planner import QwenPlanner
@@ -57,23 +57,24 @@ def test_demo_task_qwen_path_reload_policy(tmp_path: Path) -> None:
             seen.append((prompt, image))
             return '{"action":"move","from":"A","to":"B","reason":"user asked"}', 20
 
-    loads: list[int] = []
-
-    def factory() -> QwenPlanner:
-        loads.append(1)
-        return QwenPlanner(PlannerConfig(backend="qwen"), engine=Engine())
-
     args = parse_args(["--dry-run", "--log-dir", str(tmp_path), "--http-port", "0"])
     rig = build_dry_rig(args, DemoConfig(http_port=0), DemoStatus())
-    rig.qwen_factory, rig.qwen_keep = factory, False
+    rig.qwen = QwenPlanner(PlannerConfig(backend="qwen"), engine=Engine())
     try:
-        assert Demo(rig).run(False, "take the block from A over to B") is True
+        demo = Demo(rig)
+        assert demo.run(False, "take the block from A over to B") is True
+        n = len(seen)
+        assert demo.run(False, "move the block from A to zone C") is False
+        assert len(seen) == n  # refused before Qwen
     finally:
         run_stoppers(rig.stoppers)
-    assert loads == [1] and rig.qwen is None  # loaded for the plan, unloaded after
+    assert rig.qwen is not None
     prompt, image = seen[-1]
     assert image is not None and "- B: FAKE: back of the table" in prompt
-    assert rig.status.plan["backend"] == "qwen" and "user asked" in rig.status.plan["note"]
+    assert '"none" ONLY if no block is visible' in prompt
+    assert rig.status.result_kind == "rejected" and "valid names are A, B, place" in (
+        rig.status.result
+    )
 
 
 def test_web_task_post_and_busy() -> None:
@@ -102,7 +103,7 @@ def test_web_task_post_and_busy() -> None:
 
         assert post("move from A to B") == {"accepted": True}
         assert post("again") == {"busy": True} and status.busy
-        assert cmds.q.get_nowait() == ("move from A to B", False)
+        assert cmds.q.get_nowait() == ("move from A to B", False, "web")
         cmds.done()
         assert post("again") == {"accepted": True}
     finally:

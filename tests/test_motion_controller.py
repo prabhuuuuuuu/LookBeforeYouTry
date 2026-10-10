@@ -61,7 +61,7 @@ def test_controller_never_blocks_on_critic_and_sends_one_m_per_segment() -> None
     assert stats.missed == 0, stats
     assert stats.p99_ms < JITTER_P99_MS, stats
     assert arm.moves == [(60, 20, 30, 10, 0, 40)]  # ONE segment, no streaming
-    assert arm.status_requests >= stats.ticks - 1  # q polled every tick
+    assert 0 < arm.status_requests < stats.ticks  # q polled only while moving (+1 final)
     np.testing.assert_allclose(arm.read_state().joints, (60, 20, 30, 10, 0, 40), atol=0.1)
 
 

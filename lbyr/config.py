@@ -380,9 +380,10 @@ class DemoConfig:
     # qwen_timeout_s. ~60 tokens for the JSON + one-sentence reason.
     task_max_new_tokens: int = 96
     moondream_path: Path = Path("~/models/moondream2")
-    # After Moondream loads: below this, Qwen is unloaded after each plan and reloaded per
-    # instruction ("loading planner...", costs the logged Qwen load time each instruction).
-    min_free_ram_mb: float = 1024.0
+    # Qwen stays resident (loaded once): unloading does not return memory on the Jetson
+    # (RAM stayed ~14.5 GB used after "freed Qwen") and a reload costs ~11 s. Below this
+    # free RAM after both models load: WARNING only, never a refusal.
+    warn_free_ram_mb: float = 800.0
     regrasp_step_pct: float = 15.0  # bible 13: +15% closure per re-grasp
     # --induce-slip: gripper angle of the FIRST grasp only, zero-relative degrees (poses.yaml
     # gripper: open -40, closed 0). Operator range "clearly loose": -20 .. -25.

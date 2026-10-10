@@ -55,25 +55,45 @@ class TaskPlanResult:
 
 
 def build_task_prompt(
-    instruction: str, locations: Mapping[str, str], block_at: str, has_image: bool
+    instruction: str,
+    locations: Mapping[str, str],
+    block_at: str,
+    has_image: bool,
+    labelled: bool = False,
 ) -> str:
-    """``locations``: name -> description (poses.yaml order)."""
+    """``locations``: name -> description (poses.yaml order). Grounding rule: Qwen cannot
+    tell which area is "A" from the image unless it is labelled, so it must NOT veto a move
+    by guessing where locations are: "none" only for no block at all / an unlisted place."""
     names = ", ".join(f'"{n}"' for n in locations)
     lines = "\n".join(f"- {n}: {d or '(no description)'}" for n, d in locations.items())
-    seen = "The image is the overhead camera view of the table.\n" if has_image else ""
+    if not has_image:
+        seen = "There is no camera image: assume the block is on the table.\n"
+    elif labelled:
+        seen = (
+            "The image is the overhead camera view of the table. Each location is outlined "
+            "and labelled with its name in large yellow letters.\n"
+        )
+    else:
+        seen = (
+            "The image is the overhead camera view of the table. Locations may be marked "
+            "with printed letters on the table; their positions are known to the robot.\n"
+        )
     return (
         "You control a robot arm that moves one wooden block between fixed table locations.\n"
         f"{seen}"
         f"Locations (use these exact names: {names}):\n{lines}\n"
-        f"The block is currently at: {block_at}\n"
+        f"Block location reported by the detector: {block_at}\n"
         f"Instruction: {json.dumps(instruction)}\n"
+        'Follow the instruction: set "from" and "to" to the locations it names (if it '
+        'names only the target, "from" is where the block is). Do not refuse because you '
+        "are unsure where a location is on the table: the robot knows its positions.\n"
+        'Answer "none" ONLY if no block is visible on the table at all, or the instruction '
+        "names a location that is not in the list.\n"
         "Answer with ONE JSON object and nothing else. Either\n"
         '{"action": "move", "from": "<location>", "to": "<location>", '
         '"reason": "<one sentence>"}\n'
         "or\n"
-        '{"action": "none", "reason": "<why it can\'t or shouldn\'t do it>"}\n'
-        'Use "none" if the instruction is not a block move between these locations, '
-        "names a place that is not in the list, or the block is already at the target."
+        '{"action": "none", "reason": "<why it can\'t do it>"}'
     )
 
 

@@ -47,7 +47,7 @@ def test_parse_rejects(text: str) -> None:
 def test_prompt_lists_locations_block_and_quotes_instruction() -> None:
     p = build_task_prompt('put it "left"', {"A": "left side", "place": ""}, "unknown", True)
     assert "- A: left side" in p and "- place: (no description)" in p
-    assert "currently at: unknown" in p and json.dumps('put it "left"') in p
+    assert "detector: unknown" in p and json.dumps('put it "left"') in p
 
 
 def test_plan_task_timeout_and_invalid() -> None:

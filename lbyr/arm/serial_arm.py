@@ -22,6 +22,9 @@ completion = the firmware's ``DONE`` line. No setpoint streaming.
 - :meth:`move_joints` converts host degrees to zero-relative degrees (sign and zero_pose_deg
   from joints.yaml) and returns the duration predicted by the firmware planner port; the
   motion controller turns "no DONE within predicted x 1.5 + 0.5 s" into a LINK fault.
+- Robustness: write timeout 1 s; a failed write raises but is not sticky (the controller
+  retries the ``q`` poll); the reader retries reads and declares the link lost only after
+  ``READ_FAILS_LINK`` (3) consecutive failures.
 - Feedback: none (OQ-5). ``read_state`` reports the COMMANDED position from ``q``.
 
 ``pyserial`` is imported lazily so this module can be imported on any machine.
@@ -56,7 +59,10 @@ from lbyr.errors import ConfigError, LBYRError, ProtocolError
 log = logging.getLogger(__name__)
 
 READ_TIMEOUT_S = 0.05
-WRITE_TIMEOUT_S = 0.05
+# 0.05 s timed out under load (Qwen loading, 2026-10-11): "SerialTimeoutException: Write
+# timeout" on a 2-byte 'q'. 1 s covers USB stalls; a failed write is retried by the caller.
+WRITE_TIMEOUT_S = 1.0
+READ_FAILS_LINK = 3  # consecutive serial read failures before the link is declared lost
 LIST_TIMEOUT_S = 2.0
 OPEN_SETTLE_S = 0.3  # connect: watch the line this long after open, then flush
 PROBE_TRIES = 5  # connect: 'q' attempts ...
@@ -352,6 +358,7 @@ class SerialArm(ArmInterface):
 
     # ------------------------------------------------------------ reader thread
     def _read_loop(self) -> None:
+        fails = 0
         while self._running.is_set():
             port = self._port
             if port is None:
@@ -359,10 +366,16 @@ class SerialArm(ArmInterface):
             try:
                 raw = port.readline()
             except Exception as e:  # serial.SerialException, OSError (cable pulled)
-                with self._lock:
-                    self._link_error = f"LINK: serial read failed: {e}"
-                log.error("bridge read failed: %s", e)
-                return
+                fails += 1
+                if fails >= READ_FAILS_LINK:
+                    with self._lock:
+                        self._link_error = f"LINK: serial read failed {fails}x: {e}"
+                    log.error("bridge read failed %d times in a row: %s", fails, e)
+                    return
+                log.warning("bridge read failed (%d/%d), retrying: %s", fails, READ_FAILS_LINK, e)
+                time.sleep(0.02)
+                continue
+            fails = 0
             if not raw:
                 continue
             if self._check_rom_line(raw):
@@ -412,6 +425,8 @@ class SerialArm(ArmInterface):
 
     # ------------------------------------------------------------ writes
     def _write(self, text: str) -> None:
+        """One write (<= WRITE_TIMEOUT_S). A failure raises but is NOT sticky: the caller
+        decides (the motion controller retries ``q`` and faults after 3 in a row)."""
         port = self._port
         if port is None:
             raise LBYRError("SerialArm not connected")
@@ -419,9 +434,8 @@ class SerialArm(ArmInterface):
             with self._wlock:
                 port.write((text + "\n").encode("ascii"))
         except Exception as e:  # serial.SerialTimeoutException, OSError
-            with self._lock:
-                self._link_error = f"LINK: serial write failed: {e}"
-            raise LBYRError(f"LINK: serial write failed: {e}") from e
+            cmd = (text.split() or [""])[0]
+            raise LBYRError(f"LINK: serial write {cmd!r} failed: {e}") from e
 
     def move_joints(self, joints_deg: Sequence[float]) -> float:
         fw = self.joints.host_to_fw_deg(joints_deg)

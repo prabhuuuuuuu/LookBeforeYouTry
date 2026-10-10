@@ -6,9 +6,11 @@ The bridge firmware generates the trajectory. This thread, at ``MotionConfig.pol
 1. picks up the latest commanded segment (a latest-value buffer; a new segment pre-empts
    the old one) and sends it as ONE ``m`` (:meth:`ArmInterface.move_joints`), which returns
    the duration predicted by the firmware planner port;
-2. sends a status request (``q``) and checks :meth:`ArmInterface.motion_status`;
-3. marks the segment DONE, or FAULT when the board reports ERR, a write fails, or no DONE
-   arrives within ``predicted x done_timeout_factor + done_timeout_margin_s`` (LINK fault).
+2. while a segment is active, sends a status request (``q``) and checks
+   :meth:`ArmInterface.motion_status` (idle: no polling, no serial traffic);
+3. marks the segment DONE, or FAULT when the board reports ERR, the ``m`` write fails,
+   ``POLL_FAILS_LINK`` (3) ``q`` polls fail in a row (single failures: warning + retry), or
+   no DONE arrives within ``predicted x done_timeout_factor + done_timeout_margin_s``.
 
 It never blocks on AI, detection, logging or replies: every arm call is at most one serial
 write or a read of state the serial reader thread already parsed. Deadline scheduling
@@ -37,6 +39,8 @@ IDLE = "idle"
 MOVING = "moving"
 SEG_DONE = "done"
 FAULT = "fault"
+
+POLL_FAILS_LINK = 3  # consecutive failed 'q' polls (while moving) -> LINK fault
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,8 @@ class MotionController(threading.Thread):
         self._fault: str | None = None
         self._predicted = self._timeout = 0.0
         self._t_start = 0.0
+        self._poll_fails = 0
+        self._final_poll = False
         self._publish()
 
     # ------------------------------------------------------------ producer API (FSM)
@@ -139,21 +145,37 @@ class MotionController(threading.Thread):
                 self._stop_event.wait(remaining)
 
     def tick(self) -> None:
-        """One poll cycle (public for deterministic tests)."""
+        """One poll cycle (public for deterministic tests). ``q`` is sent only while a
+        segment is active (plus one final poll after it ends, for a fresh idle position);
+        idle = no serial traffic."""
         new = self._commands.get_if_newer(self._seg_id)
         if new is not None:
             self._dispatch(new.seq, new.value)
-        try:
-            if self._output_enabled:
-                self._arm.request_state()
-        except Exception:
-            self._errors += 1
-            if self._errors == 1 or self._errors % 20 == 0:
-                log.exception("status request failed (%d errors)", self._errors)
+        if self._output_enabled and (self._phase == MOVING or self._final_poll):
+            self._final_poll = False
+            self._poll()
         if self._phase == MOVING:
             self._check_segment()
+            if self._phase != MOVING:
+                self._final_poll = True
         self._ticks += 1
         self._publish()
+
+    def _poll(self) -> None:
+        """One ``q``. A failure is retried on the next tick; POLL_FAILS_LINK in a row while
+        moving -> LINK fault (the DONE timeout catches a silent link as before)."""
+        try:
+            self._arm.request_state()
+        except Exception as e:
+            self._errors += 1
+            self._poll_fails += 1
+            log.warning("status poll failed (%d in a row): %s", self._poll_fails, e)
+            if self._phase == MOVING and self._poll_fails >= POLL_FAILS_LINK:
+                self._phase = FAULT
+                self._fault = f"LINK: {self._poll_fails} status polls failed in a row: {e}"
+                log.error("segment %d fault: %s", self._seg_id, self._fault)
+            return
+        self._poll_fails = 0
 
     def _dispatch(self, seg_id: int, goal: np.ndarray) -> None:
         self._seg_id = seg_id
