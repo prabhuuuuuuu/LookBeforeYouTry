@@ -3,10 +3,10 @@ Save as:
 ```markdown
 # PROJECT CONTEXT / BIBLE — “Look Before You Retry” (LBYR)
 
-**Version:** 1.2  
+**Version:** 1.3  
 **Status:** Locked hackathon context  
-**Hardware revision:** ROT3U 6-DOF arm + Jetson Orin 16GB + RealSense D435 + Panoculonlabs Trinet wrist camera  
-**Supersedes:** Version 1.1 where conflicting  
+**Hardware revision:** ROT3U 6-DOF PWM arm (no feedback) + XIAO ESP32-C6 bridge + Jetson Orin NX 16GB (reComputer J401) + RealSense D435 + Panoculonlabs Trinet wrist camera  
+**Supersedes:** Version 1.2 where conflicting (v1.3 changes: compute platform, browser dashboard instead of HDMI capture, PWM arm + XIAO C6 text-protocol bridge, 6.0 V servo rail, JAMMED policy, OQ-1/2/3/5 closed)  
 
 > This document is the updated single source of truth for the hackathon build.  
 > Where this document conflicts with older notes, this document wins.  
@@ -19,15 +19,15 @@ Save as:
 | # | Decision | Locked Choice | Notes |
 |---:|---|---|---|
 | 1 | Robot arm | **ROT3U 6-DOF desktop arm** | Replaces any earlier MK3 / 3D-printed arm plan. |
-| 2 | Main compute | **NVIDIA Jetson Orin 16GB** | All inference local. JetPack 6, MAXN, headless. |
+| 2 | Main compute | **Jetson Orin NX 16GB on Seeed reComputer J401** | All inference local. JetPack 6.2 / L4T 36.4.3, `nvpmodel -m 4` (40 W) + `jetson_clocks`, headless. |
 | 3 | Overhead camera | **Intel RealSense D435** | Overhead RGB-D for detection + metric 3D. |
 | 4 | Overhead camera mount height | **~70 cm above 40×40 cm mat** | Tilt ~50° downward. Lock exposure/white balance. |
 | 5 | Wrist / gripper camera | **Panoculonlabs Trinet camera** | Replaces Raspberry Pi Camera v2 / IMX219 as primary wrist Critic camera. |
 | 6 | Wrist camera interface | **USB live stream to Jetson Orin** | Do not use Jetson CSI ribbon cable for primary wrist camera. |
 | 7 | Wrist camera image handling | **Dewarp before VLM** | Trinet ultra-wide/fisheye image must be rectified before Moondream2. |
 | 8 | Wrist camera role | **Semantic-only Critic** | Not used for metric control or hand-eye calibration. |
-| 9 | ESP32-to-Jetson link | **USB serial / USB CDC** | Use a good USB-A to USB-C / Micro-USB data cable. |
-| 10 | Judge-facing display | **Laptop screen via USB HDMI capture card** | Preferred over external HDMI monitor for portability. |
+| 9 | Bridge-to-Jetson link | **USB serial / USB CDC, 115200, text protocol** | XIAO ESP32-C6 bridge. Use a good USB-A to USB-C data cable. |
+| 10 | Judge-facing display | **Browser dashboard (FastAPI/WebSocket, separate process)** | Bound to 0.0.0.0; reached over Tailscale or LAN. Replaces the HDMI capture card. |
 | 11 | Workspace | **40×40 cm rigid mat** | Clamped to table. Contains ArUco / calibration grid and object start zones. |
 | 12 | Object set | **Hard + soft failure-inducing objects** | See Section 7. All objects should be under ~150 g. |
 | 13 | Architecture | **Modular VLA + deterministic motion stack** | No end-to-end policy during hackathon. |
@@ -82,26 +82,26 @@ The core research contribution is not “a VLA controls an arm.” The contribut
 | Attribute | Locked / Assumed Value | Status |
 |---|---|---|
 | Arm | ROT3U 6-DOF desktop robotic arm | Locked |
-| DOF | 6: base yaw, shoulder pitch, elbow pitch, wrist pitch, wrist roll, gripper | Confirm joint mapping |
+| DOF | 6, base to gripper: 1 base yaw, 2 shoulder, 3 elbow, 4 wrist pitch, 5 wrist roll, 6 gripper | Confirmed (v1.3) |
 | Class | Desktop arm | Locked |
 | Reach | Approximately 300–450 mm | Confirm |
 | Payload | Approximately 250–500 g | Confirm |
-| Servo type | Likely Feetech STS/SCS-class serial-bus smart servos | Must confirm |
-| Servo voltage | Likely 6.0–7.4 V, **not assumed 5 V** | Must confirm before powering |
-| Feedback | Position/load/temperature may be readable | Confirm |
+| Servo type | **PWM servos**: joints 1-4 Feetech 25 kg, joints 5-6 MG996R | Confirmed (v1.3) |
+| Servo voltage | **6.0 V** rail (MG996R max ~7.2 V). **Never assume 5 V.** | Confirmed (v1.3) |
+| Feedback | **None.** No position, load or temperature readback. "Position" = last commanded pulse | Confirmed (v1.3) |
 | Gripper | Parallel jaw, position-controlled | Confirm stroke and closure mapping |
 
-Before any software work, the following must be confirmed:
+Confirmed in v1.3: servo bus type (PWM), joint order and roles, servo voltage (6.0 V),
+no feedback. Servo IDs and baud rate do not apply to PWM servos.
 
-1. Servo bus type: serial TTL or PWM.
-2. Servo protocol, baud rate, and servo IDs.
-3. Correct PSU voltage and current.
-4. Joint limits in degrees.
-5. Link lengths or official URDF.
-6. Payload at full extension.
-7. Whether position/load feedback is readable.
-8. Gripper stroke and closure-to-angle mapping.
-9. Trinet mounting point and cable routing path.
+Still to be confirmed before relying on them:
+
+1. Joint limits in degrees.
+2. Link lengths or official URDF.
+3. Payload at full extension.
+4. Gripper stroke and closure-to-angle mapping.
+5. Servo PSU current rating.
+6. Trinet mounting point and cable routing path.
 
 ---
 
@@ -109,34 +109,27 @@ Before any software work, the following must be confirmed:
 
 | Item | Role | Interface | Notes |
 |---|---|---|---|
-| Jetson Orin 16GB | All AI inference, perception, FSM, logging | Headless JetPack 6 | Use MAXN: `sudo nvpmodel -m 0`, `sudo jetson_clocks` |
-| Laptop | SSH, logs, judge-facing UI display | GbE / USB capture | Primary operator machine |
-| USB HDMI capture card | Displays Jetson HDMI output on laptop | USB-A / USB-C | Required if using laptop as judge-facing screen |
-| External HDMI monitor | Optional backup | HDMI | Not primary if capture card is available |
+| Jetson Orin NX 16GB on Seeed reComputer J401 | All AI inference, perception, FSM, logging | Headless, JetPack 6.2 / L4T 36.4.3 | Power mode `sudo nvpmodel -m 4` (40 W, the maximum on this image) + `jetson_clocks` applied at boot via systemd |
+| Laptop | SSH, logs, judge-facing dashboard in a browser | GbE / Wi-Fi / Tailscale | Primary operator machine |
+| Browser dashboard | Overlay UI, latency HUD, verdict, FSM state, detection boxes | HTTP + WebSocket (FastAPI) | Separate process, bound to `0.0.0.0` |
+| External HDMI monitor | Optional backup | HDMI | Not required |
 
 ### Locked display decision
 
-Primary judge-facing display:
+Primary judge-facing display (v1.3, replaces the HDMI capture card):
 
 ```text
-Jetson Orin HDMI out
-→ USB HDMI capture card
-→ laptop screen
+Jetson Orin NX
+→ dashboard process (FastAPI + WebSocket, 0.0.0.0)
+→ Tailscale or LAN
+→ laptop browser
 ```
 
-The laptop shows the overlay UI, latency HUD, wrist camera verdict, FSM state, and detection boxes.
+The browser shows the overlay UI, latency HUD, wrist camera verdict, FSM state, and detection boxes.
 
-Do **not** assume a laptop HDMI port can accept HDMI input directly. Most laptop HDMI ports are output-only.
-
-Fallback if capture card is unavailable:
-
-```text
-Jetson Orin
-→ GStreamer / WebSocket / lightweight web stream
-→ laptop browser or viewer
-```
-
-However, the capture card is preferred because it avoids network jitter and makes the demo look stable.
+The dashboard is a **separate process** from the control loop. The 50 Hz motion thread, the
+FSM and the Critic never wait on it: it reads logged or published state only, and a dead or
+slow browser must not affect the arm. Prefer a wired LAN at the venue if Wi-Fi is unreliable.
 
 ---
 
@@ -272,17 +265,17 @@ The Trinet decision does not break the edge compute budget.
 
 ---
 
-## 6. ESP32 Bridge Connection
+## 6. Bridge MCU Connection (XIAO ESP32-C6)
 
 ### Locked connection
 
 ```text
 Jetson Orin USB-A host
-→ USB-A to USB-C / Micro-USB data cable
-→ ESP32-S3 USB port
+→ USB-A to USB-C data cable
+→ XIAO ESP32-C6 USB port
 ```
 
-The ESP32 appears as a USB serial device.
+The XIAO ESP32-C6 appears as a USB serial device.
 
 Typical device names:
 
@@ -300,76 +293,54 @@ or
 
 Use a **data-capable USB cable**, not a charge-only cable.
 
-Depending on the ESP32-S3 board:
-
-| ESP32 Connector | Required Cable |
-|---|---|
-| USB-C | USB-A to USB-C data cable |
-| Micro-USB | USB-A to Micro-USB data cable |
-
-Bring spare cables.
+The XIAO ESP32-C6 has a USB-C port: use a USB-A to USB-C data cable. Bring spare cables.
 
 ### Communication protocol
 
-JSON over USB serial.
+Newline-terminated **text** over USB serial, **115200 baud** (v1.3; replaces the JSON
+protocol of v1.2). Authoritative reference: `firmware/xiao_c6_bridge/Code.ino`.
+Angles are degrees relative to each joint's saved zero; joints are numbered 1-6.
 
-Baud rate:
+| Command | Meaning |
+|---|---|
+| `J` | Test joint J: swing ±30°, back to zero |
+| `g J DEG` | Move joint J to DEG |
+| `m D1 .. D6` | Move all joints together, arriving at the same time |
+| `t J D` | Nudge joint J by D µs from its target; `z J` then stores it |
+| `z [J]` | Store the current target as zero (saved to flash) |
+| `set J US` | Set joint J's zero to an exact pulse, move there, save |
+| `save` | Write all zeros to flash |
+| `home` | Move all joints to their zeros (re-attaches released joints) |
+| `x` / `stop` | Brake smoothly and hold |
+| `speed V A` | Max speed (deg/s) and accel (deg/s²), capped in firmware |
+| `off [J]` | Release PWM (arm may fall; support it first) |
+| `list` | Print state: `S,<joint>,<zero_us>,<pos_us>,<attached>,<name>` and `V,<vmax>,<amax>` |
+| `help` | Print commands |
 
-```text
-115200 or higher
-```
+Replies are `OK ...` or `ERR ...` lines. There is no `state` query with load or temperature.
 
-Example messages:
-
-```json
-{"type":"move","joints":[0,45,60,30,0,50],"time_ms":800}
-```
-
-```json
-{"type":"traj","pts":[[...],[...]],"dt_ms":20}
-```
-
-```json
-{"type":"state"}
-```
-
-Response:
-
-```json
-{"joints":[...],"load":[...],"temp":[...],"status":"ok"}
-```
-
-```json
-{"type":"torque","on":false}
-```
-
-```json
-{"type":"stop"}
-```
+The host-side `lbyr/arm/bridge_proto.py` JSON protocol is **not** what the firmware speaks.
+`SerialArm` must speak this text protocol for now (not yet implemented; see
+`docs/OPEN_QUESTIONS.md`).
 
 ### Bridge responsibilities
 
-The ESP32 / arm MCU bridge must enforce:
+The firmware implements: PWM generation (direct LEDC, one pin per joint), pulse clamps
+(500-2500 µs, to be tightened per joint), a speed- and acceleration-limited planner,
+backlash approach from below, per-joint speed scaling (joints 5-6 slower), per-joint zero
+stored in flash, staggered home-on-boot, smooth `stop`.
 
-1. Joint clamps.
-2. Maximum delta per tick.
-3. Watchdog behavior.
-4. Hold position on link loss.
-5. Safe stop command handling.
+Not implemented in the firmware yet: joint limits in degrees, a link-loss watchdog, a
+per-tick delta clamp. PWM servos hold their last pulse, so a link loss means "hold".
 
-If serial-bus servos are used:
-
-```text
-ESP32 → SyncWrite packets → Feetech-style serial bus
-```
-
-If PWM servos are used:
+### Actuation
 
 ```text
-ESP32 → PCA9685 → PWM servos
+XIAO ESP32-C6 → direct LEDC PWM (D0, D1, D3, D4, D5, D8) → PWM servos
 ```
 
-The host software must not depend on which low-level actuation method is used.
+No PCA9685 and no serial-bus servos. The host software must still not depend on this
+low-level detail beyond the command set above.
 
 ### Important power rule
 
@@ -388,7 +359,7 @@ Never power servos from:
 - MCU signal pins.
 - PCA9685 signal pins.
 
-Servos must be powered from a separate confirmed servo PSU.
+Servos must be powered from a separate confirmed servo PSU (6.0 V, see Section 8).
 
 ---
 
@@ -448,8 +419,7 @@ Avoid mounting the camera so close that the gripper occludes the entire field of
 Arm on table
 RealSense overhead
 Jetson beside table
-Laptop beside table
-Capture card between Jetson HDMI and laptop
+Laptop beside table (browser dashboard over LAN / Tailscale)
 PSU + E-stop within operator reach
 ```
 
@@ -460,7 +430,7 @@ PSU + E-stop within operator reach
 ### Locked power rules
 
 1. Separate servo PSU.
-2. Confirm servo voltage before powering.
+2. Servo rail is **6.0 V** (MG996R max ~7.2 V). Confirm with a multimeter before powering.
 3. Do not assume 5 V.
 4. Use inline fuse on positive servo rail.
 5. Use rocker switch / E-stop on positive servo rail.
@@ -468,18 +438,22 @@ PSU + E-stop within operator reach
 7. Use single star ground at PSU negative terminal.
 8. Do not add an extra ground wire from servo PSU to Orin.
 9. USB already ties Jetson and ESP32 grounds.
+10. The servo supply negative must be tied to XIAO GND (single star ground).
+11. **Boot rule:** the first PWM pulse at boot goes to each joint's saved zero, and there is
+    no feedback to smooth it. The arm must rest in its zero pose **before** the servo rail is
+    powered.
 
 ### Grounding concept
 
 ```text
 Servo PSU −V
 Servo GND
-ESP32 / logic GND
+XIAO / logic GND
         ↓
 single star ground
 ```
 
-Jetson ground is connected through the USB link to ESP32. Do not create a second ground path to the Jetson.
+Jetson ground is connected through the USB link to the XIAO. Do not create a second ground path to the Jetson.
 
 ### Safety rules
 
@@ -493,6 +467,8 @@ These are non-negotiable:
 6. Never run the arm unattended.
 7. Support the arm by hand before cutting servo power.
 8. Firmware clamps + FSM limits + human E-stop are three independent safety layers.
+9. With no feedback, a stalled or blocked servo cannot be detected in software: the
+   human E-stop is the only jam protection (see Section 13).
 
 ---
 
@@ -770,14 +746,18 @@ Not required for closed-loop Cartesian control.
 | `SLIPPING` | Critic = SLIPPING after close/lift | +15% closure → wrist re-orient 30° → lateral offset 10 mm | 2 |
 | `EMPTY` | Critic = EMPTY after lift | Re-approach with −5 mm standoff → re-grasp | 2 |
 | `MISS` | Critic = EMPTY after close | Re-plan from PERCEIVE | 2 |
-| `JAMMED` | Load/position-error spike or motion timeout | Stop → torque off → human report | 0 |
+| `JAMMED` | **Operator stop only** (no load/position feedback on PWM servos) | Stop → torque off → human report | 0 |
 | `OCCLUDED` | Critic = OCCLUDED | Re-position wrist cam pose → re-query once | 1 |
 | `WRONG_OBJECT` | Planner re-check vs detected class | Re-plan | 1 |
 
-Optional paper bonus:
+`JAMMED` (v1.3): the PWM servos give no load or position feedback, so software cannot
+detect a jam by itself. It is triggered by the operator stop only, unless an INA226 current
+sensor on the servo rail is added later (then a current spike can raise `JAMMED`).
+
+Optional paper bonus (only if an INA226 current sensor is added):
 
 ```text
-Fuse Critic visual verdict with servo load / position-error proprioception.
+Fuse Critic visual verdict with servo-rail current proprioception.
 Report agreement statistics.
 ```
 
@@ -949,7 +929,7 @@ Adapter weights deployed to Jetson Orin
 
 | Phase | Content | Exit Test |
 |---|---|---|
-| Prep D1–2 | Environment, cameras streaming, ROT3U checklist | `tegrastats` MAXN, 30 FPS both cameras, checklist complete |
+| Prep D1–2 | Environment, cameras streaming, ROT3U checklist | `tegrastats` at `nvpmodel -m 4` + `jetson_clocks`, 30 FPS both cameras, checklist complete |
 | Prep D3 | Bridge firmware + protocol | Sine sweep smooth, link-loss hold works |
 | Prep D4 | Calibration + metric perception | `<8 mm` point error |
 | Prep D5 | Planner + skills + open-loop picks | ≥3/5 picks |
@@ -964,7 +944,7 @@ Adapter weights deployed to Jetson Orin
 
 | Risk | Mitigation |
 |---|---|
-| ROT3U servo protocol unknown | ArmInterface abstraction, candidate drivers, checklist first |
+| Servos have no feedback | Conservative speed/accel caps, E-stop in reach, rest in zero pose before power-on, optional INA226 later |
 | Orin OOM | `tegrastats`, fallback to GGUF-Q4 Critic, INT8 planner |
 | Trinet USB bandwidth issue | Lower resolution/FPS, use separate USB port, avoid shared hub with RealSense if unstable |
 | Fisheye image confuses VLM | Dewarp before Critic, validate on held-out frames |
@@ -980,19 +960,18 @@ Adapter weights deployed to Jetson Orin
 | Category | Item | Notes |
 |---|---|---|
 | Robot | ROT3U 6-DOF arm | Primary arm |
-| Compute | Jetson Orin 16GB | Edge inference |
+| Compute | Jetson Orin NX 16GB on Seeed reComputer J401 | Edge inference, JetPack 6.2 |
 | Overhead camera | Intel RealSense D435 | USB 3.0 |
 | Wrist camera | Panoculonlabs Trinet | USB live stream |
 | Wrist camera cable | Short flexible USB data cable | Strain relief required |
-| Bridge MCU | ESP32-S3 or arm native MCU | USB serial to Jetson |
-| ESP32 cable | USB-A to USB-C / Micro-USB data cable | Not charge-only |
+| Bridge MCU | Seeed XIAO ESP32-C6 | USB serial to Jetson, direct PWM |
+| Bridge cable | USB-A to USB-C data cable | Not charge-only |
 | RealSense cable | USB 3.0 cable | Use blue port |
 | Workspace | 40×40 cm rigid mat | Clamp to table |
 | Calibration | ArUco / checkerboard / grid | Fixed to mat |
 | Overhead mount | Tripod or gantry | ~70 cm height |
-| Judge display | Laptop | Via capture card |
-| Display capture | USB HDMI capture card | Preferred |
-| Servo PSU | Confirmed voltage, ≥6–10 A | Separate from Jetson supply |
+| Judge display | Laptop | Browser dashboard over Tailscale / LAN |
+| Servo PSU | 6.0 V, ≥6–10 A | Separate from Jetson supply |
 | E-stop | Rocker switch / button | On positive servo rail |
 | Fuse | Inline fuse | Servo rail |
 | Capacitor | Bulk capacitor | Across servo rail |
@@ -1006,11 +985,11 @@ Adapter weights deployed to Jetson Orin
 
 These do not change the locked architecture, but they must be physically confirmed.
 
-1. ROT3U servo bus type: serial Feetech-style or PWM?
-2. Servo baud rate and IDs.
-3. Exact servo PSU voltage and current.
+1. ~~ROT3U servo bus type~~ **CLOSED (v1.3): PWM.**
+2. ~~Servo baud rate and IDs~~ **CLOSED (v1.3): not applicable (PWM).** Joint order is 1 base yaw, 2 shoulder, 3 elbow, 4 wrist pitch, 5 wrist roll, 6 gripper.
+3. ~~Exact servo PSU voltage~~ **CLOSED (v1.3): 6.0 V** (MG996R max ~7.2 V). PSU current rating not recorded.
 4. Official URDF/CAD availability, or link lengths must be measured.
-5. Whether servo position/load feedback is readable.
+5. ~~Whether servo position/load feedback is readable~~ **CLOSED (v1.3): no feedback.**
 6. Gripper stroke and closure-to-angle mapping.
 7. Trinet live-stream mode: UVC webcam or vendor SDK.
 8. Trinet resolution/FPS that works reliably on Jetson.
