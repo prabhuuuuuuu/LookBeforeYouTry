@@ -130,15 +130,18 @@ class WristCameraConfig:
     # OQ-7 alternative: stable V4L2 path (e.g. /dev/v4l/by-id/usb-...-video-index0); wins
     # over device_index when set.
     device_path: str | None = None
-    fourcc: str | None = None  # e.g. "MJPG" if the UVC mode needs it (OQ-8); None = default
-    width: int | None = None  # OQ-8: reliable resolution on Jetson, unconfirmed (start at 720p)
-    height: int | None = None  # OQ-8
-    fps: int | None = None  # OQ-8
+    # OQ-8 measured 2026-10-11: the Trinet's ONLY usable mode is MJPG 1920x1080 @ 30 FPS
+    # (H264 is also offered: do not use it). Capture node /dev/video6, metadata /dev/video7.
+    fourcc: str | None = "MJPG"
+    width: int | None = 1920
+    height: int | None = 1080
+    fps: int | None = 30
+    retrieve_hz: float = 12.0  # decode rate (grab() runs at 30 FPS, retrieve() at this rate)
     calib_path: Path = DATA_DIR / "calib" / "trinet_fisheye.yaml"  # OQ-9: produced by tools/
     dewarp_enabled: bool = True  # bible 5.2: dewarp before the VLM
     dewarp_balance: float = 0.0  # 0 = crop to valid pixels, 1 = keep full FOV
     # Optional Dewarper pre-crop (rarely needed). The Critic's gripper ROI is
-    # CriticConfig.crop_xywh (OQ-12); do not set both to the same box.
+    # CriticConfig.crop_box_norm (OQ-12); do not set both to the same box.
     crop_xywh: tuple[int, int, int, int] | None = None
 
 
@@ -259,12 +262,15 @@ class CriticConfig:
     # "bf16" (Moondream's native dtype; the Orin supports it) | "fp16" (weights cast +
     # crop-dtype patch). M-1 resolved 2026-10-10: bf16 + 378x378 crop (0.85 s vs 1.35 s).
     dtype: str = "bf16"
-    # Runtime input = dewarped wrist frame -> 378x378 crop (one Moondream tile).
+    # Runtime input = dewarped wrist frame -> gripper region RESIZED (INTER_AREA) to 378x378
+    # (one Moondream tile).
     crop_enabled: bool = True
     crop_size_px: int = 378
-    # OQ-12: gripper bite-zone box (x, y, w, h) in the DEWARPED frame. None = centred square.
-    # Must be re-centred on the bite zone once the Trinet is mounted (tools/ to set it).
-    crop_xywh: tuple[int, int, int, int] | None = None
+    # OQ-12: gripper bite-zone box (x0, y0, x1, y1), NORMALIZED 0..1 in the (dewarped) frame.
+    # None = width-centred full-height square (1080x1080 of a 1920x1080 frame). Tune it on the
+    # mounted Trinet (lbyr.demo --crop overrides it). Keep it square in PIXELS: on 16:9,
+    # x1 - x0 = (y1 - y0) * 9 / 16, else the resize stretches the image.
+    crop_box_norm: tuple[float, float, float, float] | None = None
 
     def validate(self) -> None:
         if self.temperature != 0.0:
@@ -273,8 +279,12 @@ class CriticConfig:
             raise ConfigError(f"critic.dtype must be one of {CRITIC_DTYPES}")
         if self.crop_size_px < 28:
             raise ConfigError("critic.crop_size_px is too small")
-        if self.crop_xywh is not None and (self.crop_xywh[2] <= 0 or self.crop_xywh[3] <= 0):
-            raise ConfigError("critic.crop_xywh width/height must be > 0")
+        if self.crop_box_norm is not None:
+            x0, y0, x1, y1 = self.crop_box_norm
+            if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+                raise ConfigError(
+                    "critic.crop_box_norm must be 0 <= x0 < x1 <= 1, 0 <= y0 < y1 <= 1"
+                )
         if self.timeout_s <= 0.0:
             raise ConfigError("Critic timeout must be > 0 (bible 11.2)")
         if self.max_new_tokens < 1:

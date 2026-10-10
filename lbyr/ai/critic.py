@@ -4,7 +4,7 @@ Event-driven: the FSM submits a request (non-blocking) and polls the verdict que
 (non-blocking). Inference runs on the CriticWorker thread under an explicit timeout.
 
 Runtime input (M-1, 2026-10-10): wrist frame -> dewarp -> 378x378 crop
-(``CriticConfig.crop_xywh``, default centred) -> Moondream2 BF16. Measured on the Orin NX
+(``CriticConfig.crop_box_norm``, resized) -> Moondream2 BF16. Measured on the Orin NX
 40 W: ~4.1 GB, p50 0.85 s (1.35 s on the full 640x480 frame). See bible 9.2.
 """
 
@@ -215,7 +215,8 @@ class CriticWorker(threading.Thread):
     """Request queue -> (dewarp) -> crop -> backend under timeout -> verdict queue.
 
     ``preprocess`` is the dewarp (None = raw frame). The crop is applied when
-    ``cfg.crop_enabled`` (box ``cfg.crop_xywh``, default centred, ``cfg.crop_size_px``).
+    ``cfg.crop_enabled`` (box ``cfg.crop_box_norm``, default centred square), resized to
+    ``cfg.crop_size_px``.
     """
 
     def __init__(
@@ -269,7 +270,7 @@ class CriticWorker(threading.Thread):
             if self._preprocess is not None:
                 image = self._preprocess(image)
             if self._cfg.crop_enabled:
-                image = critic_crop(image, self._cfg.crop_xywh, self._cfg.crop_size_px)
+                image = critic_crop(image, self._cfg.crop_box_norm, self._cfg.crop_size_px)
             judged = image
             t0 = time.perf_counter()
             out = self._runner.run(lambda: self._backend.infer(judged, CRITIC_PROMPT))

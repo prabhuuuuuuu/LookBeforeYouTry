@@ -31,21 +31,21 @@ bench = _load_bench()
 
 
 # ------------------------------------------------------------------ crop helper
-def test_centred_crop_is_one_moondream_tile() -> None:
-    img = np.zeros((480, 640, 3), dtype=np.uint8)
-    img[240, 320] = (1, 2, 3)  # frame centre
+def test_default_crop_is_centred_square_resized_to_one_tile() -> None:
+    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    img[:, 420:1500] = 200  # exactly the width-centred 1080x1080 square
     out = critic_crop(img)
     assert out.shape == (MOONDREAM_TILE_PX, MOONDREAM_TILE_PX, 3) == (378, 378, 3)
-    assert tuple(out[240 - 51, 320 - 131]) == (1, 2, 3)  # offsets (480-378)/2, (640-378)/2
+    assert out.min() == 200  # the whole square, resized (not a raw 378-px centre crop)
 
 
-def test_box_crop_is_clipped_and_resized() -> None:
+def test_normalized_box_is_clipped_and_resized() -> None:
     img = np.zeros((480, 640, 3), dtype=np.uint8)
-    out = critic_crop(img, (600, 400, 200, 200))  # runs off the bottom-right corner
+    out = critic_crop(img, (0.9, 0.8, 1.3, 1.4))  # runs off the bottom-right corner
     assert out.shape == (378, 378, 3)
     assert critic_crop(np.zeros((240, 320, 3), dtype=np.uint8)).shape == (378, 378, 3)
     with pytest.raises(ValueError):
-        critic_crop(img, (700, 10, 50, 50))
+        critic_crop(img, (1.1, 0.0, 1.2, 0.1))
 
 
 # ------------------------------------------------------------------ dtype / compile

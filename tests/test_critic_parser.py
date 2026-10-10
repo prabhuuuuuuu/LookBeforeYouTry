@@ -109,7 +109,7 @@ def _one(cfg: CriticConfig, img: np.ndarray, pre=None):  # type: ignore[no-untyp
 
 def test_defaults_are_bf16_and_378_crop() -> None:
     cfg = CriticConfig()
-    assert (cfg.dtype, cfg.crop_enabled, cfg.crop_size_px, cfg.crop_xywh) == (
+    assert (cfg.dtype, cfg.crop_enabled, cfg.crop_size_px, cfg.crop_box_norm) == (
         "bf16",
         True,
         378,
@@ -134,7 +134,9 @@ def test_worker_crops_after_preprocess_and_reports_infer_time() -> None:
 def test_worker_crop_box_and_crop_off() -> None:
     img = np.zeros((480, 640, 3), np.uint8)
     img[100, 200] = (9, 9, 9)
-    r, _ = _one(CriticConfig(timeout_s=1.0, crop_xywh=(200, 100, 378, 378)), img)
+    r, _ = _one(
+        CriticConfig(timeout_s=1.0, crop_box_norm=(200 / 640, 100 / 480, 578 / 640, 478 / 480)), img
+    )
     assert tuple(r.image_bgr[0, 0]) == (9, 9, 9)
     r, rec = _one(CriticConfig(timeout_s=1.0, crop_enabled=False), img)
     assert rec.shapes == [(480, 640, 3)]

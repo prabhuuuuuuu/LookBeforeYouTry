@@ -47,15 +47,22 @@ from lbyr.ai.planner import (
 )
 from lbyr.arm.calib import JointsCalib, load_joints, mock_joints
 from lbyr.arm.interface import ArmInterface
-from lbyr.config import GRIPPER_INDEX, AppConfig, DemoConfig, mock_profile
+from lbyr.config import (
+    GRIPPER_INDEX,
+    AppConfig,
+    DemoConfig,
+    WristCameraConfig,
+    mock_profile,
+    require,
+)
 from lbyr.errors import CalibrationError, LBYRError
 from lbyr.log_setup import setup_logging
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor, make_record, read_system_ram
 from lbyr.motion.controller import FAULT, MotionController
-from lbyr.perception.buffers import CaptureThread, LatestFrameBuffer
+from lbyr.perception.buffers import LatestFrameBuffer
 from lbyr.perception.detector import Detection
 from lbyr.perception.overhead import FakeObject, FakeOverheadCamera, FakeScene, RGBDFrame
-from lbyr.perception.wrist import FakeWristCamera
+from lbyr.perception.wrist import FakeWristCamera, decode_wrist_jpeg
 
 log = logging.getLogger("lbyr.demo")
 
@@ -169,63 +176,180 @@ class DemoStatus:
 
 
 # ------------------------------------------------------------------ cameras
-def find_wrist_device() -> str | None:
-    """First V4L2 capture node (index 0) whose name is not the RealSense D435."""
+def open_wrist(device: int | str, wc: WristCameraConfig) -> tuple[Any, np.ndarray]:
+    """Open the Trinet in its ONE mode (MJPG 1920x1080@30, OQ-8) and read a first frame.
+    No fallback mode: anything else raises."""
+    import cv2  # lazy
+
+    w, h, fps = (
+        require(wc.width, "Trinet width", "OQ-8"),
+        require(wc.height, "Trinet height", "OQ-8"),
+        require(wc.fps, "Trinet FPS", "OQ-8"),
+    )
+    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise LBYRError(f"cannot open the wrist camera {device!r} (use --wrist-dev)")
+    if wc.fourcc:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*wc.fourcc))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+    cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # OpenCV's own MJPEG decode returns all-zero frames for the Trinet (SEI blob inside the
+    # DHT segment): take the raw JPEG and decode it with decode_wrist_jpeg.
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+    ok, raw = cap.read()
+    frame = decode_wrist_jpeg(raw) if ok and raw is not None and raw.size else None
+    if frame is None:
+        cap.release()
+        raise LBYRError(f"wrist camera {device!r} opened but gave no decodable frame")
+    if (frame.shape[1], frame.shape[0]) != (w, h):
+        cap.release()
+        raise LBYRError(
+            f"wrist camera {device!r} gives {frame.shape[1]}x{frame.shape[0]}, need {w}x{h} "
+            f"{wc.fourcc} (the Trinet's only mode, OQ-8)"
+        )
+    return cap, frame
+
+
+def _wrist_candidates() -> list[str]:
+    """Non-RealSense V4L2 nodes, lowest number first."""
 
     def num(p: str) -> int:
         return int(p.rsplit("video", 1)[1])
 
+    out = []
     for d in sorted(glob.glob("/sys/class/video4linux/video*"), key=num):
         try:
             name = Path(d, "name").read_text().strip()
-            index = Path(d, "index").read_text().strip()
         except OSError:
             continue
-        if "realsense" not in name.lower() and index == "0":
-            return f"/dev/{Path(d).name}"
-    return None
+        if "realsense" not in name.lower():
+            out.append(f"/dev/{Path(d).name}")
+    return out
+
+
+def open_wrist_wait(
+    devices: Callable[[], list[str]], wc: WristCameraConfig, wait_s: float = 15.0
+) -> tuple[str, Any, np.ndarray]:
+    """Open the first device that delivers a frame; keep it OPEN (returned).
+
+    Trinet quirk (measured 2026-10-11): after a stream is closed, the NEXT open gets no frame
+    and the camera drops off USB and re-enumerates (~6 s); the open after that works. So
+    never probe-and-close, and retry for ``wait_s``. Nodes without frames (metadata, e.g.
+    /dev/video7) are skipped."""
+    t_end = time.perf_counter() + wait_s
+    errors: list[str] = []
+    while True:
+        for dev in devices():
+            try:
+                cap, frame = open_wrist(dev, wc)
+            except Exception as e:
+                errors.append(f"{dev}: {e}")
+                log.info("wrist: skip %s (%s)", dev, e)
+                continue
+            log.info("wrist: using %s", dev)
+            return dev, cap, frame
+        if time.perf_counter() >= t_end:
+            raise LBYRError(f"no wrist camera frame within {wait_s:.0f} s: {errors[-3:]}")
+        time.sleep(1.0)
 
 
 class WristCapture:
-    """Trinet via cv2.VideoCapture; resolution from WristCameraConfig if set, else default."""
+    """Trinet capture thread: ``grab()`` every frame (30 FPS, keeps the 1-frame buffer fresh,
+    no decode); ``retrieve()`` of the RAW JPEG + :func:`decode_wrist_jpeg` (1080p, ~15 ms
+    CPU) only at ``retrieve_hz`` (12 Hz, ~18% of one core) and on demand (:meth:`fresh`,
+    for the Critic)."""
 
-    def __init__(self, device: str, width: int | None, height: int | None, fourcc: str | None):
-        self.device: int | str = int(device) if device.isdigit() else device
-        self.size, self.fourcc = (width, height), fourcc
+    def __init__(self, device: str, wc: WristCameraConfig, opened: Any = None) -> None:
+        """``opened`` = (cap, first frame) from :func:`open_wrist_wait` (kept open)."""
+        self.device = device
+        self.wc = wc
+        self._opened = opened
         self.buffer: LatestFrameBuffer[np.ndarray] = LatestFrameBuffer()
+        self.grabs = self.retrieves = self.reconnects = 0
         self._cap: Any = None
-        self._thread: CaptureThread[np.ndarray] | None = None
+        self._want = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="wrist-cam", daemon=True)
+        self._t0 = 0.0
 
     def start(self) -> None:
-        import cv2  # lazy
-
-        cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            raise LBYRError(f"cannot open the wrist camera {self.device!r} (use --wrist-dev)")
-        if self.fourcc:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
-        if self.size[0] and self.size[1]:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.size[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.size[1])
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            cap.release()
-            raise LBYRError(f"wrist camera {self.device!r} opened but gave no frame")
-        self._cap = cap
+        if self._opened is not None:
+            self._cap, frame = self._opened
+            self._opened = None
+        else:
+            _, self._cap, frame = open_wrist_wait(lambda: [self.device], self.wc)
         self.buffer.put(frame)
-        self._thread = CaptureThread("wrist-cam", self._grab, self.buffer)
+        self._t0 = time.perf_counter()
         self._thread.start()
-        log.info("wrist camera %r: %dx%d", self.device, frame.shape[1], frame.shape[0])
+        log.info("wrist camera %r: %dx%d MJPG", self.device, frame.shape[1], frame.shape[0])
 
-    def _grab(self) -> np.ndarray | None:
-        ok, frame = self._cap.read()
-        return frame if ok else None
+    def _reconnect(self) -> None:
+        """The Trinet can drop off USB and re-enumerate (~3 s): re-open every 1 s."""
+        log.warning("wrist camera %r lost: reconnecting", self.device)
+        self._cap.release()
+        while not self._stop.is_set():
+            try:
+                self._cap, frame = open_wrist(self.device, self.wc)
+            except Exception as e:
+                log.debug("wrist reopen failed: %s", e)
+                self._stop.wait(1.0)
+                continue
+            self.buffer.put(frame)
+            self.reconnects += 1
+            log.warning("wrist camera %r reconnected (%d)", self.device, self.reconnects)
+            return
+
+    def _run(self) -> None:
+        period = 1.0 / self.wc.retrieve_hz
+        due = 0.0
+        fails = 0
+        while not self._stop.is_set():
+            if not self._cap.grab():
+                fails += 1
+                if fails >= 20:  # ~0.2 s without a frame: device gone
+                    self._reconnect()
+                    fails = 0
+                self._stop.wait(0.01)
+                continue
+            fails = 0
+            self.grabs += 1
+            now = time.perf_counter()
+            if self._want.is_set() or now >= due:
+                ok, raw = self._cap.retrieve()
+                frame = decode_wrist_jpeg(raw) if ok and raw is not None and raw.size else None
+                if frame is not None:
+                    self.buffer.put(frame)
+                    self.retrieves += 1
+                    due = max(due + period, now)  # deadline schedule: averages retrieve_hz
+                    self._want.clear()
+
+    def fresh(self, timeout_s: float = 4.0) -> np.ndarray | None:
+        """A frame grabbed AFTER this call (Critic input). Normally <= 1 frame period;
+        ``timeout_s`` covers a USB re-enumeration (~3 s)."""
+        item = self.buffer.get()
+        seq = item.seq if item is not None else 0
+        self._want.set()
+        t_end = time.perf_counter() + timeout_s
+        while time.perf_counter() < t_end:
+            new = self.buffer.get_if_newer(seq)
+            if new is not None:
+                return new.value
+            time.sleep(0.005)
+        return None
+
+    def rates(self) -> tuple[float, float]:
+        dt = max(time.perf_counter() - self._t0, 1e-6)
+        return self.grabs / dt, self.retrieves / dt
 
     def stop(self) -> None:
-        if self._thread is not None:
-            self._thread.stop()
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(1.0)
         if self._cap is not None:
             self._cap.release()
+            self._cap = None
 
 
 # ------------------------------------------------------------------ web
@@ -312,8 +436,11 @@ class DemoWeb:
             while self._running:
                 item = get()
                 if item is not None and item[0] != last:
-                    last = item[0]
-                    ok, jpg = cv2.imencode(".jpg", item[1], [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    last, img = item
+                    if img.shape[1] > 640:  # 1080p wrist -> 640x360 before the JPEG encode
+                        size = (640, round(640 * img.shape[0] / img.shape[1]))
+                        img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+                    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
                     if ok:
                         data = jpg.tobytes()
                         h.wfile.write(
@@ -350,6 +477,7 @@ class Rig:
     vram: VramMonitor
     status: DemoStatus
     stoppers: list[Callable[[], None]] = field(default_factory=list)
+    wrist_fresh: Callable[[], np.ndarray | None] | None = None  # on-demand decode (real)
 
 
 class Demo:
@@ -419,13 +547,17 @@ class Demo:
         time.sleep(self.r.dcfg.settle_s)  # frame after the gripper settled
         verdict = Verdict.INVALID
         for attempt in range(2):  # OCCLUDED / INVALID / TIMEOUT: re-query once
-            item = self.r.wrist.get()
-            if item is None:
+            if self.r.wrist_fresh is not None:
+                img = self.r.wrist_fresh()
+            else:
+                item = self.r.wrist.get()
+                img = item.value if item is not None else None
+            if img is None:
                 raise DemoAbort("no wrist frame")
-            raw_path = self.frame(item.value, "raw")
+            raw_path = self.frame(img, "raw")
             if self.r.overhead is not None and (o := self.r.overhead.get()) is not None:
                 self.frame(o.value.color, "overhead")
-            rid = self.r.critic.submit(item.value, state)
+            rid = self.r.critic.submit(img, state)
             if rid is None:
                 raise DemoAbort("Critic queue full")
             deadline = time.perf_counter() + self.r.cfg.critic.timeout_s + 1.0
@@ -699,11 +831,12 @@ def build_real_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatu
         overhead_buf = cam.buffer
     except Exception as e:
         status.event(f"D435 unavailable ({e}): no overhead view, rules plan", logging.ERROR)
-    wdev = args.wrist_dev or dcfg.wrist_device or find_wrist_device()
-    if wdev is None:
-        raise LBYRError("no wrist camera found (only the D435 is attached); use --wrist-dev")
     wc = cfg.cameras.wrist
-    wrist = WristCapture(wdev, wc.width, wc.height, wc.fourcc)
+    wdev = args.wrist_dev or dcfg.wrist_device
+    if wdev is not None and wdev.isdigit():
+        wdev = f"/dev/video{wdev}"
+    dev, cap, frame = open_wrist_wait(lambda: [wdev] if wdev else _wrist_candidates(), wc)
+    wrist = WristCapture(dev, wc, (cap, frame))
     wrist.start()
     stoppers.insert(0, wrist.stop)
     detect: Callable[[RGBDFrame | None], list[Detection]] = lambda f: []  # noqa: E731
@@ -750,10 +883,12 @@ def build_real_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatu
     item = wrist.buffer.get()
     size = (item.value.shape[1], item.value.shape[0]) if item is not None else None
     pre = build_wrist_preprocess(wc, size)
-    return _finish_rig(
+    rig = _finish_rig(
         args, cfg, dcfg, status, arm, joints, poses, overhead_buf, wrist.buffer, detect,
         backend, qwen, stoppers, pre,
     )  # fmt: skip
+    rig.wrist_fresh = wrist.fresh
+    return rig
 
 
 def _finish_rig(
@@ -772,6 +907,12 @@ def _finish_rig(
     stoppers: list[Callable[[], None]],
     preprocess: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> Rig:
+    if args.crop:
+        box = tuple(float(v) for v in args.crop.split(","))
+        if len(box) != 4:
+            raise LBYRError("--crop needs x0,y0,x1,y1 (normalized 0..1)")
+        cfg.critic = replace(cfg.critic, crop_box_norm=(box[0], box[1], box[2], box[3]))
+    status.event(f"Critic crop box (normalized): {cfg.critic.crop_box_norm or 'centred square'}")
     critic = CriticWorker(backend, cfg.critic, preprocess=preprocess)
     critic.start()
     logger = EpisodeLogger(args.log_dir / time.strftime("demo-%Y%m%d-%H%M%S"))
@@ -798,6 +939,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-planner", action="store_true", help="skip Qwen: rules planner")
     p.add_argument("--port", help="bridge serial port (default: the only /dev/ttyACM*)")
     p.add_argument("--wrist-dev", help="wrist camera: /dev/videoN or index (default: auto)")
+    p.add_argument(
+        "--crop",
+        help="Critic gripper box x0,y0,x1,y1 normalized 0..1 (default CriticConfig.crop_box_norm)",
+    )
     p.add_argument("--http-port", type=int, default=d.http_port)
     p.add_argument("--log-dir", type=Path, default=AppConfig().logging.episodes_dir)
     p.add_argument("--once", action="store_true", help="one episode, then exit")

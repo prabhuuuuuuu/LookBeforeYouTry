@@ -416,7 +416,7 @@ def bench_critic(
     critic: Any,
     frames: list[np.ndarray],
     crop: bool = False,
-    crop_box: tuple[int, int, int, int] | None = None,
+    crop_box: tuple[float, float, float, float] | None = None,
     crop_size: int = 378,
 ) -> dict[str, Any]:
     """Time ``critic.infer`` (including the crop, if any) on every frame."""
@@ -445,7 +445,7 @@ def _critic_variant(
     critic: Any,
     frames: list[np.ndarray],
     crop: bool,
-    crop_box: tuple[int, int, int, int] | None,
+    crop_box: tuple[float, float, float, float] | None,
     mon: Any,
 ) -> dict[str, Any]:
     from lbyr.ai.critic import CRITIC_PROMPT
@@ -467,14 +467,14 @@ def _critic_variant(
 def run_critic_variants(
     critic: Any, frames: list[np.ndarray], args: argparse.Namespace, mon: Any
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Runtime input (378x378 crop, CriticConfig.crop_xywh); with --critic-crop the full
+    """Runtime input (378x378 crop, CriticConfig.crop_box_norm); with --critic-crop the full
     frame first for comparison; with --critic-compile the same after Moondream's compile().
     Returns (variants, skip messages)."""
     from lbyr.ai.critic import CRITIC_PROMPT
     from lbyr.ai.imaging import critic_crop
     from lbyr.config import CriticConfig
 
-    crop_box = CriticConfig().crop_xywh  # OQ-12 gripper ROI; None = centred
+    crop_box = CriticConfig().crop_box_norm  # OQ-12 gripper ROI; None = centred square
     inputs = ([("full", False)] if args.critic_crop else []) + [("crop378", True)]
     variants = [
         _critic_variant(f"{args.critic_dtype}-{tag}", critic, frames, crop, crop_box, mon)
@@ -593,7 +593,7 @@ def critic_accuracy(critic: Any, root: Path) -> dict[str, Any] | None:
         for f in files:
             img = read_bgr(f)
             if cfg.crop_enabled:
-                img = critic_crop(img, cfg.crop_xywh, cfg.crop_size_px)
+                img = critic_crop(img, cfg.crop_box_norm, cfg.crop_size_px)
             y_true.append(cls)
             y_pred.append(parse_verdict(critic.infer(img, CRITIC_PROMPT)).value)
     report = classification_report(y_true, y_pred)
@@ -667,7 +667,7 @@ def bench_combined(
     print(f"Combined: {len(frames)} x (Critic query + planner command) ...")
     for i, f in enumerate(frames):
         t = time.perf_counter()
-        critic.infer(critic_crop(f, ccfg.crop_xywh, ccfg.crop_size_px), CRITIC_PROMPT)
+        critic.infer(critic_crop(f, ccfg.crop_box_norm, ccfg.crop_size_px), CRITIC_PROMPT)
         critic_ms.append((time.perf_counter() - t) * 1000)
         case = LANGUAGE_CASES[i % len(LANGUAGE_CASES)]
         t = time.perf_counter()

@@ -17,7 +17,7 @@ def test_device_path_wins_over_index_and_missing_device_is_unconfirmed() -> None
     with pytest.raises(HardwareNotConfirmedError, match="OQ-7"):
         TrinetWristCamera(WristCameraConfig(width=640, height=480, fps=30))
     with pytest.raises(HardwareNotConfirmedError, match="OQ-8"):
-        TrinetWristCamera(WristCameraConfig(device_index=0))
+        TrinetWristCamera(WristCameraConfig(device_index=0, width=None))
 
 
 def test_no_calibration_warns_and_uses_raw(

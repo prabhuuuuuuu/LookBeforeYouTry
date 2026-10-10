@@ -6,7 +6,7 @@ and the Critic crop run in the Critic worker, off the FSM thread.
 
 Pipeline: Trinet (UVC, ``cv2.VideoCapture`` by index or V4L2 path) -> raw frame ->
 dewarp if ``data/calib/trinet_fisheye.yaml`` exists (else a warning and the raw frame)
--> 378x378 Critic crop (``CriticConfig.crop_xywh``) -> Moondream2.
+-> gripper box (``CriticConfig.crop_box_norm``) resized to 378x378 -> Moondream2.
 Cost: capture ~1-5 ms, dewarp remap ~2-5 ms per Critic call (bible 5.2), 0 VRAM.
 """
 
@@ -97,6 +97,58 @@ class TrinetWristCamera:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+
+_JPEG_HEADER_MARKERS = {0xC0, 0xC1, 0xC2, 0xC4, 0xDB, 0xDD, 0xDA, 0xFE, *range(0xE0, 0xF0)}
+
+
+def _walks_to_sos(b: bytes, k: int, limit: int = 8) -> bool:
+    """True if a chain of valid header segments starting at ``k`` reaches SOS (FF DA)."""
+    for _ in range(limit):
+        if k + 4 > len(b) or b[k] != 0xFF or b[k + 1] not in _JPEG_HEADER_MARKERS:
+            return False
+        if b[k + 1] == 0xDA:
+            return True
+        k += 2 + int.from_bytes(b[k + 2 : k + 4], "big")
+    return False
+
+
+def strip_trinet_sei(b: bytes) -> bytes:
+    """Repair a Trinet MJPEG frame (measured 2026-10-11).
+
+    The camera inserts an H.264-style SEI NAL (``00 00 00 01 06 05 ... "TRINETIMUSEI"``,
+    IMU data, ~1.1-1.4 KB) INSIDE the first DHT segment, right after its length field, so
+    every standard decoder fails (OpenCV's V4L2 path silently returns all-zero frames).
+    Walk the header; where a segment's declared length does not land on a marker, cut from
+    after its length field to ``(L - 2)`` bytes before the next marker from which the
+    segment chain validly reaches SOS. Clean JPEGs are returned unchanged. Cost ~0.1 ms.
+    """
+    i = 2
+    while i + 4 <= len(b) and b[i] == 0xFF:
+        if b[i + 1] == 0xDA:
+            return b
+        seg_len = int.from_bytes(b[i + 2 : i + 4], "big")
+        nxt = i + 2 + seg_len
+        if nxt < len(b) and b[nxt] != 0xFF:  # body displaced by the SEI blob
+            k = b.find(b"\xff", nxt)
+            while k >= 0 and not _walks_to_sos(b, k):
+                k = b.find(b"\xff", k + 1)
+            if k < 0:
+                return b
+            return b[: i + 4] + b[k - (seg_len - 2) :]
+        i = nxt
+    return b
+
+
+def decode_wrist_jpeg(raw: np.ndarray | bytes) -> np.ndarray | None:
+    """Raw Trinet MJPEG buffer (``CAP_PROP_CONVERT_RGB = 0``) -> BGR frame, or None.
+    ~15 ms for 1920x1080 on the Orin CPU."""
+    import cv2  # lazy
+
+    data = raw if isinstance(raw, bytes) else raw.tobytes()
+    fixed = strip_trinet_sei(data)
+    img = cv2.imdecode(np.frombuffer(fixed, np.uint8), cv2.IMREAD_COLOR)
+    return img if img is not None else None
 
 
 def build_wrist_preprocess(
