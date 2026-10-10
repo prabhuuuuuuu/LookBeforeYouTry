@@ -107,9 +107,9 @@ class _Mon:
 
 
 def test_critic_only_flag_and_dtype_choices() -> None:
-    args = bench.parse_args(["--critic-only", "--critic-dtype", "bf16", "--critic-crop"])
-    assert args.skip_planner and args.critic_dtype == "bf16" and args.critic_crop
-    assert bench.parse_args([]).critic_dtype == "fp16"
+    args = bench.parse_args(["--critic-only", "--critic-dtype", "fp16", "--critic-crop"])
+    assert args.planner_list == [] and args.critic_dtype == "fp16" and args.critic_crop
+    assert bench.parse_args([]).critic_dtype == "bf16"
     with pytest.raises(SystemExit):
         bench.parse_args(["--critic-dtype", "int8"])
 
@@ -119,7 +119,7 @@ def test_variants_full_crop_and_compile_skip(capsys: pytest.CaptureFixture[str])
     args = bench.parse_args(["--critic-only", "--critic-crop", "--critic-compile", "--n", "3"])
     critic = _FakeCritic("this Moondream2 revision exposes no compile() method")
     variants, skipped = bench.run_critic_variants(critic, frames, args, _Mon())
-    assert [v["variant"] for v in variants] == ["fp16-full", "fp16-crop378"]
+    assert [v["variant"] for v in variants] == ["bf16-full", "bf16-crop378"]
     assert [v["input"] for v in variants] == ["640x480", "378x378"]
     assert all(v["latency_ms"]["n"] == 3 and v["verdicts"] == {"GRASPED": 3} for v in variants)
     assert skipped and "no compile()" in skipped[0]
@@ -131,12 +131,112 @@ def test_variants_full_crop_and_compile_skip(capsys: pytest.CaptureFixture[str])
     }
     bench.print_critic_variants(result)
     out = capsys.readouterr().out
-    assert "fp16-crop378" in out and "p50 vs full" in out and "no compile()" in out
+    assert "bf16-crop378" in out and "p50 vs first" in out and "no compile()" in out
 
 
 def test_compiled_variants_run_after_compile() -> None:
     frames = [bench.synthetic_frame(i) for i in range(2)]
     args = bench.parse_args(["--critic-only", "--critic-compile", "--n", "2"])
     variants, skipped = bench.run_critic_variants(_FakeCritic(None), frames, args, _Mon())
-    assert [v["variant"] for v in variants] == ["fp16-full", "fp16-full-compiled"]
+    assert [v["variant"] for v in variants] == ["bf16-crop378", "bf16-crop378-compiled"]
     assert skipped == []
+
+
+def test_default_critic_variant_is_the_runtime_crop() -> None:
+    frames = [bench.synthetic_frame(i) for i in range(2)]
+    args = bench.parse_args(["--critic-only", "--n", "2"])
+    critic = _FakeCritic(None)
+    variants, _ = bench.run_critic_variants(critic, frames, args, _Mon())
+    assert [v["variant"] for v in variants] == ["bf16-crop378"]
+    assert set(critic.shapes) == {(378, 378, 3)}
+
+
+# ------------------------------------------------------------------ planner models (M-2)
+def test_planner_models_args() -> None:
+    args = bench.parse_args(["--planner-models", "qwen3-1.7b,qwen3-0.6b", "--combined"])
+    assert args.planner_list == ["qwen3-1.7b", "qwen3-0.6b"] and args.combined
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--planner-models", "smolvlm2"])
+    with pytest.raises(SystemExit):
+        bench.parse_args(["--combined", "--skip-critic"])
+
+
+class _FakeLangPlanner:
+    """Answers the compact schema; gets the 'blue' commands wrong / invalid on purpose."""
+
+    def __init__(self) -> None:
+        from lbyr.ai.planner import GenStats
+
+        self._stats = GenStats
+        self.last_stats: Any = None
+
+    def generate_language_untimed(self, request: Any) -> str:
+        self.last_stats = self._stats(19, 0.5)
+        text = request.instruction.lower()
+        if "blue" in text:
+            return "the blue cube" if "zone b" in text else '{"a":1,"s":40,"g":80,"p":7}'
+        pick = next(i for kw, i in (("red", 1), ("sponge", 3), ("acrylic", 4)) if kw in text)
+        place = 7 if "zone a" in text else 8
+        return f'{{"a":{pick},"s":40,"g":80,"p":{place}}}'
+
+
+def test_bench_language_planner_rates() -> None:
+    out = bench.bench_language_planner(_FakeLangPlanner())
+    assert len(bench.LANGUAGE_CASES) == 10
+    blue = sum("blue" in c.instruction.lower() for c in bench.LANGUAGE_CASES)
+    blue_b = sum(
+        "blue" in c.instruction.lower() and "zone b" in c.instruction.lower()
+        for c in bench.LANGUAGE_CASES
+    )
+    assert out["valid_parse_fraction"] == pytest.approx((10 - blue_b) / 10)
+    assert out["correct_fraction"] == pytest.approx((10 - blue) / 10)
+    assert out["tokens_per_s"]["p50"] == pytest.approx(38.0)
+    assert out["within_timeout_fraction"] == 1.0
+    assert len(out["samples"]) == 10
+
+
+def test_language_cases_resolve_against_the_detection_list() -> None:
+    ids = {d.id: d.label for d in bench.language_detections()}
+    for c in bench.LANGUAGE_CASES:
+        assert c.pick_id in ids and "zone" not in ids[c.pick_id]
+        assert "zone" in ids[c.place_id]
+
+
+def test_missing_planner_weights_are_skipped(tmp_path: Path) -> None:
+    out = bench.bench_planner_model("qwen3-0.6b", tmp_path, _Mon())
+    assert "skipped" in out
+    bench.print_planner_table([out])
+
+
+# ------------------------------------------------------------------ Critic accuracy
+def test_classification_report() -> None:
+    y_true = ["GRASPED", "GRASPED", "EMPTY", "SLIPPING", "OCCLUDED"]
+    y_pred = ["GRASPED", "SLIPPING", "EMPTY", "SLIPPING", "INVALID"]
+    r = bench.classification_report(y_true, y_pred)
+    assert r["accuracy"] == pytest.approx(3 / 5)
+    assert r["labels"][-1] == "INVALID"
+    assert r["confusion"]["GRASPED"]["SLIPPING"] == 1
+    assert r["confusion"]["OCCLUDED"]["INVALID"] == 1
+    g, s = r["per_class"]["GRASPED"], r["per_class"]["SLIPPING"]
+    assert (g["precision"], g["recall"]) == (1.0, 0.5)
+    assert (s["precision"], s["recall"]) == (0.5, 1.0)
+    assert r["per_class"]["OCCLUDED"]["f1"] == 0.0
+
+
+def test_accuracy_on_dataset_and_warning_without(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from PIL import Image
+
+    assert bench.critic_accuracy(_FakeCritic(None), tmp_path) is None
+    bench.print_accuracy(None, tmp_path)
+    assert "NOT measured" in capsys.readouterr().out
+    for cls in ("GRASPED", "EMPTY"):
+        (tmp_path / cls).mkdir()
+        Image.new("RGB", (640, 480)).save(tmp_path / cls / "a.jpg")
+    critic = _FakeCritic(None)  # always answers GRASPED
+    acc = bench.critic_accuracy(critic, tmp_path)
+    assert acc is not None and acc["n"] == 2 and acc["accuracy"] == 0.5
+    assert set(critic.shapes) == {(378, 378, 3)}  # runtime crop applied
+    bench.print_accuracy(acc, tmp_path)
+    assert "Confusion matrix" in capsys.readouterr().out
