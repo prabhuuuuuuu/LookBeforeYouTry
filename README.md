@@ -53,4 +53,11 @@ data/       git-ignored: frames/, datasets/, calib/, episodes/
 ## Jetson install
 
 JetPack provides CUDA-enabled OpenCV, torch and pyrealsense2 (the last one built from
-source). Do **not** pip-install them on the Jetson. Run `pip install -e ".[jetson,dev]"`.
+source). Do **not** pip-install them on the Jetson.
+
+```bash
+python3 -m venv --system-site-packages .venv && source .venv/bin/activate
+pip install -U pip setuptools wheel "packaging>=24.2"
+export PIP_CONSTRAINT=constraints-jetson.txt   # numpy<2: NumPy 2 breaks the JetPack cv2
+pip install -e ".[jetson,dev]"
+```

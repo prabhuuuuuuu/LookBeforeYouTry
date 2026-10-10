@@ -23,8 +23,11 @@ dependencies = [
 #   - opencv (cv2)          (JetPack CUDA build)
 #   - pyrealsense2          (librealsense source build)
 # Install those per docs/ONBOARDING_LAVISH.md, then `pip install -e .[jetson]`.
+# numpy<2: JetPack's system OpenCV and the Jetson torch wheels are built against NumPy 1.x
+# (NumPy 2 breaks `import cv2` with "_ARRAY_API not found"). Also see constraints-jetson.txt.
 jetson = [
     "ikpy>=3.3",
+    "numpy<2",
 ]
 # Laptop / CI only: GUI-capable OpenCV for dewarp tests and tools/. Never install on the Jetson.
 laptop = [
