@@ -24,6 +24,9 @@
 // The first pulse cannot be smoothed (no feedback): rest the arm in its zero
 // pose before powering the servo rail.
 //
+// HOST CONTRACT (lbyr SerialArm): this board is the trajectory generator. The host
+// sends ONE 'm' per motion segment and waits for DONE; it never streams setpoints.
+//
 // Serial 115200, newline-terminated:
 //   J              test joint J: swing +/-30 deg, back to zero
 //   g J DEG        move joint J to DEG relative to its zero
@@ -36,7 +39,21 @@
 //   x | stop       brake smoothly and hold
 //   speed V A      max speed deg/s and accel deg/s^2 (capped)
 //   off [J]        release PWM (arm may fall; support it first)
+//   q              one status line (below)
 //   list           print state;  help  print commands
+//
+// Replies (one line each):
+//   OK ... / ERR ...                      command accepted / rejected
+//   DONE                                  all attached joints settled after a motion
+//                                         command (g, m, home, t, set, J test end, and
+//                                         the boot homing). Exactly once per motion: a
+//                                         command that pre-empts a running motion
+//                                         replaces it, so only one DONE follows. A 'DONE'
+//                                         printed after 'OK m' belongs to that 'm'.
+//   Q,<moving 0|1>,<cur_us j1..j6>        reply to 'q'; cur = commanded pulse now
+//   S,j,zero_us,cur_us,attached,goal_us,moving,name   per joint, from 'list'
+//   V,vmax_deg_s,amax_deg_s2                          last line of 'list'
+// "cur"/"goal" are COMMANDED pulses (no feedback). goal = final target incl. backlash leg.
 
 const int COUNT = 6;
 const uint8_t PINS[COUNT] = {D0, D1, D3, D4, D5, D8};
@@ -84,6 +101,7 @@ Preferences prefs;
 uint32_t lastTick = 0;
 char line[96];
 size_t used = 0;
+bool motionPending = false;  // a motion command is running; print DONE once it settles
 
 uint32_t ticks(float us) {
   return (uint32_t)((us * (1UL << PWM_BITS) + PERIOD_US / 2) / PERIOD_US);
@@ -194,6 +212,12 @@ void service() {
 
 bool settled(int j) { return J[j].pos == J[j].tgt && J[j].vel == 0 && !J[j].hasFin; }
 
+bool anyMoving() {
+  for (int j = 0; j < COUNT; j++)
+    if (J[j].attached && !settled(j)) return true;
+  return false;
+}
+
 void waitMs(uint32_t ms) {
   uint32_t t0 = millis();
   while (millis() - t0 < ms) { service(); delay(1); }
@@ -238,9 +262,10 @@ void homeAll() {
   moveSynced(goal, use);
 }
 
-void moveDeg(int j, float deg) {
-  if (!attachJoint(j)) { Serial.println("ERR attach"); return; }
+bool moveDeg(int j, float deg) {
+  if (!attachJoint(j)) { Serial.println("ERR attach"); return false; }
   setTarget(j, J[j].zeroUs + deg * US_PER_DEG, 1.0f);
+  return true;
 }
 
 void storeZero(int j) {
@@ -250,15 +275,22 @@ void storeZero(int j) {
 }
 
 void list() {
+  // Fields 1-4 unchanged (tools/arm_gui.py); goal_us and moving appended before the name.
   for (int j = 0; j < COUNT; j++)
-    Serial.printf("S,%d,%d,%.0f,%d,%s\n", j + 1, J[j].zeroUs, J[j].pos,
-                  J[j].attached ? 1 : 0, NAMES[j]);
+    Serial.printf("S,%d,%d,%.0f,%d,%.0f,%d,%s\n", j + 1, J[j].zeroUs, J[j].pos,
+                  J[j].attached ? 1 : 0, goalOf(j), (J[j].attached && !settled(j)) ? 1 : 0,
+                  NAMES[j]);
   Serial.printf("V,%.0f,%.0f\n", vmaxDeg, amaxDeg);
+}
+
+void status() {
+  Serial.printf("Q,%d,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f\n", anyMoving() ? 1 : 0, J[0].pos, J[1].pos,
+                J[2].pos, J[3].pos, J[4].pos, J[5].pos);
 }
 
 void help() {
   Serial.println("J test | g J DEG | m D1..D6 | t J D nudge | z [J] zero | set J US | save");
-  Serial.println("home | x stop | speed V A | off [J] | list | help");
+  Serial.println("home | x stop | speed V A | off [J] | q status | list | help");
   Serial.println("Boot: joints go to saved zeros. Rest arm in zero pose before power. Support arm before 'off'.");
 }
 
@@ -270,11 +302,13 @@ void testJoint(int j) {
   moveDeg(j, -TEST_DEG); waitSettled(j);
   moveDeg(j, 0);         waitSettled(j);
   Serial.println("OK test done (holding zero; 'off' to release)");
+  motionPending = true;  // DONE follows (already settled)
 }
 
 void nudge(int j, int d) {
   if (!attachJoint(j)) { Serial.println("ERR attach"); return; }
   setTarget(j, goalOf(j) + d, 1.0f);
+  motionPending = true;
   Serial.printf("OK joint %d target=%.0f us (zero is still %d; 'z %d' to store)\n",
                 j + 1, goalOf(j), J[j].zeroUs, j + 1);
 }
@@ -284,6 +318,7 @@ void setZero(int j, int us) {
   J[j].zeroUs = (int)clampUs(j, (float)us);
   storeZero(j);
   setTarget(j, J[j].zeroUs, 1.0f);
+  motionPending = true;
   Serial.printf("OK joint %d zero set to %d us (saved)\n", j + 1, J[j].zeroUs);
 }
 
@@ -303,8 +338,9 @@ void command(char *cmd) {
   char extra;
   if (!strcmp(cmd, "help")) { help(); return; }
   if (!strcmp(cmd, "list")) { list(); return; }
+  if (!strcmp(cmd, "q")) { status(); return; }
   if (!strcmp(cmd, "save")) { for (int i = 0; i < COUNT; i++) storeZero(i); Serial.println("OK saved all zeros"); return; }
-  if (!strcmp(cmd, "home")) { homeAll(); Serial.println("OK home"); return; }
+  if (!strcmp(cmd, "home")) { homeAll(); motionPending = true; Serial.println("OK home"); return; }
   if (!strcmp(cmd, "x") || !strcmp(cmd, "stop")) { stopAll(); Serial.println("OK stopped; holding"); return; }
   if (!strcmp(cmd, "off")) { for (int i = 0; i < COUNT; i++) releaseJoint(i); Serial.println("OK off"); return; }
   if (sscanf(cmd, "off %d %c", &j, &extra) == 1 && validJoint(j)) {
@@ -330,12 +366,15 @@ void command(char *cmd) {
       goal[i] = J[i].zeroUs + m[i] * US_PER_DEG;
     }
     moveSynced(goal, use);
-    Serial.println("OK m");
+    motionPending = true;
+    Serial.println("OK m");  // the next DONE belongs to this move
     return;
   }
   if (sscanf(cmd, "g %d %f %c", &j, &v, &extra) == 2 && validJoint(j)) {
-    moveDeg(j - 1, v);
-    Serial.printf("OK g %d %.1f deg\n", j, v);
+    if (moveDeg(j - 1, v)) {
+      motionPending = true;
+      Serial.printf("OK g %d %.1f deg\n", j, v);
+    }
     return;
   }
   if (sscanf(cmd, "%d %c", &j, &extra) == 1 && validJoint(j)) { testJoint(j - 1); return; }
@@ -360,11 +399,16 @@ void setup() {
     J[i].scale = 1;
   }
   homeAll();  // staggered attach at saved zeros, then hold
+  motionPending = true;  // DONE once boot homing has settled
   help();
 }
 
 void loop() {
   service();
+  if (motionPending && !anyMoving()) {  // exactly one DONE per motion command
+    motionPending = false;
+    Serial.println("DONE");
+  }
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\r' || c == '\n') {
