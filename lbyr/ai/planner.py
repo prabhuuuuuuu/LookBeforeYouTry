@@ -9,10 +9,12 @@ The planner NEVER outputs joint angles; IK produces joints. Contract::
      "notes": "..."}
 
 Temperature 0, 3 s hard timeout for every in-loop call (:func:`plan_with_timeout`).
-Default backend is the rule-based planner; Qwen is only loaded with ``backend = "qwen"``.
-Qwen "language mode" (:func:`plan_language`, demo intro only): text-only prompt, compact
-schema ``{"a":2,"s":40,"g":80,"p":5}``, its own ``qwen_timeout_s`` (8 s). Every path goes
-through the strict :func:`parse_skill_chain`. Each result carries a :class:`ReasoningTrace`.
+Default backend is the rule-based planner; Qwen2.5-VL is only loaded with
+``backend = "qwen"``. "Language mode" (:func:`plan_language`, demo intro only): text-only
+prompt, compact schema ``{"a":2,"s":40,"g":80,"p":5}``, its own ``qwen_timeout_s`` (8 s),
+served by Qwen3 (``language_backend = "qwen3_text"``, default, thinking disabled) or by
+Qwen2.5-VL text-only (``"qwen_vl"``). Every path goes through the strict
+:func:`parse_skill_chain`. Each result carries a :class:`ReasoningTrace`.
 """
 
 from __future__ import annotations
@@ -731,6 +733,12 @@ class QwenPlanner:
     def language_prompt_for(self, request: PlanRequest) -> str:
         return build_language_prompt(request)
 
+    def generate_language_untimed(self, request: PlanRequest) -> str:
+        """BENCHMARK/TOOLS ONLY: language mode without the ``max_time`` cut-off."""
+        return self._run(
+            self.language_prompt_for(request), None, self.cfg.language_max_new_tokens, None
+        )
+
     def generate_language(self, request: PlanRequest) -> str:
         """Demo-intro "language mode": text only (``request.image_bgr`` is ignored), compact
         schema, at most ``cfg.language_max_new_tokens`` tokens; generation stops itself after
@@ -750,3 +758,136 @@ class QwenPlanner:
             text, n_tokens = self._engine.run(prompt, image, max_new_tokens, max_time_s)
             self.last_stats = GenStats(n_tokens, time.perf_counter() - t0)
         return text
+
+
+# ------------------------------------------------------------------ Qwen3 text (language mode)
+_EMPTY_THINK = re.compile(r"^\s*<think>\s*</think>\s*")
+
+
+def strip_empty_think(text: str) -> str:
+    """Remove a leading EMPTY ``<think></think>`` block (Qwen3 with thinking disabled).
+    A non-empty reasoning block is left in place, so the strict parser rejects it."""
+    return _EMPTY_THINK.sub("", text, count=1)
+
+
+class _HFQwen3TextEngine:
+    """transformers Qwen3 causal LM, greedy, thinking disabled. torch is imported lazily."""
+
+    def __init__(self, path: Path, device: str, dtype: str) -> None:
+        force_offline()  # edge-only: never touch the network
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self._torch = torch
+        self._device = device
+        tdtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+        self._tok: Any = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
+        self._model: Any = AutoModelForCausalLM.from_pretrained(
+            str(path), dtype=tdtype, device_map={"": device}, local_files_only=True
+        ).eval()
+
+    def run(
+        self, prompt: str, image: Any | None, max_new_tokens: int, max_time_s: float | None
+    ) -> tuple[str, int]:
+        if image is not None:
+            raise ValueError("Qwen3 text planner is text-only")
+        text = self._tok.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,  # Qwen3: no <think> reasoning (latency)
+        )
+        inputs = self._tok([text], return_tensors="pt").to(self._device)
+        with self._torch.inference_mode():
+            out = self._model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,  # greedy == temperature 0
+                temperature=None,
+                top_p=None,
+                top_k=None,
+                min_p=None,
+                max_time=max_time_s,  # an abandoned (timed-out) call stops itself
+            )
+        new = out[0, inputs["input_ids"].shape[1] :]
+        return self._tok.decode(new, skip_special_tokens=True), int(new.shape[0])
+
+
+class Qwen3TextPlanner:
+    """Qwen3 (default ~/models/qwen3-1.7b) for the demo-intro language mode ONLY.
+
+    Text-only, thinking disabled (``enable_thinking=False``), greedy, at most
+    ``cfg.language_max_new_tokens`` tokens, generation stops itself after
+    ``cfg.qwen_timeout_s``. Same compact schema and strict parser as the Qwen2.5-VL language
+    mode (:func:`plan_language`). Cost: see bible 9.2 / ``tools/bench_models.py
+    --planner-models``. ``engine`` injects a fake (tests).
+    """
+
+    backend_name = "qwen3_text"
+
+    def __init__(self, cfg: PlannerConfig, *, engine: QwenEngine | None = None) -> None:
+        cfg.validate()
+        self.cfg = cfg
+        self.last_stats: GenStats | None = None
+        self._lock = threading.Lock()
+        if engine is None:
+            path = cfg.language_model_path.expanduser()
+            if not path.is_dir():
+                raise ConfigError(
+                    f"planner.language_model_path {path} does not exist (local weights only)"
+                )
+            t0 = time.perf_counter()
+            engine = _HFQwen3TextEngine(path, cfg.device, cfg.language_dtype)
+            log.info("Qwen3 (%s) loaded in %.1f s", path.name, time.perf_counter() - t0)
+            log_cuda_allocated(f"Qwen3 text planner ({path.name})")
+        self._engine = engine
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        dummy = PlanRequest(
+            "pick up the block", [Detection(1, "block", 0.9, (200.0, 150.0, 300.0, 250.0))]
+        )
+        t0 = time.perf_counter()
+        out = run_with_timeout(
+            lambda: self._run(self.language_prompt_for(dummy), 8, self.cfg.qwen_timeout_s),
+            self.cfg.warmup_timeout_s,
+            "qwen3-warmup",
+        )
+        if isinstance(out, TimeoutResult):
+            raise LBYRError(f"Qwen3 warm-up exceeded {self.cfg.warmup_timeout_s:.0f} s")
+        log.info("Qwen3 warm-up in %.0f ms", (time.perf_counter() - t0) * 1000)
+
+    def language_prompt_for(self, request: PlanRequest) -> str:
+        return build_language_prompt(request)
+
+    def generate_language(self, request: PlanRequest) -> str:
+        return strip_empty_think(
+            self._run(
+                self.language_prompt_for(request),
+                self.cfg.language_max_new_tokens,
+                self.cfg.qwen_timeout_s,
+            )
+        )
+
+    def generate_language_untimed(self, request: PlanRequest) -> str:
+        """BENCHMARK/TOOLS ONLY: no ``max_time`` cut-off. Never use at runtime."""
+        return strip_empty_think(
+            self._run(self.language_prompt_for(request), self.cfg.language_max_new_tokens, None)
+        )
+
+    def _run(self, prompt: str, max_new_tokens: int, max_time_s: float | None) -> str:
+        with self._lock:
+            t0 = time.perf_counter()
+            text, n_tokens = self._engine.run(prompt, None, max_new_tokens, max_time_s)
+            self.last_stats = GenStats(n_tokens, time.perf_counter() - t0)
+        return text
+
+
+def build_language_planner(cfg: PlannerConfig) -> LanguagePlanner:
+    """Language-mode planner for ``cfg.language_backend``: "qwen3_text" (default) loads
+    Qwen3 from ``cfg.language_model_path``; "qwen_vl" loads Qwen2.5-VL from ``cfg.model_path``
+    and uses it text-only."""
+    cfg.validate()
+    if cfg.language_backend == "qwen_vl":
+        return QwenPlanner(cfg)
+    return Qwen3TextPlanner(cfg)

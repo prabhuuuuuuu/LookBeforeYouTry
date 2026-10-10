@@ -1,9 +1,11 @@
 """Real-model tests. Skipped by default; run on the Jetson with:  pytest -m jetson -v
 
-Weights: /home/sentrix/models/{moondream2,qwen2.5-vl-3b}, override with the
-LBYR_MOONDREAM_PATH / LBYR_QWEN_PATH environment variables. Loads both models (about 11 GB).
+Weights: /home/sentrix/models/{moondream2,qwen3-1.7b}, override with LBYR_MOONDREAM_PATH /
+LBYR_QWEN3_PATH. Loads Moondream2 (bf16) + Qwen3-1.7B (about 8 GB). Qwen2.5-VL is no longer
+loaded by default: set LBYR_TEST_QWEN_VL=1 (and LBYR_QWEN_PATH) to run its tests too.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -12,7 +14,15 @@ import pytest
 
 from lbyr.ai.critic import CRITIC_PROMPT, MODEL_CLASSES, Moondream2Critic, parse_verdict
 from lbyr.ai.cuda_mem import cuda_allocated_mb
-from lbyr.ai.planner import PlanRequest, QwenPlanner, parse_skill_chain, plan_with_timeout
+from lbyr.ai.imaging import critic_crop
+from lbyr.ai.planner import (
+    PlanRequest,
+    Qwen3TextPlanner,
+    QwenPlanner,
+    parse_skill_chain,
+    plan_language,
+    plan_with_timeout,
+)
 from lbyr.config import CriticConfig, PlannerConfig
 from lbyr.perception.detector import Detection
 
@@ -39,8 +49,18 @@ def critic(moondream_path: Path) -> Moondream2Critic:
 
 
 @pytest.fixture(scope="module")
+def qwen3(critic: Moondream2Critic) -> Qwen3TextPlanner:
+    # Depends on `critic`: Critic first, then the planner (co-residency, as in production).
+    path = Path(os.environ.get("LBYR_QWEN3_PATH", "/home/sentrix/models/qwen3-1.7b"))
+    if not any(path.glob("*.safetensors")):
+        pytest.skip(f"no Qwen3 weights at {path}")
+    return Qwen3TextPlanner(PlannerConfig(language_model_path=path))
+
+
+@pytest.fixture(scope="module")
 def planner(critic: Moondream2Critic, qwen_path: Path) -> QwenPlanner:
-    # Depends on `critic`: Critic first, then Planner (co-residency, as in production).
+    if os.environ.get("LBYR_TEST_QWEN_VL") != "1":
+        pytest.skip("Qwen2.5-VL is opt-in: LBYR_TEST_QWEN_VL=1")
     if not qwen_path.is_dir():
         pytest.skip(f"no Qwen weights at {qwen_path}")
     return QwenPlanner(PlannerConfig(model_path=qwen_path))
@@ -48,7 +68,7 @@ def planner(critic: Moondream2Critic, qwen_path: Path) -> QwenPlanner:
 
 def test_critic_answers_one_class_within_its_timeout(critic: Moondream2Critic) -> None:
     t0 = time.perf_counter()
-    text = critic.infer(_frame(), CRITIC_PROMPT)
+    text = critic.infer(critic_crop(_frame()), CRITIC_PROMPT)  # runtime input: 378x378
     assert time.perf_counter() - t0 < CriticConfig().timeout_s
     assert parse_verdict(text) in MODEL_CLASSES, text
 
@@ -75,6 +95,15 @@ def test_planner_never_runs_past_the_hard_timeout(planner: QwenPlanner) -> None:
     time.sleep(1.5)  # abandoned generation stops itself about 0.6 s after the timeout
 
 
-def test_both_models_are_resident_together(critic: Moondream2Critic, planner: QwenPlanner) -> None:
+def test_qwen3_language_mode_plans_within_its_timeout(qwen3: Qwen3TextPlanner) -> None:
+    req = PlanRequest("put the red block on the place zone", DETS)
+    res = plan_language(qwen3, req, qwen3.cfg)
+    assert res.chain is not None, (res.error, res.raw_text)
+    assert (res.chain.approach.target_id, res.chain.place.target_id) == (2, 5)
+
+
+def test_critic_and_qwen3_are_resident_together(
+    critic: Moondream2Critic, qwen3: Qwen3TextPlanner
+) -> None:
     mb = cuda_allocated_mb()
-    assert mb is not None and mb > 9000  # ~4 GB Critic + ~7 GB Planner
+    assert mb is not None and mb > 6000  # ~3.7 GB Critic + ~3.3 GB Qwen3-1.7B

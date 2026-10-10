@@ -5,9 +5,12 @@ is the smaller one and its load must never be the thing that fails after the pla
 took the memory; ``torch.cuda.memory_allocated`` and system RAM (tegrastats) are logged at
 startup and after each load.
 
-Memory guard: with ``planner.backend = "qwen"``, if free system RAM after loading both
-models is below ``planner.qwen_min_free_ram_mb`` (default 1.5 GB), :func:`load_models` raises
-:class:`InsufficientMemoryError` so the episode loop never starts.
+Order: Critic -> in-loop planner (rules by default: no model) -> language-mode planner (only
+with ``planner.language_mode``; Qwen3 text by default). Free RAM is logged after each load.
+
+Memory guard: with ``planner.backend = "qwen"`` or ``planner.language_mode``, if free system
+RAM after loading all models is below ``planner.qwen_min_free_ram_mb`` (default 1.5 GB),
+:func:`load_models` raises :class:`InsufficientMemoryError` so the episode loop never starts.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from dataclasses import dataclass
 
 from lbyr.ai.critic import CriticBackend, Moondream2Critic
 from lbyr.ai.cuda_mem import cuda_allocated_mb
-from lbyr.ai.planner import Planner, build_planner
+from lbyr.ai.planner import LanguagePlanner, Planner, build_language_planner, build_planner
 from lbyr.config import AppConfig, CriticConfig, PlannerConfig, SkillConfig
 from lbyr.errors import InsufficientMemoryError
 from lbyr.logging_.episodes import RamReading, read_system_ram
@@ -32,7 +35,8 @@ class LoadedModels:
     planner: Planner
     critic_mb: float | None  # torch.cuda.memory_allocated after loading the Critic
     planner_mb: float | None  # ... after loading the Planner (cumulative)
-    ram_after_load: RamReading | None = None  # system RAM after both loads
+    ram_after_load: RamReading | None = None  # system RAM after all loads
+    language_planner: LanguagePlanner | None = None  # only with planner.language_mode
 
 
 def load_models(
@@ -40,9 +44,11 @@ def load_models(
     *,
     critic_factory: Callable[[CriticConfig], CriticBackend] = Moondream2Critic,
     planner_factory: Callable[[PlannerConfig, SkillConfig], Planner] = build_planner,
+    language_factory: Callable[[PlannerConfig], LanguagePlanner] = build_language_planner,
     ram_reader: Callable[[], RamReading | None] = read_system_ram,
 ) -> LoadedModels:
-    """Load Critic (if enabled), then Planner, then apply the memory guard.
+    """Load Critic (if enabled), Planner, language planner (if enabled), then apply the
+    memory guard.
 
     Factories and the RAM reader are injectable for tests.
     """
@@ -65,32 +71,52 @@ def load_models(
     )
     ram = ram_reader()
     _log_ram(f"after Planner ({cfg.planner.backend}) load", ram)
+    language: LanguagePlanner | None = None
+    if cfg.planner.language_mode:
+        language = language_factory(cfg.planner)
+        log.info(
+            "after language planner (%s) load: torch.cuda.memory_allocated = %s",
+            cfg.planner.language_backend,
+            _fmt(cuda_allocated_mb()),
+        )
+        ram = ram_reader()
+        _log_ram(f"after language planner ({cfg.planner.language_backend}) load", ram)
     check_memory_headroom(cfg.planner, ram)
-    return LoadedModels(critic, planner, critic_mb, planner_mb, ram)
+    return LoadedModels(critic, planner, critic_mb, planner_mb, ram, language)
 
 
 def check_memory_headroom(cfg: PlannerConfig, ram: RamReading | None) -> None:
-    """Raise :class:`InsufficientMemoryError` if ``backend = "qwen"`` and free system RAM is
-    below ``cfg.qwen_min_free_ram_mb`` (or cannot be read: fail closed). No-op for rules."""
-    if cfg.backend != "qwen":
+    """Raise :class:`InsufficientMemoryError` if a Qwen model is loaded (``backend = "qwen"``
+    or ``language_mode``) and free system RAM is below ``cfg.qwen_min_free_ram_mb`` (or cannot
+    be read: fail closed). No-op for rules-only."""
+    if cfg.backend != "qwen" and not cfg.language_mode:
         return
+    what = " + ".join(
+        ([f"Qwen2.5-VL (backend={cfg.backend})"] if cfg.backend == "qwen" else [])
+        + ([f"language planner ({cfg.language_backend})"] if cfg.language_mode else [])
+    )
     fix = (
-        'Use planner.backend = "rules" (the default), or free memory first '
-        "(close other processes; Critic GGUF-Q4 per bible 9.2 fallback chain)."
+        'Use planner.backend = "rules" (the default), language_backend = "qwen3_text" with a '
+        "smaller model (qwen3-0.6b), or free memory first (close other processes)."
     )
     if ram is None:
         raise InsufficientMemoryError(
             "Memory guard: cannot read system RAM (no tegrastats or /proc/meminfo) with "
-            f"planner.backend = 'qwen'. Refusing to start the episode loop. {fix}"
+            f"{what} loaded. Refusing to start the episode loop. {fix}"
         )
     if ram.free_mb < cfg.qwen_min_free_ram_mb:
         raise InsufficientMemoryError(
             f"Memory guard: only {ram.free_mb:.0f} MB system RAM free after loading the Critic "
-            f"and Qwen ({ram.used_mb:.0f}/{ram.total_mb:.0f} MB used, {ram.source}); "
+            f"and {what} ({ram.used_mb:.0f}/{ram.total_mb:.0f} MB used, {ram.source}); "
             f"planner.qwen_min_free_ram_mb = {cfg.qwen_min_free_ram_mb:.0f} MB. "
             f"Refusing to start the episode loop. {fix}"
         )
-    log.info("Memory guard OK: %.0f MB free >= %.0f MB", ram.free_mb, cfg.qwen_min_free_ram_mb)
+    log.info(
+        "Memory guard OK with %s: %.0f MB free >= %.0f MB",
+        what,
+        ram.free_mb,
+        cfg.qwen_min_free_ram_mb,
+    )
 
 
 def _log_ram(when: str, ram: RamReading | None) -> None:

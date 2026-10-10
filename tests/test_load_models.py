@@ -114,3 +114,60 @@ def test_ram_parsers() -> None:
     assert mi is not None and mi.source == "meminfo"
     assert round(mi.total_mb) == 15625 and round(mi.free_mb) == 3906
     assert parse_meminfo("nothing") is None
+
+
+def test_language_mode_loads_last_logs_ram_and_is_guarded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(models, "cuda_allocated_mb", lambda: None)
+    order: list[str] = []
+    cfg = AppConfig()
+    cfg.planner.language_mode = True  # backend stays "rules"
+    readings = iter([_ram(1500.0), _ram(5600.0), _ram(5600.0), _ram(9500.0)])
+
+    def lang(_cfg):  # type: ignore[no-untyped-def]
+        order.append("language")
+        return object()
+
+    with caplog.at_level(logging.INFO, logger="lbyr.ai.models"):
+        loaded = load_models(
+            cfg,
+            critic_factory=lambda c: order.append("critic") or object(),  # type: ignore[arg-type,func-returns-value]
+            planner_factory=lambda p, s: order.append("planner") or RuleBasedPlanner(),  # type: ignore[func-returns-value]
+            language_factory=lang,
+            ram_reader=lambda: next(readings),
+        )
+    assert order == ["critic", "planner", "language"] and loaded.language_planner is not None
+    assert "after language planner (qwen3_text) load: 9500/15656 MB used, 6156 MB free" in (
+        caplog.text
+    )
+    assert "Memory guard OK with language planner (qwen3_text)" in caplog.text
+
+    cfg2 = AppConfig()
+    cfg2.planner.language_mode = True
+    tight = iter([_ram(1500.0), _ram(5600.0), _ram(5600.0), _ram(TOTAL - 900.0)])
+    with pytest.raises(InsufficientMemoryError, match="language planner"):
+        load_models(
+            cfg2,
+            critic_factory=lambda c: object(),  # type: ignore[arg-type,return-value]
+            planner_factory=lambda p, s: RuleBasedPlanner(),
+            language_factory=lambda p: object(),  # type: ignore[arg-type,return-value]
+            ram_reader=lambda: next(tight),
+        )
+
+
+def test_rules_only_never_loads_the_language_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(models, "cuda_allocated_mb", lambda: None)
+
+    def boom(_cfg):  # type: ignore[no-untyped-def]
+        raise AssertionError("language planner must not be loaded by default")
+
+    loaded = _load("rules", [None, None, None])
+    assert loaded.language_planner is None
+    load_models(
+        AppConfig(),
+        critic_factory=lambda c: object(),  # type: ignore[arg-type,return-value]
+        planner_factory=lambda p, s: RuleBasedPlanner(),
+        language_factory=boom,
+        ram_reader=lambda: None,
+    )

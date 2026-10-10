@@ -41,6 +41,9 @@ DATA_DIR = Path("data")
 
 PLANNER_BACKENDS: tuple[str, ...] = ("qwen", "rules")
 CRITIC_DTYPES: tuple[str, ...] = ("fp16", "bf16")
+MODEL_DTYPES: tuple[str, ...] = ("bf16", "fp16")
+# Language mode (demo intro): "qwen3_text" (Qwen3 LLM) | "qwen_vl" (Qwen2.5-VL, text-only)
+LANGUAGE_BACKENDS: tuple[str, ...] = ("qwen3_text", "qwen_vl")
 
 
 def require(value: T | None, what: str, question: str) -> T:
@@ -143,12 +146,17 @@ class PlannerConfig:
     device: str = "cuda"
     max_image_pixels: int = 640 * 480  # overhead frame is downscaled above this (latency)
     warmup_timeout_s: float = 60.0  # startup warm-up generation (first CUDA call is slow)
-    # Qwen "language mode" (demo intro ONLY, never in the FSM loop): text-only prompt, compact
+    # "Language mode" (demo intro ONLY, never in the FSM loop): text-only prompt, compact
     # output schema. Its own timeout; every in-loop call keeps the 3 s ``timeout_s``.
     qwen_timeout_s: float = 8.0
     language_max_new_tokens: int = 64
-    # Memory guard: with backend = "qwen", refuse to start the episode loop if free system RAM
-    # (unified memory) after loading Critic + Qwen is below this. Measured: ~0.8 GB free.
+    language_mode: bool = False  # load the language planner at startup (demo intro)
+    language_backend: str = "qwen3_text"  # "qwen3_text" | "qwen_vl" (uses model_path)
+    # Local Qwen3 weights (no downloads). Alternative: ~/models/qwen3-0.6b (M-2).
+    language_model_path: Path = Path("~/models/qwen3-1.7b")
+    language_dtype: str = "bf16"  # Qwen3 native dtype
+    # Memory guard: with backend = "qwen" or language_mode, refuse to start the episode loop if
+    # free system RAM (unified memory) after loading all models is below this.
     qwen_min_free_ram_mb: float = 1536.0  # 1.5 GB
 
     def validate(self) -> None:
@@ -158,6 +166,10 @@ class PlannerConfig:
             raise ConfigError("planner.qwen_timeout_s must be in (0, 30] s")
         if self.language_max_new_tokens < 1:
             raise ConfigError("planner.language_max_new_tokens must be >= 1")
+        if self.language_backend not in LANGUAGE_BACKENDS:
+            raise ConfigError(f"planner.language_backend must be one of {LANGUAGE_BACKENDS}")
+        if self.language_dtype not in MODEL_DTYPES:
+            raise ConfigError(f"planner.language_dtype must be one of {MODEL_DTYPES}")
         if self.qwen_min_free_ram_mb < 0.0:
             raise ConfigError("planner.qwen_min_free_ram_mb must be >= 0")
         if not 0.0 < self.timeout_s <= 3.0:
