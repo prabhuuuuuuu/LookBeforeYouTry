@@ -2,11 +2,21 @@
 
 The D435 is the ONLY camera used for metric control. Depth is converted to mm at
 this boundary. ``pyrealsense2`` is imported lazily (JetPack/source build, not pip).
+
+Real camera: 640x480@30 color (BGR) + depth aligned to color, published by a capture
+thread into a latest-frame buffer (readers never wait). Exposure and white balance are
+locked after an auto-settle (:func:`lock_color_controls`). Frame metadata (the auto values)
+is not readable on this Jetson kernel, so the lock MATCHES the settled image instead:
+exposure by bisection to the auto mean brightness, white balance by bisection to a neutral
+(B = R) bright region (the white table). Cost: ~4 s once at start; per frame ~1 ms copy
+(+ the librealsense align); 0 VRAM; ~2 MB per buffered frame.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +37,106 @@ class RGBDFrame:
     intrinsics: Intrinsics
 
 
+@dataclass(frozen=True)
+class ColorLock:
+    exposure: float
+    gain: float
+    white_balance_k: float
+    auto_mean: float  # mean brightness under auto exposure (the target)
+    locked_mean: float  # mean brightness after the lock
+    source: str  # "config" | "matched" (per control, e.g. "exposure=matched, wb=config")
+
+
+def _luma(img: np.ndarray) -> float:
+    return float(img.mean())
+
+
+def _neutral_error(img: np.ndarray) -> float:
+    """mean(B) - mean(R) over the brightest half of the image (the white table)."""
+    y = img.mean(axis=2)
+    bright = y >= np.median(y)
+    return float(img[..., 0][bright].mean() - img[..., 2][bright].mean())
+
+
+def _bisect(
+    f: Callable[[float], float], lo: float, hi: float, step: float, max_iter: int = 12
+) -> float:
+    """Root of a monotonic ``f`` on [lo, hi] (either direction); the better end if none."""
+    f_lo, f_hi = f(lo), f(hi)
+    if f_lo == 0.0 or f_hi == 0.0 or (f_lo > 0) == (f_hi > 0):
+        return lo if abs(f_lo) <= abs(f_hi) else hi
+    best = (abs(f_lo), lo) if abs(f_lo) <= abs(f_hi) else (abs(f_hi), hi)
+    for _ in range(max_iter):
+        if hi - lo <= step:
+            break
+        mid = round((lo + hi) / 2.0 / step) * step
+        f_mid = f(mid)
+        best = min(best, (abs(f_mid), mid))
+        if (f_mid > 0) == (f_lo > 0):
+            lo, f_lo = mid, f_mid
+        else:
+            hi = mid
+    return best[1]
+
+
+def lock_color_controls(
+    sensor: Any, option: Any, grab: Callable[[], np.ndarray], cfg: OverheadCameraConfig
+) -> ColorLock:
+    """Auto-settle, then lock exposure and white balance (bible 5.1).
+
+    ``sensor``: librealsense color sensor (``get_option`` / ``set_option``); ``option``:
+    ``rs.option``; ``grab``: returns the next color frame (BGR). Config values win; the
+    others are matched to the settled auto image (see module docstring). Blocking: startup
+    only, before the capture thread runs.
+    """
+
+    def settled(n: int = 3) -> np.ndarray:
+        img = grab()
+        for _ in range(n - 1):  # a new option value needs a couple of frames to apply
+            img = grab()
+        return img
+
+    sensor.set_option(option.enable_auto_exposure, 1)
+    sensor.set_option(option.enable_auto_white_balance, 1)
+    t_end = time.perf_counter() + cfg.settle_s
+    img = grab()
+    while time.perf_counter() < t_end:
+        img = grab()
+    auto_mean = float(np.mean([_luma(img), _luma(grab()), _luma(grab())]))
+    sensor.set_option(option.enable_auto_exposure, 0)
+    if cfg.gain is not None:
+        sensor.set_option(option.gain, float(cfg.gain))
+    gain = float(sensor.get_option(option.gain))
+    srcs = []
+    if cfg.exposure is not None:
+        exposure = float(cfg.exposure)
+        srcs.append("exposure=config")
+    else:
+
+        def bright_err(e: float) -> float:
+            sensor.set_option(option.exposure, float(e))
+            return _luma(settled()) - auto_mean
+
+        exposure = _bisect(bright_err, 1.0, float(cfg.max_exposure), 1.0)
+        srcs.append("exposure=matched")
+    sensor.set_option(option.exposure, exposure)
+    sensor.set_option(option.enable_auto_white_balance, 0)
+    if cfg.white_balance_k is not None:
+        wb = float(cfg.white_balance_k)
+        srcs.append("wb=config")
+    else:
+
+        def wb_err(k: float) -> float:
+            sensor.set_option(option.white_balance, float(k))
+            return _neutral_error(settled())
+
+        wb = _bisect(wb_err, 2800.0, 6500.0, 10.0)
+        srcs.append("wb=matched")
+    sensor.set_option(option.white_balance, wb)
+    locked_mean = _luma(settled())
+    return ColorLock(exposure, gain, wb, auto_mean, locked_mean, ", ".join(srcs))
+
+
 class RealSenseOverheadCamera:
     """D435 aligned color+depth stream on a capture thread. Lock exposure/WB (bible 5.1)."""
 
@@ -38,6 +148,15 @@ class RealSenseOverheadCamera:
         self._depth_scale_mm = 1.0
         self._intr: Intrinsics | None = None
         self._thread: CaptureThread[RGBDFrame] | None = None
+        self.color_lock: ColorLock | None = None
+
+    @property
+    def fps(self) -> float:
+        return self._thread.fps if self._thread is not None else 0.0
+
+    @property
+    def intrinsics(self) -> Intrinsics | None:
+        return self._intr
 
     def start(self) -> None:
         import pyrealsense2 as rs  # lazy: librealsense source build on Jetson
@@ -50,14 +169,44 @@ class RealSenseOverheadCamera:
         cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
         self._pipeline = rs.pipeline()
         profile = self._pipeline.start(cfg)
-        self._depth_scale_mm = profile.get_device().first_depth_sensor().get_depth_scale() * 1000
-        self._align = rs.align(rs.stream.color)
-        vs = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-        self._intr = Intrinsics(vs.fx, vs.fy, vs.ppx, vs.ppy, vs.width, vs.height)
-        # TODO: lock exposure / white balance via color sensor options (bible 5.1).
+        try:
+            dev = profile.get_device()
+            self._depth_scale_mm = dev.first_depth_sensor().get_depth_scale() * 1000
+            self._align = rs.align(rs.stream.color)
+            vs = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            self._intr = Intrinsics(vs.fx, vs.fy, vs.ppx, vs.ppy, vs.width, vs.height)
+            if self._cfg.lock_color:
+                self.color_lock = lock_color_controls(
+                    dev.first_color_sensor(), rs.option, self._grab_color, self._cfg
+                )
+                lk = self.color_lock
+                log.info(
+                    "D435 color locked (%s): exposure %.0f, gain %.0f, white balance %.0f K; "
+                    "mean brightness auto %.0f -> locked %.0f. To reuse: "
+                    "OverheadCameraConfig(exposure=%.0f, gain=%.0f, white_balance_k=%.0f)",
+                    lk.source,
+                    lk.exposure,
+                    lk.gain,
+                    lk.white_balance_k,
+                    lk.auto_mean,
+                    lk.locked_mean,
+                    lk.exposure,
+                    lk.gain,
+                    lk.white_balance_k,
+                )
+            else:
+                log.warning("D435 exposure / white balance NOT locked (lock_color = False)")
+        except Exception:
+            self._pipeline.stop()
+            self._pipeline = None
+            raise
         self._thread = CaptureThread("overhead-cam", self._grab, self.buffer)
         self._thread.start()
         log.info("D435 started %dx%d@%d, depth scale %.4f mm", w, h, fps, self._depth_scale_mm)
+
+    def _grab_color(self) -> np.ndarray:
+        c = self._pipeline.wait_for_frames(1000).get_color_frame()
+        return np.asanyarray(c.get_data())
 
     def _grab(self) -> RGBDFrame | None:
         assert self._intr is not None
@@ -71,8 +220,10 @@ class RealSenseOverheadCamera:
     def stop(self) -> None:
         if self._thread is not None:
             self._thread.stop()
+            self._thread = None
         if self._pipeline is not None:
             self._pipeline.stop()
+            self._pipeline = None
 
 
 # --------------------------------------------------------------------------- fakes
@@ -142,12 +293,14 @@ class FakeScene:
 
 
 class FakeOverheadCamera:
-    """Publishes a rendered FakeScene at ~30 Hz on a capture thread."""
+    """Publishes a rendered FakeScene (or a fixed ``frame``) at ~30 Hz on a capture thread."""
 
-    def __init__(self, scene: FakeScene | None = None, fps: float = 30.0) -> None:
+    def __init__(
+        self, scene: FakeScene | None = None, fps: float = 30.0, frame: RGBDFrame | None = None
+    ) -> None:
         self.scene = scene or FakeScene()
         self.buffer: LatestFrameBuffer[RGBDFrame] = LatestFrameBuffer()
-        self._frame = self.scene.render()
+        self._frame = frame if frame is not None else self.scene.render()
         self._thread = CaptureThread("overhead-fake", lambda: self._frame, self.buffer, 1.0 / fps)
 
     def start(self) -> None:

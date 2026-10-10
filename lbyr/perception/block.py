@@ -11,7 +11,7 @@ Pipeline (D435 color + aligned depth, 640x480):
 
 Output: the shared :class:`~lbyr.perception.detector.Detection` format (id, class
 ``wood_block``, bbox, centroid, yaw, xyz_cam, zone). Cost: CPU only, 0 VRAM; measured on
-the Orin NX (640x480, jetson_clocks, 2026-10-11): p50 3.9 ms (Lab) / 2.4 ms (HSV) per frame
+the Orin NX (640x480, jetson_clocks, 2026-10-11): ~4-6 ms (Lab) / ~2.5 ms (HSV) per frame
 (``last_ms``). It runs once per PERCEIVE on the FSM thread, never on the motion thread.
 ``cv2`` is imported lazily.
 """
@@ -69,12 +69,21 @@ class BlockDetector:
         self._kernel = np.ones((k, k), np.uint8)
         self.last_ms = 0.0
         self.last_areas: list[float] = []  # every contour area of the last frame (tuning)
+        self._warm_up()
         if self.workspace_px is None:
             log.warning(
                 "BlockDetector: no workspace polygon (tools/define_zones.py --workspace): "
                 "using the whole frame minus a %d px border",
                 cfg.border_px,
             )
+
+    def _warm_up(self, shape: tuple[int, int] = (480, 640)) -> None:
+        """The first OpenCV call is ~200 ms (lazy init); pay it at startup, not in PERCEIVE."""
+        blank = np.full((*shape, 3), 255, np.uint8)
+        self._cv2.findContours(
+            self.mask(blank), self._cv2.RETR_EXTERNAL, self._cv2.CHAIN_APPROX_SIMPLE
+        )
+        self._ws_cache = None
 
     # ------------------------------------------------------------------ masks
     def object_mask(self, color_bgr: np.ndarray) -> np.ndarray:

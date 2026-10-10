@@ -110,6 +110,16 @@ class OverheadCameraConfig:
     device_serial: str | None = None  # Only needed if several RealSense devices are attached
     base_T_cam_path: Path = DATA_DIR / "calib" / "base_T_cam.yaml"
     depth_median_window: int = 5  # pixels, odd
+    # Bible 5.1: lock exposure and white balance. Auto runs for settle_s after start, then
+    # both are locked: to the values below if set, else to values matched to the settled
+    # image (exposure: same mean brightness; white balance: neutral white table). The
+    # locked values are logged; copy them here to reuse them across sessions.
+    lock_color: bool = True
+    settle_s: float = 2.0
+    exposure: int | None = None  # RealSense RGB exposure units (0.1 ms on the D435)
+    gain: int | None = None  # None = keep the sensor's current gain
+    white_balance_k: int | None = None  # 2800..6500
+    max_exposure: int = 320  # search cap, ~32 ms: keeps 30 FPS
 
 
 @dataclass
