@@ -13,45 +13,15 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 from lbyr.ai.critic import Verdict
-from lbyr.config import AppConfig, mock_profile, require
-from lbyr.errors import HardwareNotConfirmedError, InsufficientMemoryError
+from lbyr.config import AppConfig, mock_profile, preflight
+from lbyr.errors import InsufficientMemoryError
 from lbyr.log_setup import setup_logging
 from lbyr.logging_.episodes import REQUIRED_FIELDS
 
 log = logging.getLogger("lbyr.main")
-
-
-def preflight(cfg: AppConfig) -> list[str]:
-    """Run every hardware-readiness check and collect what is still unconfirmed."""
-    from lbyr.arm.serial_arm import SerialArm
-    from lbyr.motion.ik import IkpyIK
-    from lbyr.motion.trajectory import capped_limits
-    from lbyr.perception.wrist import TrinetWristCamera
-
-    checks: list[tuple[str, Callable[[], object]]] = [
-        ("bridge / servos", lambda: SerialArm(cfg.arm).check_confirmed()),
-        (
-            "feedback",
-            lambda: require(cfg.arm.feedback_readable or None, "feedback readable", "OQ-5"),
-        ),
-        ("speed limits", lambda: capped_limits(cfg.arm, cfg.motion)),
-        ("per-tick clamp", lambda: require(cfg.arm.max_delta_per_tick_deg, "max delta", "A-2")),
-        ("safe pose", lambda: require(cfg.arm.safe_pose_deg, "safe pose", "A-3")),
-        ("gripper mapping", lambda: cfg.arm.gripper.closure_to_deg(0.0)),
-        ("IK", lambda: IkpyIK(cfg.arm)),
-        ("wrist camera", lambda: TrinetWristCamera(cfg.cameras.wrist)),
-    ]
-    missing: list[str] = []
-    for name, check in checks:
-        try:
-            check()
-        except HardwareNotConfirmedError as e:
-            missing.append(f"{name}: {e.what} ({e.question})")
-    return missing
 
 
 def validate_jsonl(path: Path) -> int:

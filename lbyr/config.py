@@ -14,6 +14,7 @@ Units: millimetres and degrees at every boundary.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar
@@ -336,3 +337,64 @@ def mock_profile() -> AppConfig:
         device_index=None, width=640, height=480, fps=30, dewarp_enabled=True
     )
     return cfg
+
+
+def preflight(cfg: AppConfig) -> list[str]:
+    """Everything that still blocks a real-hardware run, as operator-readable lines.
+
+    Blocks only on what that run really needs:
+    - always: data/calib/joints.yaml present, valid and ``verified: true`` (zeros checked
+      against the board's ``list``, A-7); the bridge serial port (OQ-10);
+    - motion.mode = "taught": data/calib/poses.yaml with every required pose / zone;
+    - motion.mode = "ik": joint limits / link lengths (OQ-4), gripper mapping (OQ-6),
+      safe pose (A-3);
+    - Critic enabled: the Trinet device index and mode (OQ-7/8).
+    Speed limits come from the firmware (``V`` line) and feedback is closed (OQ-5: none),
+    so neither blocks any more. Imports are local to avoid import cycles.
+    """
+    from lbyr.arm.calib import load_joints
+    from lbyr.arm.serial_arm import SerialArm
+    from lbyr.errors import CalibrationError
+
+    missing: list[str] = []
+
+    def check(name: str, fn: Callable[[], object]) -> None:
+        try:
+            fn()
+        except HardwareNotConfirmedError as e:
+            missing.append(f"{name}: {e.what} ({e.question})")
+        except (CalibrationError, ConfigError) as e:
+            missing.append(f"{name}: {e}")
+
+    joints = None
+    try:
+        joints = load_joints(cfg.arm.joints_path)
+        if not joints.verified:
+            missing.append(
+                f"joints: {cfg.arm.joints_path} not verified: compare zero_us with the board's "
+                "`list` (tools/arm_gui.py 'Sync sliders'), then set verified: true (A-7)"
+            )
+    except CalibrationError as e:
+        missing.append(f"joints: {e}")
+    if not cfg.arm.simulated:
+        check("bridge", lambda: SerialArm(cfg.arm).check_confirmed())
+    if cfg.motion.mode == "taught":
+        if joints is not None:
+            from lbyr.motion.taught import load_poses
+
+            try:
+                poses = load_poses(cfg.motion.poses_path, joints)
+                missing += [f"poses: {cfg.motion.poses_path}: {m}" for m in poses.missing()]
+            except CalibrationError as e:
+                missing.append(f"poses: {e}")
+    else:
+        from lbyr.motion.ik import IkpyIK
+
+        check("IK", lambda: IkpyIK(cfg.arm))
+        check("gripper mapping", lambda: cfg.arm.gripper.closure_to_deg(0.0))
+        check("safe pose", lambda: require(cfg.arm.safe_pose_deg, "safe pose", "A-3"))
+    if cfg.critic.enabled:
+        from lbyr.perception.wrist import TrinetWristCamera
+
+        check("wrist camera", lambda: TrinetWristCamera(cfg.cameras.wrist))
+    return missing
