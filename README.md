@@ -36,7 +36,7 @@ still blocks real-hardware runs (see `docs/OPEN_QUESTIONS.md`).
 | Config, bridge protocol, MockArm, trajectories, 50 Hz streamer, FSM + recovery, logging | Implemented and tested |
 | Fisheye dewarp, metric geometry, Umeyama hand-eye solve | Implemented and tested |
 | SerialArm, IkpyIK, Trinet capture | Gated on open hardware questions (OQ-4, 6-12, A-1..3, A-6, A-7). `SerialArm` also needs the firmware's text protocol (not implemented) |
-| Moondream2Critic (FP16), QwenPlanner (FP16) + RuleBasedPlanner fallback, `tools/bench_models.py` | Implemented; verified on the Orin NX (`pytest -m jetson`). Qwen cannot meet the 3 s timeout on this board (see "Measured model cost") |
+| Moondream2Critic (FP16 default, BF16 option), RuleBasedPlanner (default), QwenPlanner (FP16) + language mode, memory guard, `reasoning_trace` log event, `tools/bench_models.py` | Implemented; verified on the Orin NX (`pytest -m jetson`). Qwen cannot meet the 3 s timeout on this board, so the planner defaults to rules (see "Measured model cost"). Critic speed variant still to pick (OPEN_QUESTIONS M-1) |
 | YOLOv11n TensorRT | Stub (TODO, lazy imports) |
 | Bridge firmware (XIAO ESP32-C6, PWM, text protocol) + `tools/arm_gui.py` bench GUI | Exists (`firmware/xiao_c6_bridge/`). Joint roles, PWM servos, 6.0 V rail and no-feedback are confirmed (OQ-1/2/3/5 closed). Zeros in `data/calib/zero_positions.json` still to be verified against the board's `list` output |
 
@@ -84,19 +84,31 @@ Weights are local only (no downloads; `HF_HUB_OFFLINE=1` is forced). Defaults:
 pytest                      # default: laptop-safe, real-model tests are deselected
 pytest -m jetson -v         # real models on CUDA (loads both, about 11 GB, about 1 min)
 python tools/bench_models.py --n 10    # p50/p95, tokens/s, peak VRAM -> data/bench/*.json
+python tools/bench_models.py --critic-only --critic-dtype bf16 --critic-crop  # Critic variants
 ```
 
-Config: `planner.backend: qwen | rules`; after `planner.fallback_after_timeouts` (default 3)
-Qwen timeouts in a row the planner switches to the rule-based one for the rest of the run.
+Planner config (bible 9.2 / 11.1, v1.4):
 
-### Measured model cost (Orin NX 16 GB, nvpmodel 40 W, JetPack 6.2, torch 2.11, FP16)
+- `planner.backend: rules | qwen`, default **rules**. Qwen is only loaded with `qwen`.
+  In-loop calls keep the 3 s timeout; after `planner.fallback_after_timeouts` (default 3)
+  Qwen timeouts in a row the planner switches to rules for the rest of the run.
+- Qwen language mode (demo intro only): `plan_language(...)`. It uses a text-only prompt,
+  the compact schema `{"a":2,"s":40,"g":80,"p":5}`, at most 64 new tokens, and
+  `planner.qwen_timeout_s` (8 s).
+- Every plan is logged as a `reasoning_trace` event in `episodes.jsonl` (prompt, raw output,
+  parsed chain).
+- Memory guard: `load_models` logs system RAM (tegrastats) at startup and after each load.
+  With `backend: qwen`, it refuses to start if less than `planner.qwen_min_free_ram_mb`
+  (1.5 GB) is free.
 
-| Piece | VRAM (torch alloc) | Latency | Bible 9.2 |
+### Measured model cost (2026-10-10, Orin NX 16 GB, nvpmodel 40 W, JetPack 6.2, torch 2.11, FP16, synthetic images)
+
+| Piece | VRAM (torch alloc) | Latency | Bible 9.2 estimate |
 |---|---|---|---|
-| Moondream2 Critic, 640x480 frame | ~4.0 GB | p50 1.35 s (0.8 s at 378x378) | ~4 GB, 0.3-0.8 s |
-| Qwen2.5-VL-3B planner, full plan (~98 tokens) | ~7.0 GB | p50 11.2 s, 8.7 tok/s | ~6.5 GB, 0.8-2 s |
+| Moondream2 Critic, 640x480 frame | ~4.1 GB | p50 1.35 s (0.85 s with a 378x378 crop, M-1) | ~4 GB, 0.3-0.8 s |
+| Qwen2.5-VL-3B planner, full plan (~98 tokens) | ~7.2 GB | p50 11.2 s, 8.7 tok/s | ~6.5 GB, 0.8-2 s |
 | Both resident | 11.3 GB torch; system RAM peak ~14.8 GB of 15.6 GB | | peak 11-12 GB |
 
-The planner's 3 s hard timeout is NOT met by free-form JSON generation on this board, so
-with `backend: qwen` every plan times out and the fallback to rules takes over. System RAM
-headroom with both models loaded is under 1 GB.
+Free-form JSON generation does not meet the planner's 3 s hard timeout on this board, so
+the default backend is `rules`. System RAM headroom with both models loaded is about 0.8 GB.
+That is below the memory guard's 1.5 GB, so `backend: qwen` is refused until memory is freed.

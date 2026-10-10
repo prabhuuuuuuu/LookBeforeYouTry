@@ -17,7 +17,8 @@ Trinet wrist Critic (Moondream2) + parameterized recovery FSM, all local on a Je
 4. Single process, threads + `queue.Queue`. No ROS 2. No asyncio in the core loop.
 5. Units at all protocol boundaries: mm and degrees.
 6. Every VLM call goes through the timeout wrapper (`lbyr/ai/timeout.py`), temperature 0.
-   Planner: 3 s hard timeout. Critic: explicit `CriticConfig.timeout_s`.
+   Planner: 3 s hard timeout for every in-loop call (Qwen "language mode", demo intro only:
+   `planner.qwen_timeout_s`, 8 s). Critic: explicit `CriticConfig.timeout_s`.
 7. The 50 Hz `MotionStreamer` never blocks on AI, detection, logging or I/O. Deadline
    scheduling with `time.perf_counter()`. Feed it only via latest-value buffers.
 8. The Critic is async: the FSM submits and polls, never waits.

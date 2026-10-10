@@ -15,6 +15,10 @@ The matching `lbyr/config.py` fields have **not** been updated yet. The zeros in
 against the board's `list` output (`S,<joint>,<zero_us>,...` lines); the firmware's
 `DEFAULT_ZERO_US` fallback was copied from that file.
 
+**Status (bible v1.4, 2026-10-10):** model cost measured (bible 9.2). Planner default is now
+`rules`; Qwen only with `backend = qwen` and only if the memory guard passes (D-10..D-12).
+Open: which Critic speed variant to adopt (M-1).
+
 ## Hardware (bible Section 20)
 
 | # | Question | Unblocks (config field / code) | Answer (value, who, date) |
@@ -85,3 +89,27 @@ Open points for that increment:
 | D-7 | Critic OFF baseline: verify states pass through; verdict logged as `null`. |
 | D-8 | **Proposed, please confirm:** EMPTY recovery "-5 mm standoff" is implemented as "grasp 5 mm lower" (the pre-grasp standoff from the planner is unchanged). |
 | D-9 | JAMMED abort: stop, stop streaming, torque OFF (bible 13). Other aborts: move to safe pose and hold with torque ON; the gripper is not opened. |
+| D-10 | (2026-10-10) `planner.backend` defaults to `rules`; Qwen is not loaded unless `backend = qwen`. In-loop calls keep the 3 s timeout. |
+| D-11 | (2026-10-10) Qwen "language mode" for the demo intro only (`plan_language`): text-only prompt, compact `{"a","s","g","p"}` schema, 64 new tokens max, `planner.qwen_timeout_s` = 8 s; strict parser unchanged. Every plan is logged as a `reasoning_trace` event. |
+| D-12 | (2026-10-10) Memory guard: with `backend = qwen`, refuse to start the episode loop if free system RAM after loading both models is < `planner.qwen_min_free_ram_mb` (1536 MB), or if RAM cannot be read. |
+
+## Model performance decisions (pending)
+
+| # | Question | Unblocks | Answer |
+|---|---|---|---|
+| [ ] M-1 | Which Critic speed variant becomes the default? Candidates: `CriticConfig.dtype` fp16 / bf16; 378x378 crop before the query (gripper ROI = `WristCameraConfig.crop_xywh`, OQ-12; default centred; not wired into the runtime yet); Moondream `compile()`. Accuracy on real wrist frames is NOT measured yet: synthetic frames all answer GRASPED. | `CriticConfig.dtype`; crop in the Critic preprocess | Measurements below. Software lead to pick. |
+
+M-1 measurements (2026-10-10, Orin NX 40 W, synthetic 640x480 frames, 10 timed calls per
+variant, `tools/bench_models.py --critic-only ...`):
+
+| Variant | Input | p50 | p95 | p50 vs full | torch peak | RAM peak (tegrastats) |
+|---|---|---:|---:|---:|---:|---:|
+| bf16, full | 640x480 | 1.315 s | 1.322 s | 1.00 | 4.14 GB | 6.70 GB |
+| bf16, full (2nd run) | 640x480 | 1.333 s | 1.337 s | 1.00 | 4.14 GB | 6.72 GB |
+| bf16, crop | 378x378 | 0.851 s | 0.855 s | 0.64 | 4.13 GB | 6.70 GB |
+| fp16, full | 640x480 | 1.409 s | 1.413 s | 1.00 | 4.14 GB | 6.85 GB |
+| fp16, crop | 378x378 | 0.857 s | 0.863 s | 0.61 | 4.13 GB | 6.83 GB |
+
+`--critic-compile`: not measured. Triton is not installed in the Jetson venv, so
+`torch.compile` (inductor) is expected to fail on the first call; the bench reports that
+as "skipped".

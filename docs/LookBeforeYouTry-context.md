@@ -3,10 +3,10 @@ Save as:
 ```markdown
 # PROJECT CONTEXT / BIBLE — “Look Before You Retry” (LBYR)
 
-**Version:** 1.3  
+**Version:** 1.4  
 **Status:** Locked hackathon context  
 **Hardware revision:** ROT3U 6-DOF PWM arm (no feedback) + XIAO ESP32-C6 bridge + Jetson Orin NX 16GB (reComputer J401) + RealSense D435 + Panoculonlabs Trinet wrist camera  
-**Supersedes:** Version 1.2 where conflicting (v1.3 changes: compute platform, browser dashboard instead of HDMI capture, PWM arm + XIAO C6 text-protocol bridge, 6.0 V servo rail, JAMMED policy, OQ-1/2/3/5 closed)  
+**Supersedes:** Version 1.2 where conflicting (v1.3 changes: compute platform, browser dashboard instead of HDMI capture, PWM arm + XIAO C6 text-protocol bridge, 6.0 V servo rail, JAMMED policy, OQ-1/2/3/5 closed). v1.4 (2026-10-10): measured model cost in 9.2; planner policy (rule-based planner by default, Qwen "language mode" for the demo intro only, memory guard), see 9.2 and 11.1.  
 
 > This document is the updated single source of truth for the hackathon build.  
 > Where this document conflicts with older notes, this document wins.  
@@ -498,6 +498,8 @@ That is post-hackathon work.
 
 ### 9.2 Component Budget on Orin 16GB
 
+Original estimates (v1.2/v1.3). The measured numbers below win where they differ.
+
 | Component | Model / Precision | Approx VRAM | Approx Latency | Rate |
 |---|---|---:|---:|---:|
 | Detection | YOLOv11n TensorRT INT8 | 0.4 GB | ~8 ms | 30 Hz |
@@ -513,6 +515,40 @@ Expected peak:
 ```text
 ~11–12 GB / 16 GB
 ```
+
+**Measured 2026-10-10, 40 W, synthetic images.** Orin NX 16 GB, `nvpmodel` 40 W (mode 4),
+JetPack 6.2, torch 2.11, transformers 5.19, HF FP16 (no TensorRT). Source:
+`tools/bench_models.py` (`data/bench/`, 5 warm calls). Memory = `torch.cuda.memory_allocated`;
+the Orin has unified memory, so the real limit is system RAM (tegrastats).
+
+| Component | Model / Precision | Memory (torch) | Latency (p50) | vs estimate |
+|---|---|---:|---:|---|
+| Critic | Moondream2 FP16, 640×480 frame | 4.1 GB | 1.35 s | ~4 GB OK; latency ~2× the 0.3–0.8 s estimate (fits the 2 s Critic timeout) |
+| Planner | Qwen2.5-VL-3B-Instruct FP16, full JSON contract (98 tokens) | 7.2 GB | 11.2 s (8.7 tok/s) | +0.7 GB; ~6–14× the 0.8–2 s estimate; **never meets the 3 s hard timeout** |
+| Both loaded | Critic + Qwen | 11.3 GB | — | system RAM peak **14.8 / 16 GB** (~0.8 GB free) |
+
+Planner policy (v1.4, follows from the numbers above):
+
+```text
+1. Default planner.backend = rules (RuleBasedPlanner: class-name match against the
+   instruction; microseconds, no VRAM). Qwen is NOT loaded unless backend = qwen.
+2. In-loop planner calls keep the 3 s hard timeout (default for every in-loop call).
+   With backend = qwen, 3 timeouts in a row switch to rules for the rest of the run.
+3. Qwen "language mode" (demo intro only, never inside the FSM loop): text-only prompt
+   (task + detections as compact JSON, no image), compact output schema (11.1),
+   max_new_tokens 64 (~19 tokens expected), own timeout planner.qwen_timeout_s = 8 s.
+4. Every planner output (rules, Qwen in-loop, Qwen language mode) goes through the same
+   strict skill-chain parser; it is the only path to skills.
+5. Every plan is logged as a "reasoning_trace" episode event (prompt, raw output, parsed
+   chain) for the dashboard.
+6. Memory guard: system RAM is logged at startup and after each model load. With
+   backend = qwen, if free RAM after loading both models is below
+   planner.qwen_min_free_ram_mb (1.5 GB) the episode loop does not start.
+   At the measured ~0.8 GB free, backend = qwen is refused until memory is freed.
+```
+
+Critic speed experiments (bf16, 378×378 crop, compile) are in `docs/OPEN_QUESTIONS.md`
+(M-1); the Critic default stays FP16 full frame until a variant is chosen.
 
 Fallback chain if memory pressure appears:
 
@@ -625,8 +661,10 @@ Abort behavior:
 | Precision | FP16 primary; INT8 TensorRT-LLM optional |
 | Role | Convert language + overhead image into structured JSON skill chain |
 | Temperature | 0 |
-| Timeout | 3 s hard timeout |
+| Timeout | 3 s hard timeout (every in-loop call) |
 | Output | Strict JSON |
+| Default backend (v1.4) | Rule-based planner; Qwen only with `planner.backend = qwen` (see 9.2) |
+| Language mode (v1.4) | Demo intro only: text-only, compact schema, ≤64 tokens, `planner.qwen_timeout_s` = 8 s |
 
 Planner output contract:
 
@@ -640,6 +678,15 @@ Planner output contract:
   "notes": "..."
 }
 ```
+
+Language-mode compact contract (v1.4; no `notes`, ~19 tokens). It is expanded to the
+contract above and validated by the same strict parser:
+
+```json
+{"a": 2, "s": 40, "g": 80, "p": 5}
+```
+
+`a` = approach `target_id`, `s` = `standoff_mm`, `g` = grasp `closure` (%), `p` = place `target_id`.
 
 ### 11.2 Critic
 
