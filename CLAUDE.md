@@ -43,7 +43,10 @@ ruff check . && ruff format --check . && mypy lbyr
 python -m lbyr.main --mock   # one simulated episode with one recovery
 ```
 
-Commit in small increments with conventional commit messages (`feat(fsm): ...`).
+Repo: https://github.com/prabhuuuuuuu/LookBeforeYouTry (branch `main`).
+Commit in small increments with conventional commit messages (`feat(fsm): ...`). Before
+each commit, tests, ruff and mypy must pass. Push to `origin main` after each commit.
+Never force-push. Never commit `data/`, images or model weights.
 
 ## Map
 

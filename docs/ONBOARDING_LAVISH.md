@@ -27,8 +27,8 @@ it, the bible wins.
 You need Python 3.10 or newer and git.
 
 ```bash
-git clone <repo-url> LookBeforeYouRetry
-cd LookBeforeYouRetry
+git clone https://github.com/prabhuuuuuuu/LookBeforeYouTry.git
+cd LookBeforeYouTry
 python -m venv .venv
 # Linux/macOS: source .venv/bin/activate      Windows: .venv\Scripts\activate
 pip install -e ".[laptop,dev]"
