@@ -35,6 +35,7 @@ jetson = [
 # Laptop / CI only: GUI-capable OpenCV for dewarp tests and tools/. Never install on the Jetson.
 laptop = [
     "opencv-python>=4.8",
+    "pillow>=10",
 ]
 dev = [
     "pytest>=7.4",
@@ -48,6 +49,11 @@ include = ["lbyr*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Real-model tests need a Jetson with CUDA and local weights: `pytest -m jetson` (see README).
+addopts = "-m 'not jetson'"
+markers = [
+    "jetson: needs a Jetson (CUDA) and local model weights; skipped by default",
+]
 
 [tool.ruff]
 line-length = 100
