@@ -33,12 +33,13 @@ still blocks real-hardware runs (see `docs/OPEN_QUESTIONS.md`).
 
 | Area | State |
 |---|---|
-| Config, bridge protocol, MockArm, trajectories, 50 Hz streamer, FSM + recovery, logging | Implemented and tested |
+| Config, FSM + recovery, logging, MockArm (firmware planner port), MotionController (one `m` per segment + DONE, PP-1), taught-pose mode | Implemented and tested |
 | Fisheye dewarp, metric geometry, Umeyama hand-eye solve | Implemented and tested |
-| SerialArm, IkpyIK, Trinet capture | Gated on open hardware questions (OQ-4, 6-12, A-1..3, A-6, A-7). `SerialArm` also needs the firmware's text protocol (not implemented) |
+| SerialArm (firmware text protocol, zeros checked against `data/calib/joints.yaml`) | Implemented; tested against a fake board and the real sketch compiled on the host (`tests/fw_sim/`). Not yet run on the real board |
+| IkpyIK, Trinet capture | Gated on open hardware questions (OQ-4, OQ-6..12, A-7) |
 | Moondream2Critic (BF16, 378x378 crop at runtime), RuleBasedPlanner (default), Qwen3-1.7B text planner for language mode, QwenPlanner (Qwen2.5-VL, opt-in), memory guard, `reasoning_trace` log event, `tools/bench_models.py` | Implemented; verified on the Orin NX (`pytest -m jetson`). Trials use the rules planner. Critic accuracy on real wrist frames is NOT measured yet. Language-mode planner: Qwen3-1.7B (M-2 closed) |
 | YOLOv11n TensorRT | Stub (TODO, lazy imports) |
-| Bridge firmware (XIAO ESP32-C6, PWM, text protocol) + `tools/arm_gui.py` bench GUI | Exists (`firmware/xiao_c6_bridge/`). Joint roles, PWM servos, 6.0 V rail and no-feedback are confirmed (OQ-1/2/3/5 closed). Zeros in `data/calib/zero_positions.json` still to be verified against the board's `list` output |
+| Bridge firmware (XIAO ESP32-C6, PWM, text protocol: `DONE`, `q`, extended `S`) + `tools/arm_gui.py` (sliders, Save pose as / Go to pose) | Firmware changes NOT yet flashed / tested on the board. `data/calib/joints.yaml` is seeded from the firmware defaults and must be verified against the board's `list` (`verified: true`). `data/calib/poses.yaml` is empty: teach the poses |
 
 ## Layout
 
@@ -48,8 +49,34 @@ tools/      beginner-friendly camera / calibration / labeling / serial scripts
 firmware/   XIAO ESP32-C6 bridge (xiao_c6_bridge/)
 tests/      pytest, runs without hardware
 docs/       bible, open questions, onboarding
-data/       git-ignored: frames/, datasets/, calib/, episodes/
+data/       calib/ is tracked (joints.yaml, poses.yaml); frames/, datasets/, episodes/,
+            bench/, live/ are git-ignored
 ```
+
+## Motion and taught poses (demo path)
+
+The bridge firmware is the trajectory generator (PP-1). The host sends ONE `m` per motion
+segment and waits for the firmware's `DONE`. The `MotionController` thread polls `q` at
+20 Hz. If no DONE arrives within predicted × 1.5 + 0.5 s, that is a LINK fault and the
+episode aborts. The predicted duration comes from a Python port of the firmware planner
+(`lbyr/arm/fw_planner.py`); `MockArm` runs the same port, so mock timing matches the board.
+
+Bring-up on the real arm:
+
+1. Flash `firmware/xiao_c6_bridge/Code.ino` (adds `DONE`, `q` and the extended `S` line).
+2. `python tools/arm_gui.py` → Connect → "Sync sliders". Compare every `S,<j>,<zero_us>,...`
+   line with `data/calib/joints.yaml`; fix if needed, then set `verified: true`.
+   `SerialArm` refuses to move if the board's zeros differ from the file.
+3. Teach the poses: move with the sliders, then "Save pose as..." with the names `home`,
+   `zone_A_pre`, `zone_A_grasp`, `place_pre`, `place`. Use "Go to pose" to check each one.
+4. Edit `data/calib/poses.yaml`: `gripper.open_deg` / `closed_deg` (slider 6 values), and per
+   zone `polygon_px` (overhead image pixels) and `radius_mm` (base axis to zone centre).
+5. `python -m lbyr.main` lists anything still missing (preflight).
+
+Taught-mode recovery: +15% closure → joint 6; wrist re-orient 30° → joint 5; lateral 10 mm
+→ base yaw + atan(10 / radius_mm); −5 mm standoff → the pre-grasp pose moves along the
+joint-space segment zone_X_pre → zone_X_grasp by 5 / standoff_mm (not a straight line in
+Cartesian space; the grasp pose is unchanged).
 
 ## Jetson install
 

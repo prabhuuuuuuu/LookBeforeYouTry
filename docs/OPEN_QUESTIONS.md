@@ -10,7 +10,7 @@ prints every item that still blocks real-hardware runs.
 
 **Status (bible v1.3, 2026-10-10):** OQ-1, OQ-2, OQ-3, OQ-5 are closed (PWM servos, joint roles
 confirmed, 6.0 V rail, no feedback). Bridge firmware exists (`firmware/xiao_c6_bridge/`).
-The matching `lbyr/config.py` fields have **not** been updated yet. The zeros in
+The matching `lbyr/config.py` fields were updated in v1.6 (below). The zeros in
 `data/calib/zero_positions.json` (git-ignored, not in the repo) are still to be verified
 against the board's `list` output (`S,<joint>,<zero_us>,...` lines); the firmware's
 `DEFAULT_ZERO_US` fallback was copied from that file.
@@ -23,6 +23,14 @@ Language mode served by Qwen3-1.7B text (M-2 closed). Critic accuracy on real wr
 frames is still NOT measured (no labelled set in `data/datasets/critic/`). The crop box must
 be re-centred on the gripper bite zone once the Trinet is mounted (OQ-12).
 
+**Status (bible v1.6, 2026-10-10):** PP-1 resolved: the firmware is the trajectory generator;
+one `m` per segment, `DONE` on completion (firmware updated, NOT yet flashed / tested on the
+board). `SerialArm` speaks the text protocol (PP-4 done; config now has pwm / 6.0 V / 115200
+/ no feedback). `data/calib/` is tracked: `joints.yaml` is seeded from the firmware's
+`DEFAULT_ZERO_US` and is **unverified**; `poses.yaml` is empty (teach with tools/arm_gui.py).
+Demo path = taught-pose mode (`motion.mode: taught`), so OQ-4 / OQ-6 / A-1 / A-3 no longer
+block it (`python -m lbyr.main` preflight).
+
 ## Hardware (bible Section 20)
 
 | # | Question | Unblocks (config field / code) | Answer (value, who, date) |
@@ -32,53 +40,47 @@ be re-centred on the gripper bite zone once the Trinet is mounted (OQ-12).
 | [x] OQ-3 | Exact servo PSU voltage and current. **Do not assume 5 V.** | `ArmConfig.servo_voltage_v` (safety interlock in `SerialArm.connect`) | **6.0 V** (MG996R max ~7.2 V). PSU current rating was not recorded. Bible v1.3, 2026-10-10. |
 | [ ] OQ-4 | Official URDF/CAD, or measured link lengths; joint limits in degrees | `ArmConfig.link_lengths_mm`, `joint_min_deg`, `joint_max_deg`; `IkpyIK` | |
 | [x] OQ-5 | Is servo position/load feedback readable? Load units? | `ArmConfig.feedback_readable`; `SerialArm.read_state`; jam detection | **No feedback.** "Position" is the last commanded pulse. JAMMED = operator stop only (bible 13) unless an INA226 current sensor is added. Bible v1.3, 2026-10-10. |
-| [ ] OQ-6 | Gripper stroke and closure-to-angle mapping (open deg, closed deg) | `GripperConfig.open_deg`, `closed_deg` | |
+| [ ] OQ-6 | Gripper stroke and closure-to-angle mapping (open deg, closed deg) | `GripperConfig.open_deg`, `closed_deg` (ik mode); taught mode: `gripper.open_deg/closed_deg` in `data/calib/poses.yaml` | |
 | [ ] OQ-7 | Trinet live-stream mode: UVC webcam or vendor SDK? Device index? | `WristCameraConfig.device_index`; `TrinetWristCamera` | |
 | [ ] OQ-8 | Trinet resolution/FPS that works reliably on the Jetson | `WristCameraConfig.width/height/fps` (`tools/fps_test.py`) | |
 | [ ] OQ-9 | Trinet fisheye calibration (K, D, RMS) | `data/calib/trinet_fisheye.yaml` (`tools/calibrate_fisheye.py`) | |
 | [ ] OQ-10 | USB port plan: RealSense on USB 3.0; Trinet and XIAO ESP32-C6 on stable separate ports; XIAO device name (`/dev/ttyACM*`?) | `ArmConfig.serial_port` | |
 | [ ] OQ-11 | Final tripod height and tilt at venue | hand-eye calibration (`base_T_cam.yaml`) | |
-| [ ] OQ-12 | Final wrist mount geometry for Trinet (gripper ROI crop) | `WristCameraConfig.crop_xywh` | |
+| [ ] OQ-12 | Final wrist mount geometry for Trinet (gripper ROI crop) | `CriticConfig.crop_xywh` (378x378 Critic crop; default centred) | |
 
 ## Surfaced by software (not in the bible)
 
 | # | Question | Unblocks | Answer |
 |---|---|---|---|
-| [ ] A-1 | Servo max speed (deg/s) and a safe joint acceleration (deg/s^2). The 30% dev / 50% stage caps are fractions of this. Firmware defaults are 30 deg/s and 60 deg/s^2 (caps 60 / 200, joints 5-6 scaled x0.35); these are firmware limits, not measured servo maxima. | `ArmConfig.max_joint_speed_deg_s`, `max_joint_accel_deg_s2` | |
-| [ ] A-2 | Max delta per 20 ms tick the bridge should allow (deg). The firmware has no per-tick clamp; it limits speed/accel instead. | `ArmConfig.max_delta_per_tick_deg`; firmware clamp | |
-| [ ] A-3 | Safe / home pose (6 joint angles, deg) used on ABORT. The firmware's `home` goes to the saved zeros, which must be this pose or a decision is needed. | `ArmConfig.safe_pose_deg` | |
+| [ ] A-1 | Servo max speed (deg/s) and a safe joint acceleration (deg/s^2). The 30% dev / 50% stage caps are fractions of this. Firmware defaults are 30 deg/s and 60 deg/s^2 (caps 60 / 200, joints 5-6 scaled x0.35); these are firmware limits, not measured servo maxima. | Since PP-1 the firmware's `speed V A` sets real motion speed (SerialArm reads it from the `V` line); `ArmConfig` values are used by MockArm only. Not blocking the demo. | |
+| [x] A-2 | Max delta per 20 ms tick the bridge should allow (deg). | — | **Superseded by PP-1** (2026-10-10): no setpoint streaming; the firmware limits speed/accel itself. |
+| [ ] A-3 | Safe / home pose (6 joint angles, deg) used on ABORT. The firmware's `home` goes to the saved zeros, which must be this pose or a decision is needed. | Taught mode: the taught `home` pose in `data/calib/poses.yaml` (operator decides by teaching it). ik mode: `ArmConfig.safe_pose_deg` | |
 | [x] A-4 | Load units and a jam threshold | `ArmConfig.jam_load_threshold` | Moot: no feedback (OQ-5). Revisit only if an INA226 is added. |
 | [x] A-5 | Host <-> bridge baud (bible: >= 115200), fixed when firmware is written | `ArmConfig.host_baud` | **115200** (firmware `Serial.begin(115200)`). |
-| [ ] A-6 | Bridge `status` values other than `"ok"` (host treats any non-`ok` as JAMMED) | `bridge_proto`, firmware | Superseded: the firmware replies `OK ...` / `ERR ...` text lines and has no `status` field. Decide the host mapping when the text protocol is implemented (below). |
-| [ ] A-7 | Joint zero pose and sign conventions (what does 0 deg mean per joint?) | `IkpyIK`, safe pose | Firmware: 0 deg = saved zero pulse, +deg = longer pulse, 1000/90 us per deg nominal. Zeros (us) in the firmware fallback: 1477, 1989, 1844, 1223, 1467, 1433. Still to verify against `list` and `data/calib/zero_positions.json`; sign per joint and the physical meaning of the zero pose are unconfirmed. |
+| [x] A-6 | Bridge `status` values other than `"ok"` | `SerialArm` | **Decided 2026-10-10:** `ERR ...` after a motion command, a serial read/write failure, or no `DONE` within predicted x 1.5 + 0.5 s = **LINK** fault -> ABORT (stop sent, torque kept ON so the arm does not fall). Not JAMMED. |
+| [ ] A-7 | Joint zero pose and sign conventions (what does 0 deg mean per joint?) | `data/calib/joints.yaml` (`zero_us`, `sign`, `zero_pose_deg`); `IkpyIK` | Firmware: 0 deg = saved zero pulse, +deg = longer pulse, 1000/90 us per deg nominal. `joints.yaml` is seeded with the firmware fallback zeros (1477, 1989, 1844, 1223, 1467, 1433), `sign: 1`, `zero_pose_deg: 0`, `verified: false`. **To do:** compare with the board's `list` and set `verified: true` (blocks real runs). Signs / zero-pose meaning are only needed for ik mode. |
 
-## Host protocol plan: SerialArm / bridge_proto (recorded 2026-10-10, NOT implemented)
+## Host protocol: SerialArm <-> firmware text protocol (implemented 2026-10-10)
 
-The firmware (`firmware/xiao_c6_bridge/Code.ino`, bible v1.3 Section 6) speaks a **text**
-protocol at 115200, not the JSON protocol that `lbyr/arm/bridge_proto.py` and
-`SerialArm` implement today. Until this is done, `SerialArm` cannot drive the real board.
-Plan (for a later increment; keep `bridge_proto` JSON + `MockArm` working for tests):
+PP-1 decision: the firmware (`firmware/xiao_c6_bridge/Code.ino`) is the trajectory
+generator. The host sends ONE `m` per motion segment and waits for `DONE`; no streaming.
 
-| Host call (`ArmInterface`) | Firmware text command | Notes |
+| Host call (`ArmInterface`) | Firmware | Notes |
 |---|---|---|
-| `move_joints(deg, time_ms)` | `m D1 .. D6` | Degrees relative to saved zero. The firmware has **no `time_ms`**: it moves at its own speed/accel limits and all joints arrive together. Duration is set with `speed V A`, not per move. |
-| `stream_point(deg)` (50 Hz) | `m D1 .. D6` (see PP-1) | Open problem PP-1. |
+| `connect()` | `list`, then `q` until not moving | Zeros from the `S` lines must equal `data/calib/joints.yaml`, else `ZeroMismatchError` (no motion). Speed from the `V` line. Waits for boot homing to finish. |
+| `move_joints(deg)` | `m D1 .. D6` | Host degrees -> zero-relative degrees (`sign`, `zero_pose_deg`). Returns the duration predicted by `lbyr/arm/fw_planner.py` (port of the firmware planner, checked against the compiled sketch in `tests/test_fw_planner.py`). |
+| `motion_status()` | `OK m` then `DONE` | DONE counts only after the `OK m` of the latest segment. `ERR` / I/O error -> ERROR. The MotionController adds the timeout: predicted x 1.5 + 0.5 s -> LINK. |
+| `request_state()` / `read_state()` | `q` -> `Q,<moving>,<cur_us x6>` | COMMANDED pulses (no feedback, OQ-5); `feedback = "commanded"`. |
 | `stop()` | `x` | Brakes smoothly, then holds. |
-| `torque(False)` | `off` | Releases PWM; the arm may fall. Only with the arm supported. |
-| `torque(True)` | `home` | Re-attaches released joints at their zeros and moves there. There is no way to re-enable torque without moving. |
-| `read_state()` | `list` | Returns **commanded** pulses (`S,<joint>,<zero_us>,<pos_us>,<attached>,<name>` x6, then `V,<vmax>,<amax>`), not measured angles. Convert with `(pos_us - zero_us) / (1000/90)`. `load` and `temp` are `None`. `ArmState.status` must not be treated as measured feedback (OQ-5). |
-| `connect()` | open port, then expect the boot `help` text | The board homes itself at boot (arm must already rest in the zero pose). Host must not send motion until homing is finished. |
+| `torque(False)` | `off` | Releases PWM; the arm may fall. Only with the arm supported (JAMMED abort). |
+| `torque(True)` | — | No-op while attached. Refuses after `off` (re-attaching jumps to the zero pulse; use Home in arm_gui). |
 
-Replies are `OK ...` / `ERR ...` lines; `list` is multi-line. No reply is a timeout.
-
-Open points for that increment:
-
-| # | Question |
-|---|---|
-| PP-1 | The firmware re-plans from the current position on every command (accel-limited, backlash overshoot, `m` scales speeds by remaining distance). A 50 Hz stream of `m` commands will likely not behave like the trapezoid trajectories. Options: (a) send sparse waypoints (about 5-10 Hz) and let the firmware profile them; (b) add a firmware streaming/"direct set" mode (needs a firmware change, not made yet); (c) accept it after bench testing with `tools/arm_gui.py`. Decide before wiring `MotionStreamer` to the real arm. |
-| PP-2 | Degrees in the host are relative to each joint's saved zero. IK and `ArmConfig.safe_pose_deg` need that convention (A-3, A-7). Joint limits in degrees (OQ-4) must be enforced on the host because the firmware only clamps pulses to 500-2500 us. |
-| PP-3 | The firmware has no link-loss watchdog and no per-tick delta clamp (A-2). PWM servos hold the last pulse on link loss. Decide whether to add a watchdog in firmware. |
-| PP-4 | `ArmConfig.servo_bus` / `servo_ids` / `servo_baud` need to become "pwm" / not applicable; `SerialArm.check_confirmed` should drop the IDs/baud checks and use A-5 = 115200. Preflight in `lbyr/main.py` lists open questions from config, so closing OQ-1/2/3/5 in `config.py` is a separate step. |
+| # | Point | Status |
+|---|---|---|
+| [x] PP-1 | Streaming vs firmware planner | **Resolved 2026-10-10:** one `m` per segment + `DONE`. |
+| [ ] PP-2 | Joint limits in degrees (OQ-4) must be enforced on the host; the firmware only clamps pulses to 500-2500 us. | Open (taught poses are taught inside the safe range; ik mode needs OQ-4). |
+| [ ] PP-3 | No link-loss watchdog in the firmware; PWM servos hold the last pulse on link loss. | Open. The host detects LINK (no DONE) and aborts; a firmware watchdog is not added. |
+| [x] PP-4 | Config / check_confirmed for PWM | **Done 2026-10-10:** `servo_bus = pwm`, 6.0 V, 115200, `feedback_readable = False`; `check_confirmed` needs only voltage, port (OQ-10) and baud. |
 
 ## Software policy decisions (approved by software lead, scaffold session)
 
@@ -97,6 +99,8 @@ Open points for that increment:
 | D-11 | (2026-10-10) Qwen "language mode" for the demo intro only (`plan_language`): text-only prompt, compact `{"a","s","g","p"}` schema, 64 new tokens max, `planner.qwen_timeout_s` = 8 s; strict parser unchanged. Every plan is logged as a `reasoning_trace` event. |
 | D-12 | (2026-10-10) Memory guard: with `backend = qwen` or `language_mode`, refuse to start the episode loop if free system RAM after loading all models is < `planner.qwen_min_free_ram_mb` (1536 MB), or if RAM cannot be read. |
 | D-13 | (2026-10-10) Critic `INVALID` (unparseable answer): re-query once with a fresh frame (not counted in k), then treat as `OCCLUDED` (its recovery: re-position wrist cam, re-query; then ABORT). Logged as `critic_invalid_retry` (`action` = `requery` / `treat_as_occluded`). Every verdict record has the raw answer, verdict, total latency and inference time. |
+| D-14 | (2026-10-10) Motion PP-1: one `m` per segment + `DONE`, MotionController at 20 Hz (`q` poll). LINK fault (no DONE in predicted x 1.5 + 0.5 s, `ERR`, I/O error) -> ABORT: stop sent, torque kept ON, no further motion. JAMMED (mock / future sensors only) -> stop + torque OFF. |
+| D-15 | (2026-10-10) `motion.mode = taught` is the default (demo path). Recovery mapping: +15% closure -> joint 6; wrist re-orient 30 deg -> joint 5; lateral 10 mm -> base yaw + atan(10 / radius_mm); -5 mm standoff -> pre-grasp moves along the joint-space segment zone_X_pre -> zone_X_grasp by 5 / standoff_mm (joint-space, not Cartesian; grasp pose unchanged). Object -> zone: detection centroid inside the zone polygon (overhead pixels); outside every zone -> IK_FAILED -> ABORT. The planner's standoff_mm is not used in taught mode. |
 
 ## Model performance decisions
 

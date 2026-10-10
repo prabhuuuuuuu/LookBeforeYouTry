@@ -19,7 +19,9 @@ Trinet wrist Critic (Moondream2) + parameterized recovery FSM, all local on a Je
 6. Every VLM call goes through the timeout wrapper (`lbyr/ai/timeout.py`), temperature 0.
    Planner: 3 s hard timeout for every in-loop call (Qwen "language mode", demo intro only:
    `planner.qwen_timeout_s`, 8 s). Critic: explicit `CriticConfig.timeout_s`.
-7. The 50 Hz `MotionStreamer` never blocks on AI, detection, logging or I/O. Deadline
+7. Motion (PP-1): the bridge firmware is the trajectory generator. The host sends ONE `m`
+   per segment and waits for `DONE`; no setpoint streaming. The `MotionController` (20 Hz
+   dispatcher + `q` poller) never blocks on AI, detection, logging or replies. Deadline
    scheduling with `time.perf_counter()`. Feed it only via latest-value buffers.
 8. The Critic is async: the FSM submits and polls, never waits.
 9. The wrist camera (Trinet) is semantic-only: dewarp -> Critic. Never metric control.
@@ -47,15 +49,19 @@ python -m lbyr.main --mock   # one simulated episode with one recovery
 Repo: https://github.com/prabhuuuuuuu/LookBeforeYouTry (branch `main`).
 Commit in small increments with conventional commit messages (`feat(fsm): ...`). Before
 each commit, tests, ruff and mypy must pass. Push to `origin main` after each commit.
-Never force-push. Never commit `data/`, images or model weights.
+Never force-push. Never commit images, datasets, episodes, bench results or model weights.
+`data/calib/` (joints.yaml, poses.yaml) IS tracked.
 
 ## Map
 
 - `lbyr/config.py`: all configs, `mock_profile()`, `require()`
-- `lbyr/arm/`: `bridge_proto` (JSON protocol), `MockArm`, `SerialArm` (gated)
+- `lbyr/arm/`: `text_proto` (firmware text protocol), `fw_planner` (Python port of the firmware
+  planner), `calib` (joints.yaml), `SerialArm` (text protocol), `MockArm` (planner port);
+  `bridge_proto` (old JSON protocol, unused)
 - `lbyr/perception/`: latest-value buffers, D435/Trinet capture + fakes, dewarp, geometry, detector
 - `lbyr/ai/`: timeout wrapper, planner (strict JSON), Critic (verdict parser + worker)
-- `lbyr/motion/`: IK (ikpy gated on OQ-4; `MockIK`), trapezoid trajectories, 50 Hz streamer
+- `lbyr/motion/`: `controller` (segment dispatcher), `taught` (taught-pose mode), IK (ikpy gated
+  on OQ-4; `MockIK`), trapezoid trajectories (offline only)
 - `lbyr/fsm/`: states (bible 10), recovery table as data (bible 13), supervisor (10 Hz)
 - `lbyr/logging_/episodes.py`: episodes.jsonl + frames/, tegrastats VRAM
 - `lbyr/mock_stack.py`: wires the simulated stack for `--mock` and tests
