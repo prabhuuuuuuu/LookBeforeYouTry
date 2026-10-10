@@ -85,6 +85,10 @@ class FakeBoard:
             self.p.move_deg([float(v) for v in cmd.split()[1:]])
             self.pending = True
             self.say("OK m")
+        elif cmd.startswith("speed "):
+            v, a = (float(x) for x in cmd.split()[1:3])
+            self.p.vmax_deg, self.p.amax_deg = min(v, 60.0), min(a, 200.0)
+            self.say(f"OK speed {self.p.vmax_deg:.0f} deg/s, {self.p.amax_deg:.0f} deg/s^2")
         elif cmd == "x":
             self.p.stop_all()
             self.say("OK stopped; holding")

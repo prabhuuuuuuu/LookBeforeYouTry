@@ -73,6 +73,12 @@ class ArmInterface(ABC):
     def stop(self) -> None:
         """Safe stop: brake and hold (``x``)."""
 
+    def set_speed(self, vmax_deg_s: float, amax_deg_s2: float) -> tuple[float, float] | None:
+        """Set the trajectory speed / acceleration limits (firmware ``speed V A``). Returns the
+        values now in force, or None if this arm has no such command (mock: FAKE limits
+        from mock_profile). Blocking: call at connect time only."""
+        return None
+
     def wait_done(self, timeout_s: float, poll_s: float = 0.01) -> str:
         """BLOCKING helper for tools/tests (never call from the FSM or motion thread).
         Returns the final phase (DONE / ERROR), or MOVING on timeout."""

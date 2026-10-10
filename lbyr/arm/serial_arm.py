@@ -22,6 +22,7 @@ completion = the firmware's ``DONE`` line. No setpoint streaming.
 
 from __future__ import annotations
 
+import glob
 import logging
 import threading
 import time
@@ -29,7 +30,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from lbyr.arm.calib import JointsCalib, load_joints
-from lbyr.arm.fw_planner import TICK_S, FirmwarePlanner
+from lbyr.arm.fw_planner import AMAX_CAP_DEG, TICK_S, VMAX_CAP_DEG, FirmwarePlanner
 from lbyr.arm.interface import DONE, ERROR, IDLE, MOVING, STATUS_OK, ArmInterface, ArmState
 from lbyr.arm.text_proto import (
     DoneMsg,
@@ -55,6 +56,21 @@ BOOT_SETTLE_TIMEOUT_S = 20.0  # the board homes itself at boot (staggered attach
 
 class ZeroMismatchError(LBYRError):
     """The board's saved zeros differ from data/calib/joints.yaml: refuse to move."""
+
+
+def detect_bridge_port(pattern: str = "/dev/ttyACM*") -> tuple[str | None, list[str]]:
+    """Auto-detect the XIAO bridge: (port, candidates). The port is set only when exactly
+    one device matches; with zero or several the caller must ask (``--port``, OQ-10)."""
+    found = sorted(glob.glob(pattern))
+    return (found[0] if len(found) == 1 else None), found
+
+
+def speed_for_cap(cap: float) -> tuple[float, float]:
+    """Firmware ``speed V A`` for a speed cap fraction (bible 8: dev 0.30, stage 0.50) of the
+    firmware maxima VMAX_CAP_DEG / AMAX_CAP_DEG (Code.ino; not measured servo maxima, A-1)."""
+    if not 0.0 < cap <= 0.5:
+        raise ValueError("speed cap must be in (0, 0.5] (bible 8: dev 30%, stage 50%)")
+    return round(cap * VMAX_CAP_DEG, 1), round(cap * AMAX_CAP_DEG, 1)
 
 
 class PortLike(Protocol):
@@ -158,6 +174,31 @@ class SerialArm(ArmInterface):
             speed.vmax_deg,
             speed.amax_deg,
         )
+
+    def set_speed(self, vmax_deg_s: float, amax_deg_s2: float) -> tuple[float, float]:
+        """Send ``speed V A`` (the firmware caps it), then re-read ``list`` to get the values
+        in force (``V`` line) and re-sync the planner port so DONE timeouts stay right."""
+        if vmax_deg_s <= 0 or amax_deg_s2 <= 0:
+            raise ValueError("speed and acceleration must be > 0")
+        self._write(f"speed {vmax_deg_s:g} {amax_deg_s2:g}")
+        time.sleep(0.05)  # let the OK line arrive before the list rows
+        rows, speed = self._read_list()
+        if abs(speed.vmax_deg - vmax_deg_s) > 0.6 or abs(speed.amax_deg - amax_deg_s2) > 0.6:
+            log.warning(
+                "bridge speed is %.0f deg/s, %.0f deg/s^2 (asked %g, %g)",
+                speed.vmax_deg,
+                speed.amax_deg,
+                vmax_deg_s,
+                amax_deg_s2,
+            )
+        board_zero = [rows[j].zero_us for j in range(1, NUM_JOINTS + 1)]
+        planner = FirmwarePlanner(board_zero, speed.vmax_deg, speed.amax_deg)
+        planner.set_positions_us([rows[j].cur_us for j in range(1, NUM_JOINTS + 1)])
+        with self._lock:
+            self._planner = planner
+        self._planner_t = time.perf_counter()
+        log.info("bridge speed set: %.0f deg/s, %.0f deg/s^2", speed.vmax_deg, speed.amax_deg)
+        return speed.vmax_deg, speed.amax_deg
 
     def _read_list(self) -> tuple[dict[int, JointLine], SpeedLine]:
         with self._lock:

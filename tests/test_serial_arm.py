@@ -173,3 +173,38 @@ def test_no_done_becomes_link_fault_via_controller() -> None:
         assert mc.current().phase == SEG_DONE
     finally:
         arm.close()
+
+
+def test_set_speed_sends_speed_and_resyncs_planner() -> None:
+    from lbyr.arm.serial_arm import speed_for_cap
+
+    board = FakeBoard(vmax=30.0, amax=60.0)
+    arm = make(board)
+    arm.connect()
+    try:
+        v, a = speed_for_cap(0.30)
+        assert (v, a) == (18.0, 60.0)  # 30 % of the firmware caps 60 deg/s, 200 deg/s^2
+        assert arm.set_speed(v, a) == (18.0, 60.0)
+        assert "speed 18 60" in board.written
+        assert board.written[board.written.index("speed 18 60") + 1] == "list"
+        assert arm._planner is not None and arm._planner.vmax_deg == 18.0
+        predicted = arm.move_joints((30.0, 0, 0, 0, 0, 0))
+        assert predicted > 30.0 / 18.0  # slower than the old 30 deg/s
+        assert arm.wait_done(predicted * 1.5 + 1.0) == DONE
+    finally:
+        arm.close()
+
+
+def test_speed_cap_bounds_and_port_detection(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from lbyr.arm.serial_arm import detect_bridge_port, speed_for_cap
+
+    assert speed_for_cap(0.5) == (30.0, 100.0)
+    with pytest.raises(ValueError):
+        speed_for_cap(0.8)
+    assert detect_bridge_port(str(tmp_path / "ttyACM*")) == (None, [])
+    (tmp_path / "ttyACM0").touch()
+    one = str(tmp_path / "ttyACM0")
+    assert detect_bridge_port(str(tmp_path / "ttyACM*")) == (one, [one])
+    (tmp_path / "ttyACM1").touch()
+    port, found = detect_bridge_port(str(tmp_path / "ttyACM*"))
+    assert port is None and len(found) == 2
