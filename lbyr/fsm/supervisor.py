@@ -13,6 +13,9 @@
 - PLAN calls the planner under its 3 s hard timeout. This blocks only the FSM thread
   while the arm is idle; the board holds position by itself.
 - Failures -> RECOVER(k) per the recovery table, else ABORT with a human-readable report.
+- ``motion.mode = "taught"`` (default, demo path): skills map to taught joint poses
+  (:mod:`lbyr.motion.taught`); the target object's zone is the zone polygon containing its
+  detection centroid. ``"ik"``: Cartesian targets from the D435 + IK (needs OQ-4, hand-eye).
 """
 
 from __future__ import annotations
@@ -30,12 +33,13 @@ from lbyr.ai.critic import CriticResult, CriticWorker, Verdict
 from lbyr.ai.planner import Planner, PlanRequest, SkillChain, plan_with_timeout
 from lbyr.arm.interface import ArmInterface
 from lbyr.config import GRIPPER_INDEX, WRIST_PITCH_INDEX, AppConfig
-from lbyr.errors import IKError
+from lbyr.errors import ConfigError, IKError
 from lbyr.fsm.recovery import RECOVERY_TABLE, FailureClass, RecoveryBudget, classify
 from lbyr.fsm.states import VERIFY_STATES, State, next_in_pipeline
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor, make_record
 from lbyr.motion.controller import FAULT, MotionController
 from lbyr.motion.ik import CartesianTarget, IKSolver
+from lbyr.motion.taught import TaughtExecutor, Zone
 from lbyr.perception.buffers import LatestValueBuffer
 from lbyr.perception.detector import Detection, Detector
 from lbyr.perception.geometry import locate_in_base
@@ -73,6 +77,7 @@ class SupervisorDeps:
     critic: CriticWorker | None  # None = "Critic OFF" baseline
     logger: EpisodeLogger | None = None
     vram: VramMonitor | None = None
+    taught: TaughtExecutor | None = None  # required when motion.mode == "taught"
 
 
 @dataclass
@@ -82,7 +87,9 @@ class GraspAdjustments:
     closure_delta_pct: float = 0.0
     wrist_roll_deg: float = 0.0
     lateral_offset_mm: float = 0.0
-    grasp_z_offset_mm: float = 0.0  # EMPTY recovery: "-5 mm standoff" = grasp 5 mm lower
+    # EMPTY recovery "-5 mm standoff": IK mode = grasp 5 mm lower (D-8); taught mode = the
+    # pre-grasp pose moves toward the grasp pose (lbyr.motion.taught).
+    grasp_z_offset_mm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,7 @@ class _EpisodeCtx:
     detections: dict[int, Detection] = field(default_factory=dict)
     positions: dict[int, np.ndarray] = field(default_factory=dict)
     chain: SkillChain | None = None
+    zone: Zone | None = None  # taught mode: zone of the target object
     grasp_xyz: np.ndarray | None = None
     target: dict[str, Any] | None = None
     failure: FailureClass | None = None
@@ -135,6 +143,9 @@ class Supervisor:
         cfg.validate()
         self.cfg = cfg
         self.d = deps
+        self._taught = deps.taught
+        if cfg.motion.mode == "taught" and self._taught is None:
+            raise ConfigError("motion.mode = 'taught' needs taught poses (SupervisorDeps.taught)")
         self.state = State.IDLE
         self._ctx: _EpisodeCtx | None = None
         # motion bookkeeping
@@ -281,6 +292,14 @@ class Supervisor:
         dets = self.d.detector.detect(frame.color)
         c = self.ctx
         c.detections, c.positions = {}, {}
+        if self._taught is not None:  # taught mode: 2D detections + zones, no depth
+            c.detections = {d.id: d for d in dets}
+            if not any("zone" not in d.label for d in dets):
+                return self._fail(FailureClass.PERCEPTION_FAILED, "no object detected")
+            if not any("zone" in d.label for d in dets):
+                place = self._taught.place_detection()  # planner place target
+                c.detections[place.id] = place
+            return State.PLAN, f"{len(dets)} objects detected"
         for det in dets:
             u, v = det.centroid
             p = locate_in_base(
@@ -314,8 +333,14 @@ class Supervisor:
                 FailureClass.WRONG_OBJECT,
                 f"planner chose {label!r}, expected {c.spec.expected_label!r}",
             )
+        if self._taught is not None:
+            try:
+                c.zone = self._taught.zone_for(c.detections[res.chain.approach.target_id])
+            except IKError as e:
+                return self._fail(FailureClass.IK_FAILED, str(e))
         c.chain = res.chain
-        return State.APPROACH, f"plan ok in {res.latency_ms:.0f} ms"
+        zone = f", zone {c.zone.name}" if c.zone is not None else ""
+        return State.APPROACH, f"plan ok in {res.latency_ms:.0f} ms{zone}"
 
     # ================================================================ motion states
     def _closure_pct(self) -> float:
@@ -323,7 +348,23 @@ class Supervisor:
         return min(100.0, self.ctx.chain.grasp.closure + self.ctx.adj.closure_delta_pct)
 
     def _gripper_deg(self, closure_pct: float) -> float:
+        if self._taught is not None:
+            return self._taught.poses.gripper_deg(closure_pct)
         return self.cfg.arm.gripper.closure_to_deg(closure_pct)
+
+    def _taught_goals(
+        self, label: str, make: Callable[[TaughtExecutor, Zone], list[np.ndarray]]
+    ) -> Next:
+        """Taught mode: build the goals with ``make`` and start the motion."""
+        c = self.ctx
+        assert self._taught is not None and c.zone is not None
+        try:
+            goals = make(self._taught, c.zone)
+        except IKError as e:  # TaughtPoseError: missing pose / radius
+            return self._fail(FailureClass.IK_FAILED, f"{label}: {e}")
+        c.target = {"label": label, "zone": c.zone.name, "joints_deg": goals[-1]}
+        self._start_motion(goals)
+        return None
 
     def _pose(self, xyz: np.ndarray, gripper_deg: float) -> np.ndarray:
         """IK for a top-down TCP pose + gripper -> 6-joint goal (deg)."""
@@ -345,6 +386,14 @@ class Supervisor:
     def _enter_approach(self) -> Next:
         c = self.ctx
         assert c.chain is not None
+        if self._taught is not None:
+            a, here = c.adj, self._setpoint()
+            return self._taught_goals(
+                "grasp",
+                lambda t, z: t.approach_goals(
+                    z, here, a.wrist_roll_deg, a.lateral_offset_mm, a.grasp_z_offset_mm
+                ),
+            )
         obj = c.positions[c.chain.approach.target_id]
         grasp = np.array(
             [
@@ -375,6 +424,11 @@ class Supervisor:
         return None
 
     def _enter_lift(self) -> Next:
+        if self._taught is not None:
+            a, pct = self.ctx.adj, self._closure_pct()
+            return self._taught_goals(
+                "lift", lambda t, z: t.lift_goals(z, pct, a.wrist_roll_deg, a.lateral_offset_mm)
+            )
         assert self.ctx.grasp_xyz is not None
         up = self.ctx.grasp_xyz + [0.0, 0.0, self.cfg.skills.lift_height_mm]
         return self._plan_goals([(up, self._gripper_deg(self._closure_pct()))], "lift")
@@ -384,11 +438,17 @@ class Supervisor:
         return self.ctx.positions[self.ctx.chain.place.target_id]
 
     def _enter_transport(self) -> Next:
+        if self._taught is not None:
+            pct = self._closure_pct()
+            return self._taught_goals("transport", lambda t, z: t.transport_goals(pct))
         p = self._place_xy()
         xyz = np.array([p[0], p[1], self.cfg.skills.transport_height_mm])
         return self._plan_goals([(xyz, self._gripper_deg(self._closure_pct()))], "transport")
 
     def _enter_place(self) -> Next:
+        if self._taught is not None:
+            pct = self._closure_pct()
+            return self._taught_goals("place", lambda t, z: t.place_goals(pct))
         assert self.ctx.grasp_xyz is not None
         p = self._place_xy()
         z = p[2] + self.ctx.grasp_xyz[2] + self.cfg.skills.place_release_height_mm
@@ -546,6 +606,11 @@ class Supervisor:
         return np.asarray(self.d.motion.current().goal, dtype=float)
 
     def _safe_pose(self) -> np.ndarray | None:
+        if self._taught is not None:  # taught 'home' pose (A-3 decided per poses.yaml)
+            try:
+                return self._taught.safe_pose(float(self._setpoint()[GRIPPER_INDEX]))
+            except IKError:
+                return None
         safe = self.cfg.arm.safe_pose_deg
         if safe is None:
             return None

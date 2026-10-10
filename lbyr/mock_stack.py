@@ -18,6 +18,7 @@ from lbyr.fsm.supervisor import Supervisor, SupervisorDeps
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor
 from lbyr.motion.controller import MotionController
 from lbyr.motion.ik import MockIK
+from lbyr.motion.taught import TaughtExecutor, mock_taught_poses
 from lbyr.perception.overhead import FakeOverheadCamera, FakeScene
 from lbyr.perception.wrist import FakeWristCamera
 
@@ -111,6 +112,11 @@ def build_mock_stack(
         critic = CriticWorker(backend, cfg.critic, preprocess=pre)
     logger = EpisodeLogger.for_new_session(log_dir) if log_dir is not None else None
     vram = VramMonitor(cfg.logging.tegrastats_interval_ms)
+    taught = None
+    if cfg.motion.mode == "taught":  # FAKE taught poses around the fake scene's objects
+        taught = TaughtExecutor(
+            mock_taught_poses(scene.detections()), cfg.skills.default_standoff_mm
+        )
     deps = SupervisorDeps(
         arm=arm,
         motion=motion,
@@ -123,6 +129,7 @@ def build_mock_stack(
         critic=critic,
         logger=logger,
         vram=vram,
+        taught=taught,
     )
     sup = Supervisor(cfg, deps)
     return MockStack(cfg, arm, motion, overhead, wrist, backend, critic, logger, vram, sup)

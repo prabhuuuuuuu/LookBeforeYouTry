@@ -233,3 +233,26 @@ def test_invalid_twice_is_treated_as_occluded(tmp_path: Path) -> None:
 def test_invalid_forever_aborts_after_occluded_budget() -> None:
     result, _ = run(("banana",))
     assert result.outcome == "abort" and result.failure is FailureClass.OCCLUDED
+
+
+def test_ik_mode_still_runs_end_to_end() -> None:
+    cfg = fast_cfg()
+    cfg.motion.mode = "ik"
+    stack = build_mock_stack(cfg, DEMO_SCRIPT, critic_delay_s=0.01)
+    assert stack.supervisor._taught is None
+    with stack:
+        result = stack.supervisor.run_episode(SPEC, timeout_s=30.0)
+    assert result.outcome == "success" and result.recoveries == 1
+    gripper = stack.cfg.arm.gripper
+    assert stack.arm.peak_deg[GRIPPER_INDEX] == pytest.approx(gripper.closure_to_deg(95.0), abs=0.5)
+
+
+def test_taught_mode_requires_poses() -> None:
+    from lbyr.errors import ConfigError
+    from lbyr.fsm.supervisor import Supervisor
+
+    stack = build_mock_stack(fast_cfg(), HAPPY)
+    deps = stack.supervisor.d
+    deps.taught = None
+    with pytest.raises(ConfigError, match="taught"):
+        Supervisor(stack.cfg, deps)
