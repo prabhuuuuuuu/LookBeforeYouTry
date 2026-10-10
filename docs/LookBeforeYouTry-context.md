@@ -527,21 +527,30 @@ the Orin has unified memory, so the real limit is system RAM (tegrastats).
 | Planner | Qwen2.5-VL-3B-Instruct FP16, full JSON contract (98 tokens) | 7.2 GB | 11.2 s (8.7 tok/s) | +0.7 GB; ~6–14× the 0.8–2 s estimate; **never meets the 3 s hard timeout** |
 | Both loaded | Critic + Qwen | 11.3 GB | — | system RAM peak **14.8 / 16 GB** (~0.8 GB free) |
 
-**Measured 2026-10-10 (v1.5), 40 W, synthetic images.** Same board and software. Source:
-`tools/bench_models.py --planner-models qwen3-1.7b,qwen3-0.6b --combined` (10 calls each).
-Planner latency = full generation of the compact schema (~20 tokens) for 10 fixed
-language commands against a fixed 6-object detection list.
+**Measured 2026-10-10, 40 W + jetson_clocks, synthetic images (current, v1.5).** Same board
+and software; `jetson-clocks.service` enabled (CPU pinned 1.5 GHz, GPU 1173 MHz, EMC
+3199 MHz). Source: `tools/bench_models.py --planner-models qwen3-1.7b --combined`
+(`data/bench/bench-20261010-224019.json`, 10 calls each). Planner latency = full generation
+of the compact schema (~20 tokens) for 10 fixed language commands against a fixed 6-object
+detection list.
 
 | Component | Model / Precision | Memory (torch) | Latency p50 / p95 | Notes |
 |---|---|---:|---:|---|
-| Critic (runtime) | Moondream2 **BF16**, 378×378 crop of the dewarped frame | 4.1 GB peak (3.7 GB weights) | **0.85 s** / 0.85 s | was 1.35 s on the full 640×480 FP16 frame; accuracy NOT measured yet (no labelled set) |
-| Language planner (default) | **Qwen3-1.7B** BF16, text-only, thinking off | 3.2 GB | **2.37 s** / 2.40 s | 8.4 tok/s, 20 tokens; valid 9/10, correct 9/10 (the miss: hallucinated id, rejected by the strict parser); 10/10 within 8 s; load+warm-up 10.7 s |
-| Language planner (alt.) | Qwen3-0.6B BF16, text-only, thinking off | 1.1 GB | 2.82 s / 3.21 s | valid 5/10, correct 2/10 (string ids, wrong zones). Not usable |
-| Critic + Qwen3-1.7B loaded together | — | 7.2 GB (8.3 GB peak) | Critic 0.91 s, planner 2.32 s | system RAM 10.75 / 15.3 GB used after load, **4.5 GB free**, peak 10.8 GB → memory guard **PASS** |
+| Critic (runtime) | Moondream2 **BF16**, 378×378 crop of the dewarped frame | 4.1 GB peak (3.7 GB weights) | **0.785 s** / 0.789 s | accuracy NOT measured yet (no labelled set) |
+| Language planner (default) | **Qwen3-1.7B** BF16, text-only, thinking off | 3.2 GB | **2.14 s** / 2.18 s | 9.4 tok/s, 20 tokens; valid 9/10, correct 9/10 (the miss: hallucinated zone id 5, rejected by the strict parser); 10/10 within 8 s; load+warm-up 7.7 s |
+| Critic + Qwen3-1.7B loaded together | — | 7.2 GB (8.1 GB peak) | Critic 0.78 s, planner 2.13 s | system RAM 10.80 / 15.29 GB used after load, **4.49 GB free** → memory guard **PASS** |
 
-Decode is ~8.5 tok/s for 0.6B, 1.7B and Qwen2.5-VL-3B alike, so it is per-token overhead
-bound (HF `generate`, CPU clocks), not model-size bound. Not investigated yet
-(`jetson_clocks` state was not recorded).
+Before jetson_clocks (same day, 40 W, clocks not pinned): Critic BF16 crop p50 0.849 s
+(full 640×480 FP16 frame: 1.35 s); Qwen3-1.7B p50 2.37 s / 8.4 tok/s, load+warm-up 10.7 s;
+combined Critic 0.91 s, planner 2.32 s, 4.5 GB free. Qwen3-0.6B (not re-run): 2.82 s,
+1.1 GB, valid 5/10, correct 2/10 (string ids, wrong zones): not usable.
+
+Decode speed note: pinning the clocks (GPU to 1173 MHz, about 3× its unpinned clock per the
+operator; the unpinned GPU frequency was not logged by the bench) gave only ~10% (Qwen3-1.7B
+2.37 → 2.14 s, 8.4 → 9.4 tok/s; Critic 0.849 → 0.785 s). Qwen3-0.6B, Qwen3-1.7B and
+Qwen2.5-VL-3B also all decode at ~8.5 tok/s. So decoding is limited by per-token framework
+overhead (HF `generate`, Python + kernel launches), not compute. Post-hackathon option: a
+llama.cpp or TensorRT-LLM backend for the language planner. Not for now.
 
 Planner policy (v1.4, follows from the numbers above):
 
@@ -569,8 +578,8 @@ Planner policy (v1.4, follows from the numbers above):
 
 Critic defaults (M-1 closed, v1.5): BF16 (FP16 still selectable, `critic.dtype`), input =
 dewarped wrist frame → 378×378 crop (`critic.crop_xywh`, default centred; must be re-centred
-on the gripper bite zone once the Trinet is mounted, OQ-12). Language-planner pick: M-2 in
-`docs/OPEN_QUESTIONS.md`.
+on the gripper bite zone once the Trinet is mounted, OQ-12). Language-mode planner: Qwen3-1.7B
+(M-2 closed 2026-10-10).
 
 Fallback chain if memory pressure appears:
 
@@ -687,7 +696,7 @@ Abort behavior:
 | Output | Strict JSON |
 | Default backend (v1.4) | Rule-based planner; Qwen only with `planner.backend = qwen` (see 9.2) |
 | Language mode (v1.4) | Demo intro only: text-only, compact schema, ≤64 tokens, `planner.qwen_timeout_s` = 8 s |
-| Language-mode model (v1.5) | Qwen3-1.7B text (BF16, `enable_thinking=False`, greedy), `planner.language_backend = qwen3_text`; Qwen2.5-VL text-only selectable (`qwen_vl`). Measured 2.37 s p50, 9/10 correct (9.2) |
+| Language-mode model (v1.5) | Qwen3-1.7B text (BF16, `enable_thinking=False`, greedy), `planner.language_backend = qwen3_text`; Qwen2.5-VL text-only selectable (`qwen_vl`). Measured 2.14 s p50 with jetson_clocks, 9/10 correct (9.2) |
 
 Planner output contract:
 
@@ -722,7 +731,7 @@ contract above and validated by the same strict parser:
 | Precision (v1.5) | BF16 default; FP16 selectable (`critic.dtype`) |
 | Output | One word |
 | Classes | `GRASPED`, `SLIPPING`, `EMPTY`, `OCCLUDED` |
-| Timeout | Explicit timeout required (`critic.timeout_s`, 2 s; measured p50 0.85 s) |
+| Timeout | Explicit timeout required (`critic.timeout_s`, 2 s; measured p50 0.785 s with jetson_clocks) |
 | Unparseable answer (v1.5) | `INVALID` → re-query once with a fresh frame, then treated as `OCCLUDED`; logged as `critic_invalid_retry` |
 | Execution | Event-driven, asynchronous |
 

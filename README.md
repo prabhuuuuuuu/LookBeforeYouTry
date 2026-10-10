@@ -36,7 +36,7 @@ still blocks real-hardware runs (see `docs/OPEN_QUESTIONS.md`).
 | Config, bridge protocol, MockArm, trajectories, 50 Hz streamer, FSM + recovery, logging | Implemented and tested |
 | Fisheye dewarp, metric geometry, Umeyama hand-eye solve | Implemented and tested |
 | SerialArm, IkpyIK, Trinet capture | Gated on open hardware questions (OQ-4, 6-12, A-1..3, A-6, A-7). `SerialArm` also needs the firmware's text protocol (not implemented) |
-| Moondream2Critic (BF16, 378x378 crop at runtime), RuleBasedPlanner (default), Qwen3-1.7B text planner for language mode, QwenPlanner (Qwen2.5-VL, opt-in), memory guard, `reasoning_trace` log event, `tools/bench_models.py` | Implemented; verified on the Orin NX (`pytest -m jetson`). Trials use the rules planner. Critic accuracy on real wrist frames is NOT measured yet. Language-planner pick: OPEN_QUESTIONS M-2 |
+| Moondream2Critic (BF16, 378x378 crop at runtime), RuleBasedPlanner (default), Qwen3-1.7B text planner for language mode, QwenPlanner (Qwen2.5-VL, opt-in), memory guard, `reasoning_trace` log event, `tools/bench_models.py` | Implemented; verified on the Orin NX (`pytest -m jetson`). Trials use the rules planner. Critic accuracy on real wrist frames is NOT measured yet. Language-mode planner: Qwen3-1.7B (M-2 closed) |
 | YOLOv11n TensorRT | Stub (TODO, lazy imports) |
 | Bridge firmware (XIAO ESP32-C6, PWM, text protocol) + `tools/arm_gui.py` bench GUI | Exists (`firmware/xiao_c6_bridge/`). Joint roles, PWM servos, 6.0 V rail and no-feedback are confirmed (OQ-1/2/3/5 closed). Zeros in `data/calib/zero_positions.json` still to be verified against the board's `list` output |
 
@@ -63,6 +63,29 @@ export PIP_CONSTRAINT=constraints-jetson.txt   # numpy<2: NumPy 2 breaks the Jet
 pip install -e ".[jetson,dev]"
 ```
 
+### Enable the jetson_clocks systemd service
+
+All benchmark numbers below assume 40 W mode (`sudo nvpmodel -m 4`) plus pinned clocks
+(CPU 1.5 GHz, GPU 1173 MHz, EMC 3199 MHz). Make `jetson_clocks` run at every boot:
+
+```ini
+# /etc/systemd/system/jetson-clocks.service
+[Unit]
+Description=Max Jetson clocks
+After=nvpmodel.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/jetson_clocks
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now jetson-clocks.service
+sudo jetson_clocks --show          # check CPU / GPU / EMC frequencies
+```
+
 ### Known Jetson pitfalls
 
 - **numpy<2**: the system OpenCV is built against NumPy 1.x (`_ARRAY_API not found`).
@@ -73,6 +96,10 @@ pip install -e ".[jetson,dev]"
   PyPI wheel.
 - **cuDSS**: install via the tegra deb (`cudss-local-tegra-repo-ubuntu2204`, package
   `cudss-cuda-12`), then run `sudo ldconfig`.
+- **System SciPy**: Ubuntu's SciPy (visible through `--system-site-packages`) expects
+  `numpy<1.25` and warns ("A NumPy version >=1.17.3 and <1.25.0 is required") with the
+  NumPy 1.26 we use. Avoid scikit-learn / SciPy in the Jetson runtime path; use plain
+  torch / NumPy (e.g. the Critic metrics in `tools/bench_models.py` are plain Python).
 
 ## Real-model tests and benchmark (Jetson)
 
@@ -85,7 +112,7 @@ pytest                      # default: laptop-safe, real-model tests are deselec
 pytest -m jetson -v         # Moondream2 + Qwen3-1.7B on CUDA (~8 GB); VL: LBYR_TEST_QWEN_VL=1
 python tools/bench_models.py --critic-only                  # Critic at its runtime input
 python tools/bench_models.py --critic-only --critic-crop    # full frame vs 378x378 crop
-python tools/bench_models.py --planner-models qwen3-1.7b,qwen3-0.6b --combined
+python tools/bench_models.py --planner-models qwen3-1.7b --combined
 ```
 
 Planner config (bible 9.2 / 11.1, v1.4):
@@ -109,18 +136,24 @@ Planner config (bible 9.2 / 11.1, v1.4):
   With `backend: qwen` or `language_mode`, it refuses to start if less than
   `planner.qwen_min_free_ram_mb` (1.5 GB) is free.
 
-### Measured model cost (2026-10-10, Orin NX 16 GB, nvpmodel 40 W, JetPack 6.2, torch 2.11, synthetic images)
+### Measured model cost (measured 2026-10-10, 40 W + jetson_clocks; Orin NX 16 GB, JetPack 6.2, torch 2.11, synthetic images)
 
 | Piece | Memory (torch alloc) | Latency | Bible 9.2 estimate |
 |---|---|---|---|
-| **Moondream2 Critic, BF16, 378x378 crop (runtime)** | ~3.7 GB (4.1 GB peak) | p50 0.85 s | ~4 GB, 0.3-0.8 s |
-| Moondream2 Critic, FP16, full 640x480 frame (old default) | ~4.1 GB | p50 1.35 s | |
-| **Qwen3-1.7B language mode (default), ~20 tokens** | 3.2 GB | p50 2.37 s, 8.4 tok/s, 9/10 correct | |
-| Qwen3-0.6B language mode | 1.1 GB | p50 2.82 s, 2/10 correct | |
-| Qwen2.5-VL-3B in-loop full plan (~98 tokens, opt-in) | ~7.2 GB | p50 11.2 s, 8.7 tok/s | ~6.5 GB, 0.8-2 s |
-| **Critic + Qwen3-1.7B resident** | 7.2 GB; system RAM 10.75 of 15.3 GB, 4.5 GB free | Critic 0.91 s, planner 2.32 s | |
-| Critic + Qwen2.5-VL resident | 11.3 GB; system RAM peak ~14.8 GB, ~0.8 GB free | | peak 11-12 GB |
+| **Moondream2 Critic, BF16, 378x378 crop (runtime)** | ~3.7 GB (4.1 GB peak) | p50 0.785 s / p95 0.789 s | ~4 GB, 0.3-0.8 s |
+| **Qwen3-1.7B language mode (default), ~20 tokens** | 3.2 GB | p50 2.14 s / p95 2.18 s, 9.4 tok/s, 9/10 correct, load+warm-up 7.7 s | |
+| **Critic + Qwen3-1.7B resident** | 7.2 GB; system RAM 10.80 of 15.29 GB, 4.49 GB free (guard PASS) | Critic 0.78 s, planner 2.13 s | |
 
-Trials use the rules planner (Qwen2.5-VL never meets the 3 s in-loop timeout here). With
-Qwen3-1.7B, Critic + language planner leave 4.5 GB free and pass the 1.5 GB memory guard;
-Critic + Qwen2.5-VL (~0.8 GB free) is refused. Critic accuracy is NOT measured yet.
+Before jetson_clocks (same day, 40 W, clocks not pinned): Critic BF16 crop 0.849 s (FP16
+full 640x480 frame, the old default: 1.35 s); Qwen3-1.7B 2.37 s, 8.4 tok/s; combined Critic
+0.91 s, planner 2.32 s, 4.5 GB free. Qwen3-0.6B: 2.82 s, 1.1 GB, 2/10 correct (rejected).
+Qwen2.5-VL-3B in-loop full plan (~98 tokens, opt-in): ~7.2 GB, 11.2 s, 8.7 tok/s; Critic +
+Qwen2.5-VL leaves ~0.8 GB free and is refused by the memory guard.
+
+Pinning the clocks (GPU to 1173 MHz, about 3x) gave only ~10%. All models decode at
+~8.5-9.5 tok/s whatever their size, so decoding is limited by per-token framework overhead
+(HF `generate`), not compute. Post-hackathon option: a llama.cpp / TensorRT-LLM backend for
+the language planner. Not for now.
+
+Trials use the rules planner (Qwen2.5-VL never meets the 3 s in-loop timeout here). Critic
+accuracy on real wrist frames is NOT measured yet.

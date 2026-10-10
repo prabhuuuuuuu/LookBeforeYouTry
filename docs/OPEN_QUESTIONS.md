@@ -19,7 +19,7 @@ against the board's `list` output (`S,<joint>,<zero_us>,...` lines); the firmwar
 `rules`; Qwen only with `backend = qwen` and only if the memory guard passes (D-10..D-12).
 
 **Status (bible v1.5, 2026-10-10):** M-1 closed (Critic = Moondream2 BF16 on a 378x378 crop).
-Language mode served by Qwen3-1.7B text; M-2 records the pick. Critic accuracy on real wrist
+Language mode served by Qwen3-1.7B text (M-2 closed). Critic accuracy on real wrist
 frames is still NOT measured (no labelled set in `data/datasets/critic/`). The crop box must
 be re-centred on the gripper bite zone once the Trinet is mounted (OQ-12).
 
@@ -103,7 +103,7 @@ Open points for that increment:
 | # | Question | Unblocks | Answer |
 |---|---|---|---|
 | [x] M-1 | Which Critic speed variant becomes the default? | `CriticConfig.dtype`, `crop_enabled`, `crop_xywh` | **Closed 2026-10-10 (software lead):** Moondream2 kept as the Critic. `dtype = bf16` (FP16 selectable), runtime input = dewarped frame → 378x378 crop (`CriticConfig.crop_xywh`, default centred; re-centre on the gripper bite zone after mounting, OQ-12). `compile()` not adopted (no Triton). Measured runtime p50 0.85 s. Accuracy still NOT measured. |
-| [ ] M-2 | Which language-mode planner? Candidates: Qwen3-1.7B text (default now), Qwen3-0.6B text, Qwen2.5-VL-3B text-only. | `PlannerConfig.language_backend`, `language_model_path` | Measurements below. **Proposed: Qwen3-1.7B** (9/10 correct, 2.4 s, guard passes with the Critic). Software lead to confirm. |
+| [x] M-2 | Which language-mode planner? Candidates: Qwen3-1.7B text, Qwen3-0.6B text, Qwen2.5-VL-3B text-only. | `PlannerConfig.language_backend`, `language_model_path` | **Closed 2026-10-10 (software lead): Qwen3-1.7B** (`language_backend = qwen3_text`, `~/models/qwen3-1.7b`, already the default). With jetson_clocks: p50 2.14 s, 9.4 tok/s, 9/10 correct; Critic + Qwen3-1.7B leave 4.49 GB free (guard PASS). Qwen3-0.6B rejected (2/10 correct). |
 
 M-1 measurements (2026-10-10, Orin NX 40 W, synthetic 640x480 frames, 10 timed calls per
 variant, `tools/bench_models.py --critic-only ...`):
@@ -120,7 +120,7 @@ variant, `tools/bench_models.py --critic-only ...`):
 `torch.compile` (inductor) is expected to fail on the first call; the bench reports that
 as "skipped".
 
-M-2 measurements (2026-10-10, Orin NX 40 W, `tools/bench_models.py --planner-models
+M-2 measurements, before jetson_clocks (2026-10-10, Orin NX 40 W, `tools/bench_models.py --planner-models
 qwen3-1.7b,qwen3-0.6b --combined`; 10 fixed commands, 6-object detection list, compact
 schema, greedy, thinking off, full generation without the 8 s cut-off). Each model loaded
 alone:
@@ -143,3 +143,9 @@ Combined (Critic loaded first, then the planner, interleaved calls):
 | Critic | Planner | torch alloc | RAM used after load | RAM free | RAM peak | Critic p50 | Planner p50 | Memory guard |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | Moondream2 bf16, 378x378 crop | Qwen3-1.7B | 7.20 GB | 10.75 / 15.29 GB | 4.54 GB | 10.78 GB | 0.91 s | 2.32 s | PASS (>= 1536 MB) |
+
+M-2 re-run with jetson_clocks (2026-10-10, 40 W, CPU 1.5 GHz, GPU 1173 MHz, EMC 3199 MHz;
+`--planner-models qwen3-1.7b --combined`, `data/bench/bench-20261010-224019.json`):
+Qwen3-1.7B p50 2.14 s / p95 2.18 s, 9.4 tok/s, 9/10 valid and correct (same zone-id miss),
+load+warm-up 7.7 s. Combined: torch 7.20 GB, RAM 10.80 / 15.29 GB, 4.49 GB free, guard PASS,
+Critic p50 0.78 s, planner p50 2.13 s.
