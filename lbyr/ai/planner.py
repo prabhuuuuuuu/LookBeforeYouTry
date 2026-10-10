@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,9 +25,9 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from lbyr.ai.timeout import TimeoutResult, run_with_timeout
-from lbyr.config import PlannerConfig
-from lbyr.errors import PlanValidationError
+from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
+from lbyr.config import PlannerConfig, SkillConfig
+from lbyr.errors import PlannerTimeoutError, PlanValidationError
 from lbyr.perception.detector import Detection
 
 log = logging.getLogger(__name__)
@@ -167,6 +169,8 @@ def plan_with_timeout(planner: Planner, request: PlanRequest, cfg: PlannerConfig
     t0 = time.perf_counter()
     try:
         out = run_with_timeout(lambda: planner.generate(request), cfg.timeout_s, "planner")
+    except PlannerTimeoutError:  # the planner's own single-flight timeout (FallbackPlanner)
+        return PlanResult(None, (time.perf_counter() - t0) * 1000, None, "timeout")
     except Exception as e:  # backend crash -> treated like invalid output
         log.exception("planner backend raised")
         return PlanResult(None, (time.perf_counter() - t0) * 1000, None, f"backend error: {e}")
@@ -207,6 +211,154 @@ class FakePlanner:
             "notes": "fake planner",
         }
         return json.dumps(chain)
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _match_score(label: str, instruction_words: list[str]) -> tuple[int, int]:
+    """(full-phrase match 0/1, number of label words found in the instruction)."""
+    lw = _words(label)
+    if not lw:
+        return 0, 0
+    n = len(lw)
+    phrase = any(instruction_words[i : i + n] == lw for i in range(len(instruction_words) - n + 1))
+    return int(phrase), sum(1 for w in lw if w in instruction_words)
+
+
+def _best_match(dets: Sequence[Detection], instruction: str) -> Detection | None:
+    """Detection whose class name best matches the instruction; None if nothing matches.
+
+    Full class-name phrase beats partial word overlap; ties go to the higher detector score,
+    then the lower id (deterministic).
+    """
+    iw = _words(instruction)
+    best: tuple[tuple[int, int, float, int], Detection] | None = None
+    for d in dets:
+        phrase, overlap = _match_score(d.label, iw)
+        if overlap == 0:
+            continue
+        key = (phrase, overlap, d.score, -d.id)
+        if best is None or key > best[0]:
+            best = (key, d)
+    return None if best is None else best[1]
+
+
+class RuleBasedPlanner:
+    """No-model planner: pick the pick-target by class-name match against the instruction.
+
+    Picks the non-zone detection whose label best matches the instruction, and places it on
+    the zone detection (a label containing "zone") the instruction names, else the first zone
+    by id. Emits the same JSON contract as the VLM: approach -> grasp -> place (LIFT is an FSM
+    state, not a planner skill; the strict parser accepts exactly these three). If nothing
+    matches it emits an empty chain, which the strict parser rejects (PLANNER_FAILED).
+    Cost: pure Python, microseconds, no VRAM.
+    """
+
+    def __init__(self, closure: float = 80.0, standoff_mm: float = 40.0) -> None:
+        self.closure = closure
+        self.standoff_mm = standoff_mm
+
+    def generate(self, request: PlanRequest) -> str:
+        objs = [d for d in request.detections if "zone" not in d.label]
+        zones = sorted((d for d in request.detections if "zone" in d.label), key=lambda d: d.id)
+        target = _best_match(objs, request.instruction)
+        if target is None or not zones:
+            return json.dumps({"skill_chain": [], "notes": "rules: no matching target or zone"})
+        zone = _best_match(zones, request.instruction) or zones[0]
+        return json.dumps(
+            {
+                "skill_chain": [
+                    {"skill": "approach", "target_id": target.id, "standoff_mm": self.standoff_mm},
+                    {"skill": "grasp", "closure": self.closure},
+                    {"skill": "place", "target_id": zone.id},
+                ],
+                "notes": f"rules: {target.label} -> {zone.label}",
+            }
+        )
+
+
+# Margin so the single-flight timeout below fires before plan_with_timeout's outer one.
+_OUTER_MARGIN_S = 0.15
+
+
+class FallbackPlanner:
+    """Primary (VLM) planner that degrades to a fallback after repeated timeouts.
+
+    The primary runs under its own single-flight :class:`TimeoutRunner` (a bit shorter than
+    the hard ``cfg.timeout_s`` enforced by :func:`plan_with_timeout`, so GPU work never
+    stacks up behind an abandoned call). Timeouts (and a still-busy abandoned call) below
+    ``cfg.fallback_after_timeouts`` in a row are reported as ``"timeout"``; the Nth one
+    switches permanently to the fallback and that same request is answered by it. Any
+    completed primary call resets the counter. Other errors are not counted: they propagate.
+    """
+
+    def __init__(
+        self,
+        primary: Planner,
+        fallback: Planner,
+        cfg: PlannerConfig,
+        primary_name: str = "qwen",
+        fallback_name: str = "rules",
+    ) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._limit = cfg.fallback_after_timeouts
+        self._names = (primary_name, fallback_name)
+        self._runner = TimeoutRunner(max(0.05, cfg.timeout_s - _OUTER_MARGIN_S), "planner-primary")
+        self._lock = threading.Lock()
+        self._timeouts = 0
+        self._switched = False
+
+    @property
+    def active_backend(self) -> str:
+        return self._names[1] if self._switched else self._names[0]
+
+    @property
+    def consecutive_timeouts(self) -> int:
+        return self._timeouts
+
+    def reset(self) -> None:
+        """Go back to the primary backend (e.g. between trials)."""
+        with self._lock:
+            self._timeouts = 0
+            self._switched = False
+
+    def generate(self, request: PlanRequest) -> str:
+        if self._switched:
+            return self._fallback.generate(request)
+        out = self._runner.run(lambda: self._primary.generate(request))
+        if isinstance(out, TimeoutResult):
+            with self._lock:
+                self._timeouts += 1
+                n = self._timeouts
+                if n >= self._limit:
+                    self._switched = True
+            log.warning(
+                "%s planner timed out (%d/%d in a row%s)",
+                self._names[0],
+                n,
+                self._limit,
+                ", busy" if out.busy else "",
+            )
+            if n < self._limit:
+                raise PlannerTimeoutError(f"{self._names[0]} planner timed out")
+            log.error("Switching planner backend %s -> %s", *self._names)
+            return self._fallback.generate(request)
+        with self._lock:
+            self._timeouts = 0
+        return out
+
+
+def build_planner(cfg: PlannerConfig, skills: SkillConfig | None = None) -> Planner:
+    """Planner for ``cfg.backend``: "rules", or "qwen" with automatic fallback to rules."""
+    cfg.validate()
+    skills = skills or SkillConfig()
+    rules = RuleBasedPlanner(skills.default_closure_pct, skills.default_standoff_mm)
+    if cfg.backend == "rules":
+        return rules
+    return FallbackPlanner(QwenPlanner(cfg), rules, cfg)
 
 
 class QwenPlanner:

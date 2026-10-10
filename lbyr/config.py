@@ -39,6 +39,8 @@ WRIST_ROLL_INDEX = 4
 
 DATA_DIR = Path("data")
 
+PLANNER_BACKENDS: tuple[str, ...] = ("qwen", "rules")
+
 
 def require(value: T | None, what: str, question: str) -> T:
     """Return ``value`` or raise if it is still unconfirmed (``None``)."""
@@ -131,12 +133,27 @@ class PlannerConfig:
     model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     model_path: Path | None = None  # local weights only; no downloads at runtime
     max_new_tokens: int = 256
+    backend: str = "qwen"  # "qwen" | "rules" (RuleBasedPlanner, no model, no GPU)
+    fallback_after_timeouts: int = 3  # qwen -> rules after this many timeouts in a row
+    device: str = "cuda"
+    max_image_pixels: int = 640 * 480  # overhead frame is downscaled above this (latency)
+    warmup_timeout_s: float = 60.0  # startup warm-up generation (first CUDA call is slow)
 
     def validate(self) -> None:
         if self.temperature != 0.0:
             raise ConfigError("Planner temperature must be 0 (bible 11.1)")
         if not 0.0 < self.timeout_s <= 3.0:
             raise ConfigError("Planner timeout must be in (0, 3] s (bible 11.1)")
+        if self.backend not in PLANNER_BACKENDS:
+            raise ConfigError(f"planner.backend must be one of {PLANNER_BACKENDS}")
+        if self.fallback_after_timeouts < 1:
+            raise ConfigError("planner.fallback_after_timeouts must be >= 1")
+        if self.max_new_tokens < 1:
+            raise ConfigError("planner.max_new_tokens must be >= 1")
+        if self.max_image_pixels < 28 * 28:
+            raise ConfigError("planner.max_image_pixels is too small")
+        if self.warmup_timeout_s <= 0.0:
+            raise ConfigError("planner.warmup_timeout_s must be > 0")
 
 
 @dataclass

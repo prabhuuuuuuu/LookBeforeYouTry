@@ -42,3 +42,7 @@ class IKError(LBYRError):
 
 class ConfigError(LBYRError):
     """Configuration violates a locked project rule (e.g. temperature != 0)."""
+
+
+class PlannerTimeoutError(LBYRError):
+    """A planner backend gave up within the hard timeout; reported as ``error="timeout"``."""
