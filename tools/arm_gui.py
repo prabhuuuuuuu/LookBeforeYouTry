@@ -3,15 +3,23 @@
 Safety: E-stop within reach. Rest the arm in its ZERO pose before powering the servos
 (the board moves every joint to its saved zero at boot).
 Support the arm by hand before "Release".
+
+Teaching poses (taught-pose mode, data/calib/poses.yaml):
+    1. Move the arm with the sliders until it is where you want it.
+    2. Press "Save pose as..." and type a name, for example zone_A_pre, zone_A_grasp,
+       place_pre, place or home. The six slider values are saved (zero-relative degrees).
+    3. "Go to pose" moves the arm to a saved pose with one 'm' command.
 """
 
 import argparse
 import time
 import tkinter as tk
-from tkinter import ttk
+from pathlib import Path
+from tkinter import simpledialog, ttk
 
 import serial
 import serial.tools.list_ports
+import yaml
 
 N = 6
 RANGE = 60  # slider range in degrees either side of zero (firmware clamps pulses too)
@@ -20,9 +28,13 @@ SEND_PERIOD_S = 0.05  # at most one command per joint every 50 ms
 NAMES = ["1 Base yaw", "2 Shoulder", "3 Elbow", "4 Wrist pitch", "5 Wrist roll", "6 Gripper"]
 
 
+POSES_FILE = Path("data/calib/poses.yaml")
+
+
 class App:
-    def __init__(self, root):
+    def __init__(self, root, poses_file=POSES_FILE):
         self.root = root
+        self.poses_file = poses_file
         self.ser = None
         self.rx = ""
         self.last_sent = [0.0] * N
@@ -62,6 +74,16 @@ class App:
         self.amax = tk.IntVar(value=60)
         ttk.Spinbox(row, from_=10, to=200, width=4, textvariable=self.amax).pack(side="left")
         ttk.Button(row, text="Set speed", command=self.set_speed).pack(side="left", padx=2)
+
+        # Taught poses: save the slider values under a name, or move to a saved pose.
+        poses = ttk.Frame(root, padding=(6, 3))
+        poses.pack(fill="x")
+        ttk.Button(poses, text="Save pose as...", command=self.save_pose).pack(side="left")
+        ttk.Label(poses, text="   Pose:").pack(side="left")
+        self.pose_box = ttk.Combobox(poses, width=16, state="readonly")
+        self.pose_box.pack(side="left", padx=2)
+        ttk.Button(poses, text="Go to pose", command=self.go_to_pose).pack(side="left")
+        self.refresh_poses()
 
         for j in range(N):
             f = ttk.Frame(root, padding=(6, 3))
@@ -148,6 +170,47 @@ class App:
     def set_speed(self):
         self.send(f"speed {self.vmax.get()} {self.amax.get()}")
 
+    # Taught poses ----------------------------------------------------------------
+    def load_poses(self):
+        if not self.poses_file.is_file():
+            return {}
+        data = yaml.safe_load(self.poses_file.read_text()) or {}
+        return data.get("poses") or {}
+
+    def refresh_poses(self):
+        names = sorted(self.load_poses())
+        self.pose_box["values"] = names
+        if names and not self.pose_box.get():
+            self.pose_box.current(0)
+
+    def save_pose(self):
+        from lbyr.motion.taught import save_pose  # same file format as the robot code
+
+        name = simpledialog.askstring(
+            "Save pose", "Pose name (e.g. zone_A_pre, zone_A_grasp, place_pre, place, home):"
+        )
+        if not name:
+            return
+        values = [round(v.get()) for v in self.vars]
+        try:
+            save_pose(self.poses_file, name.strip(), values)
+        except ValueError as e:
+            self.say(f"not saved: {e}")
+            return
+        self.say(f"saved pose {name.strip()} = {values} to {self.poses_file}")
+        self.refresh_poses()
+        self.pose_box.set(name.strip())
+
+    def go_to_pose(self):
+        name = self.pose_box.get()
+        values = self.load_poses().get(name)
+        if not values:
+            self.say("choose a saved pose first")
+            return
+        self.send("m " + " ".join(f"{float(v):.1f}" for v in values))  # one synced move
+        self.set_sliders({j: float(v) for j, v in enumerate(values)})
+        self.say(f"going to pose {name}")
+
     def say(self, s):
         self.log.insert("end", s + "\n")
         self.log.see("end")
@@ -180,9 +243,11 @@ class App:
 
 
 def main() -> None:
-    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--poses", type=Path, default=POSES_FILE, help="taught poses file")
+    args = p.parse_args()
     root = tk.Tk()
-    App(root)
+    App(root, args.poses)
     root.mainloop()
 
 
