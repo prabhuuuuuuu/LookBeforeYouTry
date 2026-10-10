@@ -35,6 +35,31 @@ def test_size_mismatch_raises() -> None:
         dw(np.zeros((480, 640, 3), np.uint8))
 
 
+def test_calibrate_fisheye_recovers_synthetic_intrinsics() -> None:
+    import cv2
+
+    from lbyr.perception.dewarp import calibrate_fisheye
+
+    truth = synthetic_calibration(640, 480)
+    cols, rows, sq = 9, 6, 25.0
+    board = np.zeros((cols * rows, 3))
+    board[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * sq
+    board -= board.mean(axis=0)
+    obj, img = [], []
+    rng = np.random.default_rng(3)
+    for _ in range(15):
+        rvec = rng.uniform(-0.5, 0.5, size=3)
+        tvec = np.array([rng.uniform(-60, 60), rng.uniform(-40, 40), rng.uniform(250, 400)])
+        pts, _ = cv2.fisheye.projectPoints(
+            board.reshape(-1, 1, 3), rvec, tvec, truth.K, truth.D.reshape(4, 1)
+        )
+        obj.append(board)
+        img.append(pts.reshape(-1, 2))
+    calib = calibrate_fisheye(obj, img, (640, 480))
+    assert calib.rms is not None and calib.rms < 0.1
+    np.testing.assert_allclose(calib.K, truth.K, rtol=0.02, atol=2.0)
+
+
 def test_calibration_yaml_round_trip(tmp_path: Path) -> None:
     calib = synthetic_calibration(640, 480)
     path = tmp_path / "trinet.yaml"
