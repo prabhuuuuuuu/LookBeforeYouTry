@@ -10,10 +10,13 @@ completion = the firmware's ``DONE`` line. No setpoint streaming.
 - DONE pairing: the firmware prints ``OK m`` while handling ``m`` and the next ``DONE``
   after it. A DONE that arrives before the ``OK m`` of the latest segment belongs to an
   older motion and is ignored.
-- The port is opened with DTR/RTS low (set before ``open()``) so it never resets the board.
-- :meth:`connect` first sends ``q`` and needs a well-formed ``Q`` within 1 s; ERR, a
-  malformed Q or S lines with fewer than 8 fields mean old firmware: refuse
-  (:class:`FirmwareTooOldError`, "reflash firmware/xiao_c6_bridge/Code.ino").
+- The port is opened with plain pyserial defaults; DTR/RTS are never set or toggled
+  (setting them reset the ESP32-C6 on open: servo jitter).
+- :meth:`connect` watches the line for 0.3 s, flushes the input, sends a bare newline, then
+  probes with ``q`` (up to 5 tries over 3 s) and needs a well-formed ``Q``. ERR, a malformed
+  Q or S lines with fewer than 8 fields mean old firmware: refuse
+  (:class:`FirmwareTooOldError`, "reflash firmware/xiao_c6_bridge/Code.ino"). ROM boot
+  lines (the board was reset anyway) -> WARNING, wait for the boot-homing DONE, then probe.
 - :meth:`connect` then sends ``list``, compares the board's zero pulses with
   ``data/calib/joints.yaml`` and refuses to move on any mismatch.
 - :meth:`move_joints` converts host degrees to zero-relative degrees (sign and zero_pose_deg
@@ -55,8 +58,11 @@ log = logging.getLogger(__name__)
 READ_TIMEOUT_S = 0.05
 WRITE_TIMEOUT_S = 0.05
 LIST_TIMEOUT_S = 2.0
-PROBE_TIMEOUT_S = 1.0  # connect: a well-formed Q reply to 'q' within this
+OPEN_SETTLE_S = 0.3  # connect: watch the line this long after open, then flush
+PROBE_TRIES = 5  # connect: 'q' attempts ...
+PROBE_WINDOW_S = 3.0  # ... spread over this window
 BOOT_SETTLE_TIMEOUT_S = 20.0  # the board homes itself at boot (staggered attach)
+ROM_BOOT_MARKERS = (b"entry 0x", b"mode:DIO", b"ESP-ROM")  # ESP32-C6 ROM bootloader lines
 S_LINE_FIELDS = 8  # S,j,zero_us,cur_us,attached,goal_us,moving,name (current Code.ino)
 FW_TOO_OLD = "bridge firmware too old: reflash firmware/xiao_c6_bridge/Code.ino"
 
@@ -96,19 +102,12 @@ PortFactory = Callable[[str, int], PortLike]
 
 
 def _pyserial_port(port: str, baud: int) -> PortLike:
-    """Open WITHOUT toggling DTR/RTS: set them low before open() so opening the port never
-    resets the ESP32-C6 (a reset would re-run the boot homing)."""
+    """Plain pyserial defaults. NEVER set or toggle DTR/RTS (before or after open): setting
+    them low before open() reset the ESP32-C6 on this board (ROM boot lines, servo jitter);
+    the defaults do not (verified on the rig, 2026-10-11)."""
     import serial  # lazy: pyserial
 
-    p: Any = serial.Serial()
-    p.port = port
-    p.baudrate = baud
-    p.timeout = READ_TIMEOUT_S
-    p.write_timeout = WRITE_TIMEOUT_S
-    p.dtr = False
-    p.rts = False
-    p.open()
-    p.reset_input_buffer()  # drop stale lines so the connect probe sees only fresh replies
+    p: Any = serial.Serial(port, baud, timeout=READ_TIMEOUT_S, write_timeout=WRITE_TIMEOUT_S)
     return p
 
 
@@ -147,6 +146,8 @@ class SerialArm(ArmInterface):
         self._probing = False
         self._probe_bad: str | None = None
         self._probe_done = threading.Event()
+        self._reset_seen = threading.Event()  # ROM boot lines seen: the board was reset
+        self._boot_done = threading.Event()  # DONE seen since the latest reset
 
     # ------------------------------------------------------------ setup
     def check_confirmed(self) -> None:
@@ -166,10 +167,11 @@ class SerialArm(ArmInterface):
         joints = self.joints
         assert self._cfg.serial_port is not None and self._cfg.host_baud is not None
         self._port = self._port_factory(self._cfg.serial_port, self._cfg.host_baud)
-        self._running.set()
-        self._reader = threading.Thread(target=self._read_loop, name="bridge-rx", daemon=True)
-        self._reader.start()
         try:
+            self._settle_after_open()
+            self._running.set()
+            self._reader = threading.Thread(target=self._read_loop, name="bridge-rx", daemon=True)
+            self._reader.start()
             self._probe_firmware()
             rows, speed = self._read_list()
             board_zero = [rows[j].zero_us for j in range(1, NUM_JOINTS + 1)]
@@ -224,27 +226,81 @@ class SerialArm(ArmInterface):
         log.info("bridge speed set: %.0f deg/s, %.0f deg/s^2", speed.vmax_deg, speed.amax_deg)
         return speed.vmax_deg, speed.amax_deg
 
-    def _probe_firmware(self) -> None:
-        """Send ``q``; require a well-formed ``Q,...`` within PROBE_TIMEOUT_S. ERR or a
-        malformed Q means an old bridge firmware: refuse before anything else is sent."""
+    def _settle_after_open(self) -> None:
+        """Before the reader starts: watch the line for OPEN_SETTLE_S (ROM boot lines = the
+        board was reset by the open), flush the input, send a bare newline (the firmware
+        ignores empty lines; it terminates any half-typed command left in its buffer)."""
+        port = self._port
+        assert port is not None
+        t_end = time.perf_counter() + OPEN_SETTLE_S
+        while time.perf_counter() < t_end:
+            raw = port.readline()  # READ_TIMEOUT_S
+            if raw:
+                self._check_rom_line(raw)
+        flush = getattr(port, "reset_input_buffer", None)
+        if callable(flush):
+            flush()
+        self._write("")
+
+    def _check_rom_line(self, raw: bytes) -> bool:
+        if not any(m in raw for m in ROM_BOOT_MARKERS):
+            return False
         with self._lock:
-            self._probing, self._probe_bad = True, None
-            self._probe_done.clear()
-        try:
-            self._write("q")
-            answered = self._probe_done.wait(PROBE_TIMEOUT_S)
-        finally:
-            with self._lock:
-                self._probing = False
-                bad = self._probe_bad
-        if not answered:
-            raise LBYRError(
-                f"bridge did not answer 'q' within {PROBE_TIMEOUT_S:.0f} s "
-                f"({self._cfg.serial_port}); check the USB cable and that the XIAO runs "
-                f"firmware/xiao_c6_bridge (if it does: {FW_TOO_OLD})"
+            first = not self._reset_seen.is_set()
+            self._reset_seen.set()
+            self._boot_done.clear()  # the next DONE ends the boot homing
+        if first:
+            log.warning(
+                "bridge was reset on open (ROM boot line %r); waiting for the firmware's "
+                "boot-homing DONE before probing",
+                raw.decode("ascii", errors="replace").strip(),
             )
-        if bad is not None:
-            raise FirmwareTooOldError(f"{FW_TOO_OLD} ('q' answered {bad!r})")
+        return True
+
+    def _probe_firmware(self) -> None:
+        """Send ``q`` up to PROBE_TRIES times over PROBE_WINDOW_S; require a well-formed
+        ``Q,...``. ERR or a malformed Q means an old bridge firmware: refuse before anything
+        else is sent. If the board was reset (ROM lines), wait for its boot DONE first."""
+        boot_waits = 0
+        tries = 0
+        while tries < PROBE_TRIES:
+            if self._reset_seen.is_set():
+                if boot_waits:
+                    raise LBYRError(
+                        "bridge reset again while connecting (brown-out? USB?); "
+                        "check the servo supply and the USB cable"
+                    )
+                boot_waits += 1
+                if not self._boot_done.wait(BOOT_SETTLE_TIMEOUT_S):
+                    raise LBYRError(
+                        f"bridge was reset on open and printed no boot DONE within "
+                        f"{BOOT_SETTLE_TIMEOUT_S:.0f} s; check the arm"
+                    )
+                self._reset_seen.clear()
+                tries = 0
+            tries += 1
+            with self._lock:
+                self._probing, self._probe_bad = True, None
+                self._probe_done.clear()
+            try:
+                self._write("q")
+                answered = self._probe_done.wait(PROBE_WINDOW_S / PROBE_TRIES)
+            finally:
+                with self._lock:
+                    self._probing = False
+                    bad = self._probe_bad
+            if answered and bad is not None:
+                raise FirmwareTooOldError(f"{FW_TOO_OLD} ('q' answered {bad!r})")
+            if answered and not self._reset_seen.is_set():
+                if tries > 1:
+                    log.info("bridge answered 'q' on try %d", tries)
+                return
+            log.debug("bridge: no Q reply to 'q' (try %d/%d)", tries, PROBE_TRIES)
+        raise LBYRError(
+            f"bridge did not answer 'q' ({PROBE_TRIES} tries over {PROBE_WINDOW_S:.0f} s, "
+            f"{self._cfg.serial_port}); check the USB cable and that the XIAO runs "
+            f"firmware/xiao_c6_bridge (if it does: {FW_TOO_OLD})"
+        )
 
     def _read_list(self) -> tuple[dict[int, JointLine], SpeedLine]:
         with self._lock:
@@ -309,6 +365,8 @@ class SerialArm(ArmInterface):
                 return
             if not raw:
                 continue
+            if self._check_rom_line(raw):
+                continue
             try:
                 msg = parse_line(raw)
             except ProtocolError as e:
@@ -328,11 +386,12 @@ class SerialArm(ArmInterface):
     def _handle(self, msg: Any) -> None:
         if isinstance(msg, StatusMsg):
             self._probe_reply(None)
-        elif isinstance(msg, ErrMsg):
-            self._probe_reply(msg.text)
+        elif isinstance(msg, ErrMsg) and not msg.text.startswith("ERR attach"):
+            self._probe_reply(msg.text)  # 'ERR attach N' is boot homing, not a reply to q
         with self._lock:
             if isinstance(msg, DoneMsg):
                 self._done_seq = self._ack_seq
+                self._boot_done.set()
             elif isinstance(msg, OkMsg):
                 if msg.text == "OK m":
                     self._ack_seq += 1

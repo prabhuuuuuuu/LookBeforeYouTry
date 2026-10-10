@@ -42,7 +42,8 @@ def test_connect_lists_compares_zeros_and_waits_for_idle() -> None:
     arm = make(board)
     arm.connect()
     try:
-        assert board.written[:2] == ["q", "list"]  # firmware probe first
+        assert board.written[:3] == ["", "q", "list"]  # newline, firmware probe, list
+        assert board.flushed == 1
         s = arm.read_state()
         assert s.feedback == "commanded" and s.load is None
         assert s.joints == pytest.approx((0.0,) * 6, abs=0.1)
@@ -62,6 +63,35 @@ def test_zero_mismatch_refuses_to_move() -> None:
 def test_silent_board_fails_connect() -> None:
     arm = make(FakeBoard(answer=False))
     with pytest.raises(LBYRError, match="did not answer 'q'"):
+        arm.connect()
+
+
+def test_probe_retries_q_until_the_board_answers() -> None:
+    board = FakeBoard(drop_q=3)
+    arm = make(board)
+    arm.connect()
+    try:
+        assert board.written[:5] == ["", "q", "q", "q", "q"]
+    finally:
+        arm.close()
+
+
+def test_reset_on_open_warns_and_waits_for_boot_done(caplog: pytest.LogCaptureFixture) -> None:
+    board = FakeBoard(reset_boot_s=0.8)
+    arm = make(board)
+    t0 = time.perf_counter()
+    arm.connect()
+    try:
+        assert "bridge was reset on open" in caplog.text
+        assert time.perf_counter() - t0 >= 0.8
+        assert board.written.count("list") == 1
+    finally:
+        arm.close()
+
+
+def test_q_retries_exhausted_fails() -> None:
+    arm = make(FakeBoard(drop_q=99))
+    with pytest.raises(LBYRError, match=r"did not answer 'q' \(5 tries over 3 s"):
         arm.connect()
 
 

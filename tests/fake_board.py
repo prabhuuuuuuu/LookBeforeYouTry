@@ -20,6 +20,8 @@ class FakeBoard:
         answer: bool = True,
         q_reply: str | None = None,
         old_s_lines: bool = False,
+        reset_boot_s: float = 0.0,
+        drop_q: int = 0,
     ) -> None:
         self.zero_us = zero_us
         self.p = FirmwarePlanner(zero_us, vmax, amax)
@@ -34,6 +36,22 @@ class FakeBoard:
         self.lock = threading.Lock()
         self.closed = False
         self.read_error: Exception | None = None
+        self.drop_q = drop_q  # ignore the first n 'q' (slow USB CDC start)
+        # reset_boot_s > 0: the open reset the board: ROM lines, deaf for reset_boot_s, DONE
+        self.boot_end = self.t + reset_boot_s
+        self.booting = reset_boot_s > 0
+        if self.booting:
+            for line in ("ESP-ROM:esp32c6-20220919", "mode:DIO, clock div:2", "entry 0x4086b910"):
+                self.out.put(line)
+        self.flushed = 0
+
+    def __setattr__(self, name: str, value: object) -> None:  # SerialArm never touches DTR/RTS
+        if name in ("dtr", "rts", "setDTR", "setRTS"):
+            raise AssertionError(f"SerialArm touched {name}")
+        super().__setattr__(name, value)
+
+    def reset_input_buffer(self) -> None:
+        self.flushed += 1
 
     # pyserial subset
     def write(self, data: bytes) -> int:
@@ -41,6 +59,8 @@ class FakeBoard:
             with self.lock:
                 self.written.append(line)
                 self._advance()
+                if self.booting or not line.strip():
+                    continue  # deaf while booting; the firmware ignores empty lines
                 self._handle(line.strip())
         return len(data)
 
@@ -68,6 +88,9 @@ class FakeBoard:
         for _ in range(n):
             self.p.step(TICK_S)
         self.t += n * TICK_S
+        if self.booting and now >= self.boot_end:
+            self.booting = False
+            self.say("DONE")
         if self.pending and not self.p.any_moving():
             self.pending = False
             if self.send_done:
@@ -85,6 +108,8 @@ class FakeBoard:
                     f"{self.p.goal_of(i):.0f},{moving},Joint {i + 1}"
                 )
             self.say(f"V,{self.p.vmax_deg:.0f},{self.p.amax_deg:.0f}")
+        elif cmd == "q" and self.drop_q > 0:
+            self.drop_q -= 1
         elif cmd == "q" and self.q_reply is not None:
             self.say(self.q_reply)
         elif cmd == "q":
