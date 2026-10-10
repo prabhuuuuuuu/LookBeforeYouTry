@@ -14,3 +14,39 @@ def bgr_to_pil(image_bgr: np.ndarray) -> Any:
     from PIL import Image
 
     return Image.fromarray(np.ascontiguousarray(image_bgr[..., ::-1]), "RGB")
+
+
+# Moondream2 vision tile (config.vision.crop_size). An image this size is encoded as a
+# single tile instead of a global view + overlapping local crops.
+MOONDREAM_TILE_PX = 378
+
+
+def critic_crop(
+    image_bgr: np.ndarray,
+    box_xywh: tuple[int, int, int, int] | None = None,
+    size_px: int = MOONDREAM_TILE_PX,
+) -> np.ndarray:
+    """Crop the wrist frame to a ``size_px`` square for the Critic.
+
+    ``box_xywh`` is the gripper ROI (``WristCameraConfig.crop_xywh``, OQ-12); None = the
+    centred square of side ``min(size_px, H, W)``. The box is clipped to the frame; if the
+    result is not ``size_px`` x ``size_px`` it is resized (Pillow, lazily). Cost: a slice
+    (centred default) or one resize, well under 1 ms.
+    """
+    h, w = image_bgr.shape[:2]
+    if box_xywh is None:
+        side = min(size_px, h, w)
+        x, y, bw, bh = (w - side) // 2, (h - side) // 2, side, side
+    else:
+        x, y, bw, bh = box_xywh
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(w, x + bw), min(h, y + bh)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(f"crop box {box_xywh} is outside the {w}x{h} frame")
+    out = image_bgr[y0:y1, x0:x1]
+    if out.shape[:2] != (size_px, size_px):
+        from PIL import Image
+
+        resized = Image.fromarray(np.ascontiguousarray(out)).resize((size_px, size_px))
+        out = np.asarray(resized)
+    return np.ascontiguousarray(out)

@@ -40,6 +40,7 @@ WRIST_ROLL_INDEX = 4
 DATA_DIR = Path("data")
 
 PLANNER_BACKENDS: tuple[str, ...] = ("qwen", "rules")
+CRITIC_DTYPES: tuple[str, ...] = ("fp16", "bf16")
 
 
 def require(value: T | None, what: str, question: str) -> T:
@@ -179,10 +180,15 @@ class CriticConfig:
     device: str = "cuda"
     max_new_tokens: int = 8  # the answer is ONE word
     warmup_timeout_s: float = 60.0  # startup warm-up query (first CUDA call is slow)
+    # "fp16" (weights cast + crop-dtype patch) | "bf16" (the model's native dtype, no patch).
+    # Speed experiment in tools/bench_models.py; default unchanged until a winner is picked.
+    dtype: str = "fp16"
 
     def validate(self) -> None:
         if self.temperature != 0.0:
             raise ConfigError("Critic temperature must be 0 (bible 21.4)")
+        if self.dtype not in CRITIC_DTYPES:
+            raise ConfigError(f"critic.dtype must be one of {CRITIC_DTYPES}")
         if self.timeout_s <= 0.0:
             raise ConfigError("Critic timeout must be > 0 (bible 11.2)")
         if self.max_new_tokens < 1:

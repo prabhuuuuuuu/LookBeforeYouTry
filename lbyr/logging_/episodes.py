@@ -81,6 +81,10 @@ class VramMonitor:
                 self.latest_mb = mb
                 self.peak_mb = mb if self.peak_mb is None else max(self.peak_mb, mb)
 
+    def reset_peak(self) -> None:
+        """Start a new peak window (e.g. per benchmark variant) from the latest sample."""
+        self.peak_mb = self.latest_mb
+
     def stop(self) -> None:
         if self._proc is not None:
             self._proc.terminate()

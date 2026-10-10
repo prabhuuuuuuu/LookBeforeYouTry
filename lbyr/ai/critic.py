@@ -98,28 +98,31 @@ class ScriptedCritic:
         return answer
 
 
-def _load_moondream2(path: Path, device: str) -> Any:
-    """Load Moondream2 from LOCAL files only, as FP16, on ``device``.
+def _load_moondream2(path: Path, device: str, dtype: str = "fp16") -> Any:
+    """Load Moondream2 from LOCAL files only, as ``dtype`` ("fp16" | "bf16"), on ``device``.
 
     The model's remote code builds its modules in bfloat16 and hard-codes a bfloat16 cast
     of the image crops, so FP16 needs two things: casting the weights, and a forward
     pre-hook that casts the crops to the weight dtype. Outputs were checked to match bf16.
+    BF16 is the model's native dtype (the Orin supports it): no cast, no patch.
     """
     force_offline()  # edge-only: never touch the network
     import torch
     from transformers import AutoModelForCausalLM
 
+    tdtype = torch.bfloat16 if dtype == "bf16" else torch.float16
     model: Any = AutoModelForCausalLM.from_pretrained(
-        str(path), trust_remote_code=True, dtype=torch.float16, local_files_only=True
+        str(path), trust_remote_code=True, dtype=tdtype, local_files_only=True
     )
-    model = model.to(torch.float16).to(device).eval()
+    model = model.to(tdtype).to(device).eval()
     try:
         patch_emb = model.model.vision["patch_emb"]
     except (AttributeError, KeyError, TypeError) as e:
         raise LBYRError(
             f"{path}: unexpected Moondream2 remote-code layout (need the 2025-06-21 revision)"
         ) from e
-    patch_emb.register_forward_pre_hook(lambda mod, args: (args[0].to(mod.weight.dtype),))
+    if tdtype is not torch.bfloat16:
+        patch_emb.register_forward_pre_hook(lambda mod, args: (args[0].to(mod.weight.dtype),))
     return model
 
 
@@ -145,8 +148,8 @@ class Moondream2Critic:
             if cfg.model_path is None:
                 raise ConfigError("CriticConfig.model_path is not set (local weights only)")
             t0 = time.perf_counter()
-            model = _load_moondream2(cfg.model_path, cfg.device)
-            log.info("Moondream2 loaded in %.1f s", time.perf_counter() - t0)
+            model = _load_moondream2(cfg.model_path, cfg.device, cfg.dtype)
+            log.info("Moondream2 (%s) loaded in %.1f s", cfg.dtype, time.perf_counter() - t0)
             log_cuda_allocated("Moondream2 Critic")
         self._model = model
         self._warm_up()
@@ -167,6 +170,21 @@ class Moondream2Critic:
         with self._lock:
             result = self._model.query(image, prompt, settings=settings)
         return str(result["answer"]).strip()
+
+    def try_compile(self) -> str | None:
+        """BENCHMARK ONLY: call the Moondream revision's own ``compile()`` (torch.compile of
+        the vision encoder / prefill / decode). Returns None on success, else why it was
+        skipped. Compilation is lazy: the next calls are slow and can still fail."""
+        inner = getattr(self._model, "model", None)
+        owner = next((c for c in type(inner).__mro__ if "compile" in vars(c)), None)
+        if inner is None or owner is None or owner.__module__.startswith("torch"):
+            return "this Moondream2 revision exposes no compile() method"
+        with self._lock:
+            try:
+                inner.compile()
+            except Exception as e:
+                return f"compile() failed: {type(e).__name__}: {e}"
+        return None
 
 
 # ------------------------------------------------------------------ worker

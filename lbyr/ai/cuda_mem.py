@@ -31,6 +31,16 @@ def cuda_peak_mb() -> float | None:
     return float(torch.cuda.max_memory_allocated()) / _MB
 
 
+def reset_cuda_peak() -> None:
+    """``torch.cuda.reset_peak_memory_stats`` (no-op without torch / CUDA)."""
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
 def log_cuda_allocated(label: str) -> float | None:
     """Log (INFO) and return ``torch.cuda.memory_allocated`` after loading ``label``."""
     mb = cuda_allocated_mb()

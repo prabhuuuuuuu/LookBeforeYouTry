@@ -7,9 +7,19 @@ WHY
 HOW TO USE (on the Jetson, weights already downloaded)
         python tools/bench_models.py
         python tools/bench_models.py --images data/frames/wrist --n 20
-        python tools/bench_models.py --skip-planner        # Critic only
+        python tools/bench_models.py --critic-only         # Critic only (= --skip-planner)
     Without --images, synthetic frames are used. With --images, the same folder feeds both
     models (the planner also gets a fixed synthetic detections list).
+
+CRITIC SPEED EXPERIMENTS (each variant is reported separately; defaults stay unchanged)
+        --critic-dtype fp16|bf16   fp16 = weights cast + crop-dtype patch (current default);
+                                   bf16 = Moondream's native dtype, no patch
+        --critic-crop              also run a 378x378 crop (gripper ROI from
+                                   WristCameraConfig.crop_xywh, default centred) vs full frame
+        --critic-compile           then also run after Moondream's own compile(), if this
+                                   revision has one (skipped with a message otherwise)
+    Per variant: p50/p95 latency, torch peak (max_memory_allocated, includes the weights)
+    and tegrastats system-RAM peak during that variant.
 
 OUTPUT
     A table matching bible 9.2 (measured next to the bible estimate) and a JSON file in
@@ -40,6 +50,7 @@ DEFAULT_CRITIC = Path(os.environ.get("LBYR_MOONDREAM_PATH", "/home/sentrix/model
 DEFAULT_PLANNER = Path(os.environ.get("LBYR_QWEN_PATH", "/home/sentrix/models/qwen2.5-vl-3b"))
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
 PLANNER_HARD_TIMEOUT_S = 3.0
+CRITIC_DTYPES = ("fp16", "bf16")  # mirrors lbyr.config.CRITIC_DTYPES (keeps --help light)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,10 +64,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", type=Path, default=Path("data/bench"), help="result JSON folder")
     p.add_argument("--skip-critic", action="store_true")
     p.add_argument("--skip-planner", action="store_true")
+    p.add_argument("--critic-only", action="store_true", help="same as --skip-planner")
     p.add_argument("--max-new-tokens", type=int, default=256, help="planner generation cap")
+    p.add_argument(
+        "--critic-dtype",
+        choices=CRITIC_DTYPES,
+        default="fp16",
+        help="Critic weights dtype (default fp16 = current config default)",
+    )
+    p.add_argument(
+        "--critic-crop",
+        action="store_true",
+        help="also benchmark a 378x378 crop (default centred) against the full frame",
+    )
+    p.add_argument(
+        "--critic-compile",
+        action="store_true",
+        help="also benchmark after Moondream's compile(), if the revision exposes one",
+    )
     args = p.parse_args(argv)
     if args.n < 1:
         p.error("--n must be >= 1")
+    if args.critic_only:
+        if args.skip_critic:
+            p.error("--critic-only and --skip-critic contradict each other")
+        args.skip_planner = True
     return args
 
 
@@ -126,20 +158,90 @@ def environment() -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ benchmarks
-def bench_critic(critic: Any, frames: list[np.ndarray]) -> dict[str, Any]:
+def bench_critic(
+    critic: Any,
+    frames: list[np.ndarray],
+    crop: bool = False,
+    crop_box: tuple[int, int, int, int] | None = None,
+) -> dict[str, Any]:
+    """Time ``critic.infer`` (including the crop, if any) on every frame."""
     from lbyr.ai.critic import CRITIC_PROMPT, parse_verdict
+    from lbyr.ai.imaging import critic_crop
 
     lat_ms: list[float] = []
     answers: list[str] = []
+    shape = frames[0].shape
     for f in frames:
         t0 = time.perf_counter()
-        text = critic.infer(f, CRITIC_PROMPT)
+        img = critic_crop(f, crop_box) if crop else f
+        text = critic.infer(img, CRITIC_PROMPT)
         lat_ms.append((time.perf_counter() - t0) * 1000)
         answers.append(parse_verdict(text).value)
+        shape = img.shape
     return {
+        "input": f"{shape[1]}x{shape[0]}",
         "latency_ms": percentile_stats(lat_ms),
         "verdicts": {v: answers.count(v) for v in sorted(set(answers))},
     }
+
+
+def _critic_variant(
+    name: str,
+    critic: Any,
+    frames: list[np.ndarray],
+    crop: bool,
+    crop_box: tuple[int, int, int, int] | None,
+    mon: Any,
+) -> dict[str, Any]:
+    from lbyr.ai.critic import CRITIC_PROMPT
+    from lbyr.ai.cuda_mem import cuda_peak_mb, reset_cuda_peak
+    from lbyr.ai.imaging import critic_crop
+
+    print(f"Critic [{name}]: 1 warm-up + {len(frames)} timed calls ...")
+    critic.infer(critic_crop(frames[0], crop_box) if crop else frames[0], CRITIC_PROMPT)
+    reset_cuda_peak()
+    mon.reset_peak()
+    out = bench_critic(critic, frames, crop, crop_box)
+    time.sleep(0.3)  # let tegrastats take one more sample
+    out["variant"] = name
+    out["torch_peak_mb"] = cuda_peak_mb()
+    out["tegrastats_peak_mb"] = mon.peak_mb
+    return out
+
+
+def run_critic_variants(
+    critic: Any, frames: list[np.ndarray], args: argparse.Namespace, mon: Any
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Full frame, then (--critic-crop) 378x378 crop, then (--critic-compile) the same
+    after Moondream's compile(). Returns (variants, skip messages)."""
+    from lbyr.ai.critic import CRITIC_PROMPT
+    from lbyr.ai.imaging import critic_crop
+    from lbyr.config import WristCameraConfig
+
+    crop_box = WristCameraConfig().crop_xywh  # OQ-12 gripper ROI; None = centred
+    inputs = [("full", False)] + ([("crop378", True)] if args.critic_crop else [])
+    variants = [
+        _critic_variant(f"{args.critic_dtype}-{tag}", critic, frames, crop, crop_box, mon)
+        for tag, crop in inputs
+    ]
+    skipped: list[str] = []
+    if args.critic_compile:
+        reason = critic.try_compile()
+        if reason is not None:
+            skipped.append(f"--critic-compile skipped: {reason}")
+        else:
+            for tag, crop in inputs:
+                name = f"{args.critic_dtype}-{tag}-compiled"
+                try:
+                    for f in frames[:2]:  # compilation happens lazily on the first calls
+                        critic.infer(critic_crop(f, crop_box) if crop else f, CRITIC_PROMPT)
+                    variants.append(_critic_variant(name, critic, frames, crop, crop_box, mon))
+                except Exception as e:  # torch.compile can fail lazily (e.g. no Triton)
+                    skipped.append(f"{name} skipped: {type(e).__name__}: {e}")
+                    break
+    for msg in skipped:
+        print(msg)
+    return variants, skipped
 
 
 def bench_planner(planner: Any, frames: list[np.ndarray]) -> dict[str, Any]:
@@ -190,7 +292,7 @@ def print_table(result: dict[str, Any]) -> None:
         rows.append(
             (
                 "Critic",
-                "Moondream2 FP16",
+                f"Moondream2 {result.get('critic_dtype', 'fp16').upper()}, {c.get('input', '?')}",
                 f"{mem['critic_alloc_mb'] / 1024:.1f} GB (bible ~4)"
                 if mem.get("critic_alloc_mb") is not None
                 else "n/a",
@@ -236,6 +338,42 @@ def print_table(result: dict[str, Any]) -> None:
         print("tegrastats: not available")
 
 
+def _gb(mb: float | None) -> str:
+    return f"{mb / 1024:.2f} GB" if mb is not None else "n/a"
+
+
+def print_critic_variants(result: dict[str, Any]) -> None:
+    """One row per Critic variant; p50 is also compared with the same dtype's full frame."""
+    variants = result.get("critic_variants") or []
+    if not variants:
+        return
+    full = variants[0]["latency_ms"]["p50"]
+    head = ("Variant", "Input", "p50", "p95", "p50 vs full", "torch peak", "RAM peak", "Verdicts")
+    rows = [
+        (
+            v["variant"],
+            v["input"],
+            f"{v['latency_ms']['p50'] / 1000:.3f} s",
+            f"{v['latency_ms']['p95'] / 1000:.3f} s",
+            f"x{v['latency_ms']['p50'] / full:.2f}",
+            _gb(v.get("torch_peak_mb")),
+            _gb(v.get("tegrastats_peak_mb")),
+            ",".join(f"{k}:{n}" for k, n in v["verdicts"].items()),
+        )
+        for v in variants
+    ]
+    widths = [max(len(head[i]), *(len(r[i]) for r in rows)) for i in range(len(head))]
+    print(f"Critic variants ({result['n_warm_calls']} timed calls each, {result['images']})")
+    for line in (head, *rows):
+        print("| " + " | ".join(line[i].ljust(widths[i]) for i in range(len(head))) + " |")
+        if line is head:
+            print("|-" + "-|-".join("-" * w for w in widths) + "-|")
+    for msg in result.get("critic_skipped") or []:
+        print(f"note: {msg}")
+    print("torch peak = max_memory_allocated (weights included); RAM peak = tegrastats used.")
+    print()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(
@@ -271,8 +409,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_critic:
         from lbyr.ai.critic import Moondream2Critic
 
-        critic = Moondream2Critic(CriticConfig(model_path=args.critic_path))
+        critic = Moondream2Critic(
+            CriticConfig(model_path=args.critic_path, dtype=args.critic_dtype)
+        )
         memory["critic_alloc_mb"] = cuda_allocated_mb()
+        result["critic_dtype"] = args.critic_dtype
     if not args.skip_planner:
         from lbyr.ai.planner import QwenPlanner
 
@@ -281,23 +422,35 @@ def main(argv: list[str] | None = None) -> int:
         )
         memory["planner_alloc_mb"] = cuda_allocated_mb()
 
+    # Per-variant windows reset the peaks, so keep every window's peak for the overall one.
+    torch_peaks: list[float | None] = [cuda_peak_mb()]
+    ram_peaks: list[float | None] = [mon.peak_mb]
     if critic is not None:
-        print(f"Critic: {args.n} warm calls ...")
-        result["critic"] = bench_critic(critic, frames)
+        variants, skipped = run_critic_variants(critic, frames, args, mon)
+        result["critic_variants"] = variants
+        result["critic_skipped"] = skipped
+        result["critic"] = variants[0]  # full frame: the bible 9.2 row
+        torch_peaks += [v["torch_peak_mb"] for v in variants]
+        ram_peaks += [v["tegrastats_peak_mb"] for v in variants]
     if planner is not None:
         print(f"Planner: {args.n} warm calls (full generation, can take ~10 s each) ...")
         result["planner"] = bench_planner(planner, frames)
 
-    memory["torch_peak_mb"] = cuda_peak_mb()
+    torch_peaks.append(cuda_peak_mb())
     time.sleep(0.5)
     mon.stop()
-    if mon.peak_mb is not None and ram_before is not None:
-        memory["tegrastats_ram_mb"] = {"baseline": ram_before, "peak": mon.peak_mb}
+    ram_peaks.append(mon.peak_mb)
+    known_torch = [p for p in torch_peaks if p is not None]
+    known_ram = [p for p in ram_peaks if p is not None]
+    memory["torch_peak_mb"] = max(known_torch) if known_torch else None
+    if known_ram and ram_before is not None:
+        memory["tegrastats_ram_mb"] = {"baseline": ram_before, "peak": max(known_ram)}
 
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"bench-{time.strftime('%Y%m%d-%H%M%S')}.json"
     path.write_text(json.dumps(result, indent=2))
     print()
+    print_critic_variants(result)
     print_table(result)
     print(f"\nWrote {path}")
     return 0
