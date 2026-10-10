@@ -17,7 +17,11 @@ against the board's `list` output (`S,<joint>,<zero_us>,...` lines); the firmwar
 
 **Status (bible v1.4, 2026-10-10):** model cost measured (bible 9.2). Planner default is now
 `rules`; Qwen only with `backend = qwen` and only if the memory guard passes (D-10..D-12).
-Open: which Critic speed variant to adopt (M-1).
+
+**Status (bible v1.5, 2026-10-10):** M-1 closed (Critic = Moondream2 BF16 on a 378x378 crop).
+Language mode served by Qwen3-1.7B text; M-2 records the pick. Critic accuracy on real wrist
+frames is still NOT measured (no labelled set in `data/datasets/critic/`). The crop box must
+be re-centred on the gripper bite zone once the Trinet is mounted (OQ-12).
 
 ## Hardware (bible Section 20)
 
@@ -84,20 +88,22 @@ Open points for that increment:
 | D-2 | "Wrist re-orient 30 deg" = wrist roll. SLIPPING's 3rd step (lateral 10 mm) is kept as data but unreachable while max attempts = 2. |
 | D-3 | Recovery budget: per-class max attempts AND a global RECOVER(k), k <= 2 per episode. |
 | D-4 | VERIFY_PLACE: `EMPTY` = success; `GRASPED`/`SLIPPING` -> PLACE_FAILED -> ABORT. The locked Critic prompt is reused unchanged. |
-| D-5 | Critic `TIMEOUT`/`INVALID`: re-query once (not counted in k), then ABORT. Never treated as success. |
+| D-5 | Critic `TIMEOUT`: re-query once (not counted in k), then ABORT. Never treated as success. `INVALID`: superseded by D-13. |
 | D-6 | Default Critic timeout 2.0 s (`CriticConfig.timeout_s`). |
 | D-7 | Critic OFF baseline: verify states pass through; verdict logged as `null`. |
 | D-8 | **Proposed, please confirm:** EMPTY recovery "-5 mm standoff" is implemented as "grasp 5 mm lower" (the pre-grasp standoff from the planner is unchanged). |
 | D-9 | JAMMED abort: stop, stop streaming, torque OFF (bible 13). Other aborts: move to safe pose and hold with torque ON; the gripper is not opened. |
 | D-10 | (2026-10-10) `planner.backend` defaults to `rules`; Qwen is not loaded unless `backend = qwen`. In-loop calls keep the 3 s timeout. |
 | D-11 | (2026-10-10) Qwen "language mode" for the demo intro only (`plan_language`): text-only prompt, compact `{"a","s","g","p"}` schema, 64 new tokens max, `planner.qwen_timeout_s` = 8 s; strict parser unchanged. Every plan is logged as a `reasoning_trace` event. |
-| D-12 | (2026-10-10) Memory guard: with `backend = qwen`, refuse to start the episode loop if free system RAM after loading both models is < `planner.qwen_min_free_ram_mb` (1536 MB), or if RAM cannot be read. |
+| D-12 | (2026-10-10) Memory guard: with `backend = qwen` or `language_mode`, refuse to start the episode loop if free system RAM after loading all models is < `planner.qwen_min_free_ram_mb` (1536 MB), or if RAM cannot be read. |
+| D-13 | (2026-10-10) Critic `INVALID` (unparseable answer): re-query once with a fresh frame (not counted in k), then treat as `OCCLUDED` (its recovery: re-position wrist cam, re-query; then ABORT). Logged as `critic_invalid_retry` (`action` = `requery` / `treat_as_occluded`). Every verdict record has the raw answer, verdict, total latency and inference time. |
 
-## Model performance decisions (pending)
+## Model performance decisions
 
 | # | Question | Unblocks | Answer |
 |---|---|---|---|
-| [ ] M-1 | Which Critic speed variant becomes the default? Candidates: `CriticConfig.dtype` fp16 / bf16; 378x378 crop before the query (gripper ROI = `WristCameraConfig.crop_xywh`, OQ-12; default centred; not wired into the runtime yet); Moondream `compile()`. Accuracy on real wrist frames is NOT measured yet: synthetic frames all answer GRASPED. | `CriticConfig.dtype`; crop in the Critic preprocess | Measurements below. Software lead to pick. |
+| [x] M-1 | Which Critic speed variant becomes the default? | `CriticConfig.dtype`, `crop_enabled`, `crop_xywh` | **Closed 2026-10-10 (software lead):** Moondream2 kept as the Critic. `dtype = bf16` (FP16 selectable), runtime input = dewarped frame → 378x378 crop (`CriticConfig.crop_xywh`, default centred; re-centre on the gripper bite zone after mounting, OQ-12). `compile()` not adopted (no Triton). Measured runtime p50 0.85 s. Accuracy still NOT measured. |
+| [ ] M-2 | Which language-mode planner? Candidates: Qwen3-1.7B text (default now), Qwen3-0.6B text, Qwen2.5-VL-3B text-only. | `PlannerConfig.language_backend`, `language_model_path` | Measurements below. **Proposed: Qwen3-1.7B** (9/10 correct, 2.4 s, guard passes with the Critic). Software lead to confirm. |
 
 M-1 measurements (2026-10-10, Orin NX 40 W, synthetic 640x480 frames, 10 timed calls per
 variant, `tools/bench_models.py --critic-only ...`):
@@ -113,3 +119,27 @@ variant, `tools/bench_models.py --critic-only ...`):
 `--critic-compile`: not measured. Triton is not installed in the Jetson venv, so
 `torch.compile` (inductor) is expected to fail on the first call; the bench reports that
 as "skipped".
+
+M-2 measurements (2026-10-10, Orin NX 40 W, `tools/bench_models.py --planner-models
+qwen3-1.7b,qwen3-0.6b --combined`; 10 fixed commands, 6-object detection list, compact
+schema, greedy, thinking off, full generation without the 8 s cut-off). Each model loaded
+alone:
+
+| Model | Load + warm-up | p50 | p95 | tok/s | tokens | valid parse | correct targets | within 8 s | torch alloc | RAM peak |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Qwen3-1.7B | 10.7 s | 2.37 s | 2.40 s | 8.4 | 20 | 9/10 | 9/10 | 10/10 | 3.21 GB | 6.79 GB |
+| Qwen3-0.6B | 2.9 s | 2.82 s | 3.21 s | 8.4 | 24 | 5/10 | 2/10 | 10/10 | 1.13 GB | 4.64 GB |
+
+- Qwen3-1.7B miss: "Place the acrylic block into zone B." -> `"p":5` (no such id), rejected by
+  the strict parser.
+- Qwen3-0.6B: 5 answers used string ids (`"a": "4"`), rejected; 3 picked the wrong zone.
+- Qwen2.5-VL-3B text-only was not re-run in this session (its full-schema in-loop number is
+  11.2 s; it does not fit next to the Critic under the memory guard).
+- The 0.6B "RAM +load" from tegrastats is not reliable (the 1.7B was still being freed);
+  use torch alloc.
+
+Combined (Critic loaded first, then the planner, interleaved calls):
+
+| Critic | Planner | torch alloc | RAM used after load | RAM free | RAM peak | Critic p50 | Planner p50 | Memory guard |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Moondream2 bf16, 378x378 crop | Qwen3-1.7B | 7.20 GB | 10.75 / 15.29 GB | 4.54 GB | 10.78 GB | 0.91 s | 2.32 s | PASS (>= 1536 MB) |
