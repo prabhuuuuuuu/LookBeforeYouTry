@@ -137,6 +137,11 @@ class WristCameraConfig:
     height: int | None = 1080
     fps: int | None = 30
     retrieve_hz: float = 12.0  # decode rate (grab() runs at 30 FPS, retrieve() at this rate)
+    # Startup: keep retrying the open this long (a USB drop re-enumerates in up to ~20 s,
+    # measured 2026-10-11). Mid-run: the Critic waits this long for a frame grabbed after
+    # its request; none -> OCCLUDED (re-query policy), never an abort while moving.
+    open_wait_s: float = 45.0
+    fresh_frame_timeout_s: float = 5.0
     calib_path: Path = DATA_DIR / "calib" / "trinet_fisheye.yaml"  # OQ-9: produced by tools/
     dewarp_enabled: bool = True  # bible 5.2: dewarp before the VLM
     dewarp_balance: float = 0.0  # 0 = crop to valid pixels, 1 = keep full FOV

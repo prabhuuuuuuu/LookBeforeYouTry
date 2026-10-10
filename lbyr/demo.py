@@ -246,16 +246,18 @@ def _wrist_candidates() -> list[str]:
 
 
 def open_wrist_wait(
-    devices: Callable[[], list[str]], wc: WristCameraConfig, wait_s: float = 15.0
+    devices: Callable[[], list[str]], wc: WristCameraConfig, wait_s: float | None = None
 ) -> tuple[str, Any, np.ndarray]:
     """Open the first device that delivers a frame; keep it OPEN (returned).
 
     Trinet quirk (measured 2026-10-11): after a stream is closed, the NEXT open gets no frame
-    and the camera drops off USB and re-enumerates (~6 s); the open after that works. So
-    never probe-and-close, and retry for ``wait_s``. Nodes without frames (metadata, e.g.
-    /dev/video7) are skipped."""
+    and the camera drops off USB and re-enumerates (~6-20 s); the open after that works. So
+    never probe-and-close, and retry for ``wait_s`` (default ``wc.open_wait_s``). Nodes
+    without frames (metadata, e.g. /dev/video7) are skipped."""
+    wait_s = wc.open_wait_s if wait_s is None else wait_s
     t_end = time.perf_counter() + wait_s
     errors: list[str] = []
+    announced = False
     while True:
         for dev in devices():
             try:
@@ -271,6 +273,9 @@ def open_wrist_wait(
                 f"no wrist camera frame within {wait_s:.0f} s: {errors[-3:] or 'no candidates'}"
                 f"\nvideo devices seen:\n{video_devices_report()}\n(use --wrist-dev /dev/videoN)"
             )
+        if not announced:
+            log.warning("wrist camera not ready: retrying for up to %.0f s", wait_s)
+            announced = True
         time.sleep(1.0)
 
 
@@ -330,9 +335,13 @@ class WristCapture:
         log.info("wrist camera %r: %dx%d MJPG", self.device, frame.shape[1], frame.shape[0])
 
     def _reconnect(self) -> None:
-        """The Trinet can drop off USB and re-enumerate (~3 s): re-open every 1 s."""
+        """The Trinet can drop off USB and re-enumerate (~3-20 s): re-open every 1 s, for as
+        long as it takes (the Critic sees OCCLUDED meanwhile, see :meth:`fresh`)."""
         log.warning("wrist camera %r lost: reconnecting", self.device)
-        self._cap.release()
+        try:
+            self._cap.release()
+        except Exception:
+            log.exception("wrist release failed")
         while not self._stop.is_set():
             try:
                 self._cap, frame = open_wrist(self.device, self.wc)
@@ -350,7 +359,12 @@ class WristCapture:
         due = 0.0
         fails = 0
         while not self._stop.is_set():
-            if not self._cap.grab():
+            try:  # a cv2 error must never kill the thread (no frames ever again)
+                grabbed = self._cap.grab()
+            except Exception:
+                log.exception("wrist grab failed")
+                grabbed = False
+            if not grabbed:
                 fails += 1
                 if fails >= 20:  # ~0.2 s without a frame: device gone
                     self._reconnect()
@@ -361,20 +375,27 @@ class WristCapture:
             self.grabs += 1
             now = time.perf_counter()
             if self._want.is_set() or now >= due:
-                ok, raw = self._cap.retrieve()
-                frame = decode_wrist_jpeg(raw) if ok and raw is not None and raw.size else None
+                try:
+                    ok, raw = self._cap.retrieve()
+                    good = ok and raw is not None and raw.size
+                    frame = decode_wrist_jpeg(raw) if good else None
+                except Exception:
+                    log.exception("wrist retrieve/decode failed")
+                    frame = None
                 if frame is not None:
                     self.buffer.put(frame)
                     self.retrieves += 1
                     due = max(due + period, now)  # deadline schedule: averages retrieve_hz
                     self._want.clear()
 
-    def fresh(self, timeout_s: float = 4.0) -> np.ndarray | None:
-        """A frame grabbed AFTER this call (Critic input). Normally <= 1 frame period;
-        ``timeout_s`` covers a USB re-enumeration (~3 s)."""
+    def fresh(self, timeout_s: float | None = None) -> np.ndarray | None:
+        """A frame grabbed AFTER this call (Critic input), or None after ``timeout_s``
+        (default ``wc.fresh_frame_timeout_s``, 5 s): normally <= 1 frame period; a USB
+        re-enumeration can take ~20 s, and the caller treats None as OCCLUDED."""
         item = self.buffer.get()
         seq = item.seq if item is not None else 0
         self._want.set()
+        timeout_s = self.wc.fresh_frame_timeout_s if timeout_s is None else timeout_s
         t_end = time.perf_counter() + timeout_s
         while time.perf_counter() < t_end:
             new = self.buffer.get_if_newer(seq)
@@ -615,10 +636,18 @@ class Demo:
         time.sleep(self.r.dcfg.settle_s)  # frame after the gripper settled
         verdict = Verdict.INVALID
         for attempt in range(2):  # OCCLUDED / INVALID / TIMEOUT: re-query once
-            img = self.r.wrist_frame()
-            if img is None:
-                raise DemoAbort("no wrist frame")
-            raw_path = self.frame(img, "raw")
+            img = self.r.wrist_frame()  # real Trinet: waits <= fresh_frame_timeout_s
+            if img is None and self.r.critic is not None:  # wrist dropped / re-enumerating
+                verdict = Verdict.OCCLUDED
+                why = "no fresh wrist frame (camera reconnecting?)"
+                self.s.add(
+                    "verdicts", {"state": state, "verdict": verdict.value, "latency_ms": 0.0,
+                                 "raw": why},
+                )  # fmt: skip
+                self.s.event(f"Critic {state}: {why} -> OCCLUDED", logging.WARNING)
+                self.rec("verdict", verdict=verdict, raw_text=None, no_frame=True, attempt=attempt)
+                continue
+            raw_path = self.frame(img, "raw") if img is not None else None
             if self.r.overhead is not None and (o := self.r.overhead.get()) is not None:
                 self.frame(o.value.color, "overhead")
             if self.r.critic is None:  # Critic OFF baseline (D-7): pass through, verdict null
@@ -629,6 +658,7 @@ class Demo:
                 self.s.event(f"Critic OFF: {state} passes through")
                 self.rec("verdict", verdict=None, critic_skipped=True, frame_raw=raw_path)
                 return Verdict.GRASPED
+            assert img is not None  # None was handled above (Critic on)
             rid = self.r.critic.submit(img, state)
             if rid is None:
                 raise DemoAbort("Critic queue full")
