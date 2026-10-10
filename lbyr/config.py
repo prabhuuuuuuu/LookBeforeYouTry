@@ -374,6 +374,12 @@ class DemoConfig:
     moondream_path: Path = Path("~/models/moondream2")
     min_free_ram_mb: float = 1024.0  # after Moondream loads: below this, Qwen is freed
     regrasp_step_pct: float = 15.0  # bible 13: +15% closure per re-grasp
+    # --induce-slip: gripper angle of the FIRST grasp only, zero-relative degrees (poses.yaml
+    # gripper: open -40, closed 0). Operator range "clearly loose": -20 .. -25.
+    induce_slip_gripper_deg: float = -22.0
+    # Rehearsal / --critic scripted: verdicts returned in order (last repeats).
+    scripted_verdicts: tuple[str, ...] = ("GRASPED",)
+    snapshot_dir: Path = Path("runs")  # 'w' key / GET /snapshot: runs/<ts>/snap_<n>_*.jpg
     max_regrasps: int = 2  # bible 10: k <= 2
     http_host: str = "0.0.0.0"
     http_port: int = 8000

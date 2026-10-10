@@ -29,3 +29,6 @@ data/bench/
 Thumbs.db
 .vscode/
 .idea/
+
+# Demo wrist snapshots (python -m lbyr.demo, w key / /snapshot)
+runs/

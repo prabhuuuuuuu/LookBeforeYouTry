@@ -1,10 +1,15 @@
 """Live demo: taught poses + Qwen2.5-VL plan + Moondream2 Critic + web view.
 
-    python -m lbyr.demo                  # real arm, D435, Trinet, Qwen + Moondream
-    python -m lbyr.demo --induce-slip    # first grasp deliberately loose -> SLIPPING -> re-grasp
-    python -m lbyr.demo --no-planner     # rules planner only (no Qwen load)
-    python -m lbyr.demo --dry-run        # MockArm + fake cameras + scripted Critic (no hardware)
+    python -m lbyr.demo --rehearsal          # real arm + cameras + web, rules plan, fake Critic,
+                                             # NO model loading (motion-only bring-up)
+    python -m lbyr.demo                      # full: Qwen plan + Moondream Critic
+    python -m lbyr.demo --planner rules      # real Critic, no Qwen (fast trials)
+    python -m lbyr.demo --induce-slip        # loose first grasp (induce_slip_gripper_deg)
+    python -m lbyr.demo --critic-off         # baseline: verify states pass through
+    python -m lbyr.demo --dry-run            # MockArm + fake cameras + scripted Critic
 
+Keys at the prompts: Enter = run, s = run with induced slip, w = wrist snapshot
+(runs/<ts>/snap_<n>_{full,crop}.jpg, also GET /snapshot?crop=x0,y0,x1,y1), q = quit.
 Web view: http://<jetson>:8000 (overhead + wrist MJPEG, FSM state, plan, verdicts).
 
 Sequence (one ``m`` per segment, DONE awaited via the MotionController, PP-1):
@@ -33,10 +38,12 @@ from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
 from lbyr.ai.critic import CriticBackend, CriticWorker, ScriptedCritic, Verdict
+from lbyr.ai.imaging import critic_crop
 from lbyr.ai.planner import (
     PlanRequest,
     PlanResult,
@@ -95,6 +102,10 @@ class DemoPoses:
             return max(v, 0.0) if c < o else min(v, 0.0)
         return max(v, c) if c < o else min(v, c)
 
+    def pct_for_deg(self, gripper_deg: float) -> float:
+        """Closure % that :meth:`gripper_deg` maps to ``gripper_deg`` (inverse map)."""
+        return 100.0 * (gripper_deg - self.open_deg) / (self.closed_deg - self.open_deg)
+
     def pose(self, name: str, closure_pct: float) -> np.ndarray:
         q = np.asarray(self.poses[name], dtype=float).copy()
         q[GRIPPER_INDEX] = self.gripper_deg(closure_pct)
@@ -121,7 +132,11 @@ def load_demo_poses(path: Path) -> DemoPoses:
         tuple((float(a), float(b)) for a, b in poly) if poly else None,
     )
     if p.gripper_deg(130.0) == p.closed_deg:
-        log.warning("gripper: 0 deg is not beyond closed_deg: +15%% re-grasp cannot squeeze more")
+        log.info(
+            "gripper: closed_deg %.0f is the limit (0 = fully shut): re-grasps close to %.0f deg",
+            p.closed_deg,
+            p.closed_deg,
+        )
     return p
 
 
@@ -134,7 +149,7 @@ def mock_demo_poses() -> DemoPoses:
         "place_pre": (-25.0, 10.0, 60.0, 40.0, 0.0, 0.0),
         "place": (-25.0, 25.0, 55.0, 50.0, 0.0, 0.0),
     }
-    return DemoPoses(fake, open_deg=60.0, closed_deg=20.0)
+    return DemoPoses(fake, open_deg=-40.0, closed_deg=0.0)  # same gripper map as the arm
 
 
 # ------------------------------------------------------------------ live status (web panel)
@@ -149,6 +164,7 @@ class DemoStatus:
     closure_pct: float | None = None
     outcome: str | None = None
     episode: int = 0
+    mode: str = ""
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set(self, **kw: Any) -> None:
@@ -213,20 +229,20 @@ def open_wrist(device: int | str, wc: WristCameraConfig) -> tuple[Any, np.ndarra
 
 
 def _wrist_candidates() -> list[str]:
-    """Non-RealSense V4L2 nodes, lowest number first."""
-
-    def num(p: str) -> int:
-        return int(p.rsplit("video", 1)[1])
-
-    out = []
-    for d in sorted(glob.glob("/sys/class/video4linux/video*"), key=num):
+    """Non-RealSense V4L2 nodes: "Trinet" capture nodes (sysfs index 0) first, so the first
+    open normally hits the right node (every extra open/close cycle costs a USB drop)."""
+    found: list[tuple[tuple[bool, bool, int], str]] = []
+    for d in glob.glob("/sys/class/video4linux/video*"):
         try:
             name = Path(d, "name").read_text().strip()
+            index = Path(d, "index").read_text().strip()
         except OSError:
             continue
-        if "realsense" not in name.lower():
-            out.append(f"/dev/{Path(d).name}")
-    return out
+        if "realsense" in name.lower():
+            continue
+        key = ("trinet" not in name.lower(), index != "0", int(d.rsplit("video", 1)[1]))
+        found.append((key, f"/dev/{Path(d).name}"))
+    return [dev for _, dev in sorted(found)]
 
 
 def open_wrist_wait(
@@ -359,13 +375,15 @@ img{width:49%;border:1px solid #444}#st{font-size:28px;color:#4f4}
 .box{border:1px solid #444;padding:6px;margin:6px 0;white-space:pre-wrap}
 .SLIPPING,.EMPTY,.ABORT{color:#f55}.GRASPED,.DONE{color:#4f4}.OCCLUDED,.TIMEOUT{color:#fa0}
 </style></head><body><img src="/overhead.mjpg"><img src="/wrist.mjpg">
-<div>State: <span id="st">?</span> &nbsp; closure <span id="cl"></span> &nbsp; RAM <span
-id="ram"></span></div><div class="box" id="plan"></div><div class="box" id="ver"></div>
+<div><a href="/snapshot" target="_blank" style="color:#8cf">snapshot</a> &nbsp;
+<span id="mode"></span></div><div>State: <span id="st">?</span> &nbsp; closure <span
+id="cl"></span> &nbsp; RAM <span id="ram"></span></div><div class="box" id="plan"></div>
+<div class="box" id="ver"></div>
 <div class="box" id="rec"></div><div class="box" id="ev"></div><script>
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 async function tick(){try{const s=await (await fetch('/state.json')).json();
 st.textContent=s.state+(s.outcome?' ('+s.outcome+')':'');st.className=s.state;
-cl.textContent=s.closure_pct==null?'-':s.closure_pct.toFixed(0)+'%';ram.textContent=s.ram;
+mode.textContent=s.mode;cl.textContent=s.closure_pct==null?'-':s.closure_pct.toFixed(0)+'%';ram.textContent=s.ram;
 const p=s.plan||{};plan.innerHTML='<b>PLAN</b> ['+esc(p.backend||'-')+'] '+
 esc(p.note||'')+'\\nraw: '+esc(p.raw||'-')+'\\nparsed: '+esc(p.parsed||'-');
 ver.innerHTML='<b>CRITIC</b>\\n'+s.verdicts.map(v=>esc(v.state)+': <span class="'+
@@ -384,8 +402,10 @@ class DemoWeb:
         port: int,
         status: DemoStatus,
         frames: dict[str, Callable[[], tuple[int, np.ndarray] | None]],
+        actions: dict[str, Callable[[dict[str, str]], dict[str, Any]]] | None = None,
     ) -> None:
         web = self
+        acts: dict[str, Callable[[dict[str, str]], dict[str, Any]]] = actions or {}
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, fmt: str, *args: Any) -> None:
@@ -399,6 +419,13 @@ class DemoWeb:
                     self._send(json.dumps(status.snapshot()).encode(), "application/json")
                 elif path.endswith(".mjpg") and path[1:-5] in frames:
                     web.stream(self, frames[path[1:-5]])
+                elif path[1:] in acts:
+                    query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                    try:
+                        out = acts[path[1:]](query)
+                    except Exception as e:
+                        out = {"error": str(e)}
+                    self._send(json.dumps(out).encode(), "application/json")
                 else:
                     self.send_error(404)
 
@@ -471,13 +498,21 @@ class Rig:
     overhead: LatestFrameBuffer[RGBDFrame] | None
     wrist: LatestFrameBuffer[np.ndarray]
     detect: Callable[[RGBDFrame | None], list[Detection]]
-    critic: CriticWorker
+    critic: CriticWorker | None  # None = Critic OFF baseline (verify passes through)
     qwen: QwenPlanner | None
     logger: EpisodeLogger
     vram: VramMonitor
     status: DemoStatus
     stoppers: list[Callable[[], None]] = field(default_factory=list)
     wrist_fresh: Callable[[], np.ndarray | None] | None = None  # on-demand decode (real)
+    preprocess: Callable[[np.ndarray], np.ndarray] | None = None  # Critic dewarp (if any)
+
+    def wrist_frame(self) -> np.ndarray | None:
+        """Newest full wrist frame: decoded on demand on the real Trinet."""
+        if self.wrist_fresh is not None:
+            return self.wrist_fresh()
+        item = self.wrist.get()
+        return item.value if item is not None else None
 
 
 class Demo:
@@ -547,16 +582,20 @@ class Demo:
         time.sleep(self.r.dcfg.settle_s)  # frame after the gripper settled
         verdict = Verdict.INVALID
         for attempt in range(2):  # OCCLUDED / INVALID / TIMEOUT: re-query once
-            if self.r.wrist_fresh is not None:
-                img = self.r.wrist_fresh()
-            else:
-                item = self.r.wrist.get()
-                img = item.value if item is not None else None
+            img = self.r.wrist_frame()
             if img is None:
                 raise DemoAbort("no wrist frame")
             raw_path = self.frame(img, "raw")
             if self.r.overhead is not None and (o := self.r.overhead.get()) is not None:
                 self.frame(o.value.color, "overhead")
+            if self.r.critic is None:  # Critic OFF baseline (D-7): pass through, verdict null
+                self.s.add(
+                    "verdicts",
+                    {"state": state, "verdict": "OFF", "latency_ms": 0.0, "raw": "pass-through"},
+                )
+                self.s.event(f"Critic OFF: {state} passes through")
+                self.rec("verdict", verdict=None, critic_skipped=True, frame_raw=raw_path)
+                return Verdict.GRASPED
             rid = self.r.critic.submit(img, state)
             if rid is None:
                 raise DemoAbort("Critic queue full")
@@ -675,10 +714,15 @@ class Demo:
             self.pose("zone_A_pre", 0.0)
             self.pose("zone_A_grasp", 0.0)
             base = 100.0  # closed_deg = "closed on the block"
-            closure = r.cfg.skills.induced_slip_closure_pct if induce_slip else base
+            closure = base
             if induce_slip:
-                self.rec("induced_slip", closure_pct=closure)
-                self.s.event(f"INDUCED SLIP: first grasp at {closure:.0f}% only", logging.WARNING)
+                g = d.induce_slip_gripper_deg
+                closure = r.poses.pct_for_deg(g)
+                self.rec("induced_slip", closure_pct=closure, gripper_deg=g)
+                self.s.event(
+                    f"INDUCED SLIP: first grasp at {g:.0f} deg ({closure:.0f}%) only",
+                    logging.WARNING,
+                )
             regrasps = 0
             while True:
                 self.state("GRASP", f"closure {closure:.0f}%")
@@ -774,8 +818,6 @@ def build_dry_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatus
 
     cfg = mock_profile()
     log.warning("DRY RUN: MockArm, fake cameras, FAKE poses. No hardware is driven.")
-    arm = MockArm(cfg.arm, initial_deg=mock_demo_poses().poses["home"])
-    arm.connect()
     scene = FakeScene(
         objects=[
             FakeObject(BLOCK_ID, cfg.detector.label, (220.0, 60.0, 0.0), 30.0, 30.0),
@@ -786,8 +828,12 @@ def build_dry_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatus
     wrist = FakeWristCamera(640, 480)
     overhead.start()
     wrist.start()
-    script = [Verdict.SLIPPING] if args.induce_slip else []
-    backend = ScriptedCritic([*script, Verdict.GRASPED], delay_s=0.2)
+    lo = list(cfg.arm.joint_min_deg or ())
+    lo[GRIPPER_INDEX] = -90.0  # FAKE: room for the -40..0 gripper map
+    cfg.arm = replace(cfg.arm, joint_min_deg=tuple(lo))
+    arm = MockArm(cfg.arm, initial_deg=mock_demo_poses().poses["home"])
+    arm.connect()
+    backend = None if args.critic == "off" else scripted_critic(args, dcfg)
     return _finish_rig(
         args, cfg, dcfg, status, arm, mock_joints(), mock_demo_poses(),
         overhead.buffer, wrist.buffer, lambda f: [
@@ -851,7 +897,7 @@ def build_real_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatu
     # models: Qwen first, plan later; Moondream next; free Qwen if RAM is short
     ram(status, "before model load")
     qwen: QwenPlanner | None = None
-    if not args.no_planner:
+    if args.planner == "qwen":
         pcfg = replace(
             cfg.planner,
             backend="qwen",
@@ -865,11 +911,16 @@ def build_real_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatu
             log.exception("Qwen load failed")
             status.event(f"Qwen load failed ({e}): rules planner", logging.ERROR)
         ram(status, "after Qwen load")
-    status.event("loading Moondream2 (bf16)...")
-    from lbyr.ai.critic import Moondream2Critic
+    backend: CriticBackend | None = None
+    if args.critic == "moondream":
+        status.event("loading Moondream2 (bf16)...")
+        from lbyr.ai.critic import Moondream2Critic
 
-    backend = Moondream2Critic(replace(cfg.critic, model_path=dcfg.moondream_path.expanduser()))
-    free = ram(status, "after Moondream load")
+        mpath = dcfg.moondream_path.expanduser()
+        backend = Moondream2Critic(replace(cfg.critic, model_path=mpath))
+    elif args.critic == "scripted":
+        backend = scripted_critic(args, dcfg)
+    free = ram(status, f"after Critic ({args.critic}) setup")
     if qwen is not None and free is not None and free < dcfg.min_free_ram_mb:
         status.event(
             f"free RAM {free:.0f} MB < {dcfg.min_free_ram_mb:.0f} MB: freeing Qwen (rules plan)",
@@ -891,6 +942,21 @@ def build_real_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatu
     return rig
 
 
+def scripted_critic(args: argparse.Namespace, dcfg: DemoConfig) -> ScriptedCritic:
+    """Fake Critic (no model): --script, else SLIPPING,GRASPED with --induce-slip, else
+    DemoConfig.scripted_verdicts."""
+    if args.script:
+        script = [v.strip().upper() for v in args.script.split(",") if v.strip()]
+    elif args.induce_slip:
+        script = ["SLIPPING", "GRASPED"]
+    else:
+        script = list(dcfg.scripted_verdicts)
+    bad = [v for v in script if v not in Verdict.__members__]
+    if bad:
+        raise LBYRError(f"--script: unknown verdicts {bad}")
+    return ScriptedCritic(script, delay_s=0.2)
+
+
 def _finish_rig(
     args: argparse.Namespace,
     cfg: AppConfig,
@@ -902,7 +968,7 @@ def _finish_rig(
     overhead: LatestFrameBuffer[RGBDFrame] | None,
     wrist: LatestFrameBuffer[np.ndarray],
     detect: Callable[[RGBDFrame | None], list[Detection]],
-    backend: CriticBackend,
+    backend: CriticBackend | None,
     qwen: QwenPlanner | None,
     stoppers: list[Callable[[], None]],
     preprocess: Callable[[np.ndarray], np.ndarray] | None = None,
@@ -913,18 +979,75 @@ def _finish_rig(
             raise LBYRError("--crop needs x0,y0,x1,y1 (normalized 0..1)")
         cfg.critic = replace(cfg.critic, crop_box_norm=(box[0], box[1], box[2], box[3]))
     status.event(f"Critic crop box (normalized): {cfg.critic.crop_box_norm or 'centred square'}")
-    critic = CriticWorker(backend, cfg.critic, preprocess=preprocess)
-    critic.start()
+    critic = None
+    if backend is not None:
+        critic = CriticWorker(backend, cfg.critic, preprocess=preprocess)
+        critic.start()
     logger = EpisodeLogger(args.log_dir / time.strftime("demo-%Y%m%d-%H%M%S"))
     logger.start()
     vram = VramMonitor(cfg.logging.tegrastats_interval_ms)
     vram.start()
-    stoppers = [critic.stop, vram.stop, logger.stop, *stoppers]
+    stoppers = [*([critic.stop] if critic else []), vram.stop, logger.stop, *stoppers]
     status.event(f"episode log: {logger.jsonl_path}")
+    planner = "qwen" if qwen is not None else "rules"
+    status.set(mode=f"planner={planner} critic={args.critic} {'DRY RUN' if args.dry_run else ''}")
     return Rig(
         cfg, dcfg, arm, joints, poses, overhead, wrist, detect, critic, qwen, logger, vram,
-        status, stoppers,
+        status, stoppers, preprocess=preprocess,
     )  # fmt: skip
+
+
+class Snapshots:
+    """'w' key / GET /snapshot[?crop=x0,y0,x1,y1]: newest FULL wrist frame + the Critic crop
+    (same preprocess + critic_crop as the CriticWorker) -> <dir>/snap_<n>_{full,crop}.jpg.
+    ``crop`` previews another box without changing the Critic's. Cost: one on-demand decode
+    (~15 ms) + two JPEG writes (~30 ms), off the motion path."""
+
+    def __init__(self, root: Path, rig_box: list[Rig]) -> None:
+        self.root = root
+        self._rig_box = rig_box
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def take(self, crop: str | None = None) -> dict[str, Any]:
+        import cv2  # lazy
+
+        if not self._rig_box:
+            return {"error": "rig not ready"}
+        rig = self._rig_box[0]
+        box = rig.cfg.critic.crop_box_norm
+        if crop:
+            vals = tuple(float(v) for v in crop.split(","))
+            if len(vals) != 4:
+                raise ValueError("crop needs x0,y0,x1,y1 (normalized 0..1)")
+            box = (vals[0], vals[1], vals[2], vals[3])
+        frame = rig.wrist_frame()
+        if frame is None:
+            return {"error": "no wrist frame"}
+        img = rig.preprocess(frame) if rig.preprocess is not None else frame
+        cropped = critic_crop(img, box, rig.cfg.critic.crop_size_px)
+        with self._lock:
+            self._n += 1
+            n = self._n
+        self.root.mkdir(parents=True, exist_ok=True)
+        full, small = self.root / f"snap_{n}_full.jpg", self.root / f"snap_{n}_crop.jpg"
+        cv2.imwrite(str(full), frame)
+        cv2.imwrite(str(small), cropped)
+        out = {"full": str(full), "crop": str(small), "box": box or "centred square"}
+        rig.status.event(f"snapshot {n}: {small} (box {out['box']})")
+        return out
+
+
+def ask(prompt: str, snaps: Snapshots) -> str:
+    """input() that handles 'w' (wrist snapshot) itself and asks again."""
+    while True:
+        ans = input(prompt).strip().lower()
+        if ans != "w":
+            return ans
+        try:
+            log.info("snapshot: %s", snaps.take())
+        except Exception as e:
+            log.error("snapshot failed: %s", e)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -936,7 +1059,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--dry-run", action="store_true", help="MockArm + fake cameras + fake Critic")
     p.add_argument("--induce-slip", action="store_true", help="first grasp at reduced closure")
-    p.add_argument("--no-planner", action="store_true", help="skip Qwen: rules planner")
+    p.add_argument(
+        "--planner", choices=("qwen", "rules"), default="qwen", help="rules = no Qwen load"
+    )
+    p.add_argument("--no-planner", action="store_true", help="same as --planner rules")
+    p.add_argument(
+        "--critic",
+        choices=("moondream", "scripted", "off"),
+        default=None,
+        help="moondream (default; dry-run: scripted) | scripted (fake, no model) | off (baseline)",
+    )
+    p.add_argument("--critic-off", action="store_true", help="same as --critic off (baseline)")
+    p.add_argument(
+        "--rehearsal",
+        action="store_true",
+        help="motion-only: real arm + cameras + web, --planner rules --critic scripted, no models",
+    )
+    p.add_argument("--script", help="scripted Critic verdicts, e.g. SLIPPING,GRASPED,GRASPED")
     p.add_argument("--port", help="bridge serial port (default: the only /dev/ttyACM*)")
     p.add_argument("--wrist-dev", help="wrist camera: /dev/videoN or index (default: auto)")
     p.add_argument(
@@ -947,7 +1086,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--log-dir", type=Path, default=AppConfig().logging.episodes_dir)
     p.add_argument("--once", action="store_true", help="one episode, then exit")
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.no_planner or args.rehearsal or args.dry_run:
+        args.planner = "rules"
+    if args.critic is None:
+        args.critic = "scripted" if (args.rehearsal or args.dry_run) else "moondream"
+    if args.critic_off:
+        args.critic = "off"
+    if args.dry_run and args.critic == "moondream":
+        p.error("--dry-run never loads models: use --critic scripted or off")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -973,11 +1121,13 @@ def main(argv: list[str] | None = None) -> int:
 
             return get
 
+        snaps = Snapshots(dcfg.snapshot_dir / time.strftime("%Y%m%d-%H%M%S"), rig_box)
         web = DemoWeb(
             dcfg.http_host,
             dcfg.http_port,
             status,
             {"overhead": frame_of("overhead"), "wrist": frame_of("wrist")},
+            {"snapshot": lambda q: snaps.take(q.get("crop"))},
         )
         web.start()
         log.info("web view on http://%s:%d", dcfg.http_host, web.port)
@@ -993,15 +1143,15 @@ def main(argv: list[str] | None = None) -> int:
         demo = Demo(rig)
         once = args.once or args.dry_run
         if not args.dry_run:
-            input(f"Ready (web view on port {web.port}). Press Enter to start the episode: ")
+            ask(f"Ready (web view on port {web.port}). [Enter] start, [w] wrist snapshot: ", snaps)
         while True:
             ok = demo.run(args.induce_slip)
             if once:
                 return 0 if ok else 1
-            ans = input("[Enter] run again, [s] again with --induce-slip, [q] quit: ")
-            if ans.strip().lower() == "q":
+            ans = ask("[Enter] run again, [s] again with slip, [w] snapshot, [q] quit: ", snaps)
+            if ans == "q":
                 return 0 if ok else 1
-            args.induce_slip = ans.strip().lower() == "s"
+            args.induce_slip = ans == "s"
     except KeyboardInterrupt:
         log.warning("Ctrl-C: stopping the arm")
         if rig is not None:

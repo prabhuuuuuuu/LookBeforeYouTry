@@ -6,20 +6,16 @@
 # zones.X.polygon_px (overhead image pixels, >= 3 points). radius_mm (base axis -> zone
 # centre, measured) is needed only for the lateral-offset recovery.
 #
-# NOTHING IS TAUGHT YET. Example of the finished file (values are placeholders):
-#   gripper: {open_deg: 0.0, closed_deg: 40.0}     # slider 6: open / closed on the block
-#   poses:
-#     home: [0, 0, 0, 0, 0, 0]                     # ABORT safe pose (A-3: decide)
-#     zone_A_pre: [10, -20, 35, 15, 0, 0]
-#     zone_A_grasp: [10, -32, 40, 22, 0, 0]
-#     place_pre: [-30, -20, 35, 15, 0, 0]
-#     place: [-30, -30, 40, 20, 0, 0]
-#   zones:
-#     A: {polygon_px: [[100, 300], [220, 300], [220, 420], [100, 420]], radius_mm: 220,
-#         standoff_mm: 40}
-#   place_polygon_px: [[420, 300], [560, 300], [560, 440], [420, 440]]   # optional
+# Entered 2026-10-11 from operator-provided values (J1 base, J2 shoulder, J3 elbow; other
+# joints 0). Gripper: open -40, closed 0 (0 = fully shut). Zones not defined yet: the live
+# demo (python -m lbyr.demo) does not need them; lbyr.main preflight still asks for them.
 gripper:
-  open_deg: null
-  closed_deg: null
-poses: {}
+  open_deg: -40.0
+  closed_deg: 0.0
+poses:
+  home: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  zone_A_pre: [-30.0, -12.0, -24.0, 0.0, 0.0, 0.0]
+  zone_A_grasp: [-30.0, -30.0, -20.0, 0.0, 0.0, 0.0]
+  place_pre: [30.0, -12.0, -24.0, 0.0, 0.0, 0.0]
+  place: [30.0, -30.0, -20.0, 0.0, 0.0, 0.0]
 zones: {}

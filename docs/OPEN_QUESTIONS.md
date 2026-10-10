@@ -40,13 +40,13 @@ block it (`python -m lbyr.main` preflight).
 | [x] OQ-3 | Exact servo PSU voltage and current. **Do not assume 5 V.** | `ArmConfig.servo_voltage_v` (safety interlock in `SerialArm.connect`) | **6.0 V** (MG996R max ~7.2 V). PSU current rating was not recorded. Bible v1.3, 2026-10-10. |
 | [ ] OQ-4 | Official URDF/CAD, or measured link lengths; joint limits in degrees | `ArmConfig.link_lengths_mm`, `joint_min_deg`, `joint_max_deg`; `IkpyIK` | |
 | [x] OQ-5 | Is servo position/load feedback readable? Load units? | `ArmConfig.feedback_readable`; `SerialArm.read_state`; jam detection | **No feedback.** "Position" is the last commanded pulse. JAMMED = operator stop only (bible 13) unless an INA226 current sensor is added. Bible v1.3, 2026-10-10. |
-| [ ] OQ-6 | Gripper stroke and closure-to-angle mapping (open deg, closed deg) | `GripperConfig.open_deg`, `closed_deg` (ik mode); taught mode: `gripper.open_deg/closed_deg` in `data/calib/poses.yaml` | |
-| [ ] OQ-7 | Trinet live-stream mode: UVC webcam or vendor SDK? Device index? | `WristCameraConfig.device_index`; `TrinetWristCamera` | |
-| [ ] OQ-8 | Trinet resolution/FPS that works reliably on the Jetson | `WristCameraConfig.width/height/fps` (`tools/fps_test.py`) | |
+| [x] OQ-6 | Gripper stroke and closure-to-angle mapping (open deg, closed deg) | `GripperConfig.open_deg`, `closed_deg` (ik mode); taught mode: `gripper.open_deg/closed_deg` in `data/calib/poses.yaml` | Taught mode: **open -40, closed 0** (zero-relative; 0 = fully shut, so re-grasp "+15%" stays at 0). Induced slip first grasp -22 (`DemoConfig.induce_slip_gripper_deg`, operator range -20..-25). Operator, 2026-10-11. ik-mode `GripperConfig` still unset. |
+| [x] OQ-7 | Trinet live-stream mode: UVC webcam or vendor SDK? Device index? | `WristCameraConfig.device_index`; `TrinetWristCamera` | **UVC.** Node number is NOT stable (seen video6, video0, video1): find it by sysfs name "Trinet UVC", capture node = sysfs index 0 (index 1 = metadata). Every 2nd open after a close fails and the camera re-enumerates (~6 s). Frames carry an IMU SEI blob inside the JPEG DHT segment; decode with `lbyr.perception.wrist.decode_wrist_jpeg`. Measured 2026-10-11. |
+| [x] OQ-8 | Trinet resolution/FPS that works reliably on the Jetson | `WristCameraConfig.width/height/fps` (`tools/fps_test.py`) | **MJPG 1920x1080 @ 30** is the only usable mode (H264 also offered, not used). Grab 30.0 fps, decode 12 Hz. Operator + software, 2026-10-11. |
 | [ ] OQ-9 | Trinet fisheye calibration (K, D, RMS) | `data/calib/trinet_fisheye.yaml` (`tools/calibrate_fisheye.py`) | |
-| [ ] OQ-10 | USB port plan: RealSense on USB 3.0; Trinet and XIAO ESP32-C6 on stable separate ports; XIAO device name (`/dev/ttyACM*`?) | `ArmConfig.serial_port` | |
+| [ ] OQ-10 | USB port plan: RealSense on USB 3.0; Trinet and XIAO ESP32-C6 on stable separate ports; XIAO device name (`/dev/ttyACM*`?) | `ArmConfig.serial_port` | Partial (operator, 2026-10-11): D435 on USB3, bridge on `/dev/ttyACM0` (auto-detected). Open: D435 and Trinet both re-enumerated during sessions on the shared VIA hub; powered hub / separate ports to check. |
 | [ ] OQ-11 | Final tripod height and tilt at venue | hand-eye calibration (`base_T_cam.yaml`) | |
-| [ ] OQ-12 | Final wrist mount geometry for Trinet (gripper ROI crop) | `CriticConfig.crop_xywh` (378x378 Critic crop; default centred) | |
+| [ ] OQ-12 | Final wrist mount geometry for Trinet (gripper ROI crop) | `CriticConfig.crop_box_norm` (normalized x0,y0,x1,y1, resized to 378x378; default centred full-height square). Tune with `lbyr.demo --crop` + `w` snapshots | |
 
 ## Surfaced by software (not in the bible)
 
