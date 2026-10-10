@@ -25,9 +25,12 @@ dependencies = [
 # Install those per docs/ONBOARDING_LAVISH.md, then `pip install -e .[jetson]`.
 # numpy<2: JetPack's system OpenCV and the Jetson torch wheels are built against NumPy 1.x
 # (NumPy 2 breaks `import cv2` with "_ARRAY_API not found"). Also see constraints-jetson.txt.
+# pillow>=10: the venv uses --system-site-packages and Ubuntu's Pillow 9.0.1 lacks
+# PIL.Image.Resampling (>= 9.1), which transformers needs.
 jetson = [
     "ikpy>=3.3",
     "numpy<2",
+    "pillow>=10",
 ]
 # Laptop / CI only: GUI-capable OpenCV for dewarp tests and tools/. Never install on the Jetson.
 laptop = [

@@ -61,3 +61,14 @@ pip install -U pip setuptools wheel "packaging>=24.2"
 export PIP_CONSTRAINT=constraints-jetson.txt   # numpy<2: NumPy 2 breaks the JetPack cv2
 pip install -e ".[jetson,dev]"
 ```
+
+### Known Jetson pitfalls
+
+- **numpy<2**: the system OpenCV is built against NumPy 1.x (`_ARRAY_API not found`).
+  Covered by the `[jetson]` extra and `constraints-jetson.txt`.
+- **pillow>=10**: with `--system-site-packages`, Ubuntu's Pillow 9.0.1 is too old for
+  `transformers` (needs `PIL.Image.Resampling`, Pillow >= 9.1). Covered by the `[jetson]` extra.
+- **torch**: install the Jetson wheel from the jetson-ai-lab `jp6/cu126` index, never the
+  PyPI wheel.
+- **cuDSS**: install via the tegra deb (`cudss-local-tegra-repo-ubuntu2204`, package
+  `cudss-cuda-12`), then run `sudo ldconfig`.
