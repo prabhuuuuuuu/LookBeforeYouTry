@@ -13,7 +13,7 @@
 verified: true   # verified by: sentrix, 2026-10-11 (matches board zeros)
 us_per_deg: 11.1111   # firmware US_PER_DEG = 1000/90
 joints:
-  - {name: base_yaw,       zero_us: 1477, sign: 1, zero_pose_deg: 0.0}
+  - {name: base_yaw,       zero_us: 1344, sign: 1, zero_pose_deg: 0.0}
   - {name: shoulder_pitch, zero_us: 1989, sign: 1, zero_pose_deg: 0.0}
   - {name: elbow_pitch,    zero_us: 1844, sign: 1, zero_pose_deg: 0.0}
   - {name: wrist_pitch,    zero_us: 1223, sign: 1, zero_pose_deg: 0.0}
