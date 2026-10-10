@@ -39,6 +39,7 @@ class MockArm(ArmInterface):
         start = initial_deg if initial_deg is not None else config.safe_pose_deg
         start = start if start is not None else (0.0,) * NUM_JOINTS
         self._pos = np.clip(np.asarray(start, dtype=float), self._lo, self._hi)
+        self.peak_deg = self._pos.copy()  # test hook: per-joint maximum ever reached
         self._lock = threading.Lock()
         self._latency_s = latency_s
         self._jammed: set[int] = set()
@@ -145,6 +146,7 @@ class MockArm(ArmInterface):
         for i in self._jammed:
             new_pos[i] = self._pos[i]
         self._pos = np.clip(new_pos, self._lo, self._hi)
+        self.peak_deg = np.maximum(self.peak_deg, self._pos)
 
     def _advance_locked(self, now: float) -> None:
         if self._move is None:

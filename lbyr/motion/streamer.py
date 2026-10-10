@@ -64,6 +64,7 @@ class MotionStreamer(threading.Thread):
         self._ticks = 0
         self._missed = 0
         self._errors = 0
+        self._output_enabled = True
         self.status.put(StreamerStatus(0, tuple(self._hold), True, 0, 0, 0))
 
     # ------------------------------------------------------------ producer API
@@ -92,6 +93,11 @@ class MotionStreamer(threading.Thread):
             float(np.percentile(j, 99) * 1000),
             float(j.max() * 1000),
         )
+
+    def set_output_enabled(self, enabled: bool) -> None:
+        """Disable to stop sending setpoints entirely (e.g. after a JAMMED torque-off).
+        Ticks and jitter accounting continue."""
+        self._output_enabled = enabled
 
     def stop(self, timeout: float = 1.0) -> None:
         self._stop_event.set()
@@ -123,7 +129,8 @@ class MotionStreamer(threading.Thread):
             done = traj is None or idx >= len(traj.points)
 
             try:
-                self._arm.stream_point(self._hold.tolist())
+                if self._output_enabled:
+                    self._arm.stream_point(self._hold.tolist())
             except Exception:
                 self._errors += 1
                 if self._errors == 1 or self._errors % 50 == 0:
