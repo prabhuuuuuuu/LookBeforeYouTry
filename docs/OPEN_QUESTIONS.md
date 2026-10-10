@@ -44,6 +44,34 @@ against the board's `list` output (`S,<joint>,<zero_us>,...` lines); the firmwar
 | [ ] A-6 | Bridge `status` values other than `"ok"` (host treats any non-`ok` as JAMMED) | `bridge_proto`, firmware | Superseded: the firmware replies `OK ...` / `ERR ...` text lines and has no `status` field. Decide the host mapping when the text protocol is implemented (below). |
 | [ ] A-7 | Joint zero pose and sign conventions (what does 0 deg mean per joint?) | `IkpyIK`, safe pose | Firmware: 0 deg = saved zero pulse, +deg = longer pulse, 1000/90 us per deg nominal. Zeros (us) in the firmware fallback: 1477, 1989, 1844, 1223, 1467, 1433. Still to verify against `list` and `data/calib/zero_positions.json`; sign per joint and the physical meaning of the zero pose are unconfirmed. |
 
+## Host protocol plan: SerialArm / bridge_proto (recorded 2026-10-10, NOT implemented)
+
+The firmware (`firmware/xiao_c6_bridge/Code.ino`, bible v1.3 Section 6) speaks a **text**
+protocol at 115200, not the JSON protocol that `lbyr/arm/bridge_proto.py` and
+`SerialArm` implement today. Until this is done, `SerialArm` cannot drive the real board.
+Plan (for a later increment; keep `bridge_proto` JSON + `MockArm` working for tests):
+
+| Host call (`ArmInterface`) | Firmware text command | Notes |
+|---|---|---|
+| `move_joints(deg, time_ms)` | `m D1 .. D6` | Degrees relative to saved zero. The firmware has **no `time_ms`**: it moves at its own speed/accel limits and all joints arrive together. Duration is set with `speed V A`, not per move. |
+| `stream_point(deg)` (50 Hz) | `m D1 .. D6` (see PP-1) | Open problem PP-1. |
+| `stop()` | `x` | Brakes smoothly, then holds. |
+| `torque(False)` | `off` | Releases PWM; the arm may fall. Only with the arm supported. |
+| `torque(True)` | `home` | Re-attaches released joints at their zeros and moves there. There is no way to re-enable torque without moving. |
+| `read_state()` | `list` | Returns **commanded** pulses (`S,<joint>,<zero_us>,<pos_us>,<attached>,<name>` x6, then `V,<vmax>,<amax>`), not measured angles. Convert with `(pos_us - zero_us) / (1000/90)`. `load` and `temp` are `None`. `ArmState.status` must not be treated as measured feedback (OQ-5). |
+| `connect()` | open port, then expect the boot `help` text | The board homes itself at boot (arm must already rest in the zero pose). Host must not send motion until homing is finished. |
+
+Replies are `OK ...` / `ERR ...` lines; `list` is multi-line. No reply is a timeout.
+
+Open points for that increment:
+
+| # | Question |
+|---|---|
+| PP-1 | The firmware re-plans from the current position on every command (accel-limited, backlash overshoot, `m` scales speeds by remaining distance). A 50 Hz stream of `m` commands will likely not behave like the trapezoid trajectories. Options: (a) send sparse waypoints (about 5-10 Hz) and let the firmware profile them; (b) add a firmware streaming/"direct set" mode (needs a firmware change, not made yet); (c) accept it after bench testing with `tools/arm_gui.py`. Decide before wiring `MotionStreamer` to the real arm. |
+| PP-2 | Degrees in the host are relative to each joint's saved zero. IK and `ArmConfig.safe_pose_deg` need that convention (A-3, A-7). Joint limits in degrees (OQ-4) must be enforced on the host because the firmware only clamps pulses to 500-2500 us. |
+| PP-3 | The firmware has no link-loss watchdog and no per-tick delta clamp (A-2). PWM servos hold the last pulse on link loss. Decide whether to add a watchdog in firmware. |
+| PP-4 | `ArmConfig.servo_bus` / `servo_ids` / `servo_baud` need to become "pwm" / not applicable; `SerialArm.check_confirmed` should drop the IDs/baud checks and use A-5 = 115200. Preflight in `lbyr/main.py` lists open questions from config, so closing OQ-1/2/3/5 in `config.py` is a separate step. |
+
 ## Software policy decisions (approved by software lead, scaffold session)
 
 | # | Decision |
