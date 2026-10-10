@@ -35,16 +35,16 @@ still blocks real-hardware runs (see `docs/OPEN_QUESTIONS.md`).
 |---|---|
 | Config, bridge protocol, MockArm, trajectories, 50 Hz streamer, FSM + recovery, logging | Implemented and tested |
 | Fisheye dewarp, metric geometry, Umeyama hand-eye solve | Implemented and tested |
-| SerialArm, IkpyIK, Trinet capture | Gated on open hardware questions (OQ-1..12, A-1..7) |
+| SerialArm, IkpyIK, Trinet capture | Gated on open hardware questions (OQ-4, 6-12, A-1..3, A-6, A-7). `SerialArm` also needs the firmware's text protocol (not implemented) |
 | QwenPlanner, Moondream2Critic, YOLOv11n TensorRT | Stubs (TODO, lazy imports) |
-| ESP32 firmware | Not started (`firmware/esp32_bridge/README.md`) |
+| Bridge firmware (XIAO ESP32-C6, PWM, text protocol) + `tools/arm_gui.py` bench GUI | Exists (`firmware/xiao_c6_bridge/`). Joint roles, PWM servos, 6.0 V rail and no-feedback are confirmed (OQ-1/2/3/5 closed). Zeros in `data/calib/zero_positions.json` still to be verified against the board's `list` output |
 
 ## Layout
 
 ```
 lbyr/       arm/ perception/ ai/ motion/ fsm/ logging_/ config.py main.py mock_stack.py
 tools/      beginner-friendly camera / calibration / labeling / serial scripts
-firmware/   ESP32 bridge (placeholder)
+firmware/   XIAO ESP32-C6 bridge (xiao_c6_bridge/)
 tests/      pytest, runs without hardware
 docs/       bible, open questions, onboarding
 data/       git-ignored: frames/, datasets/, calib/, episodes/
