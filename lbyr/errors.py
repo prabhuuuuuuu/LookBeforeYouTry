@@ -36,5 +36,9 @@ class CalibrationError(LBYRError):
     """Calibration file missing, malformed, or numerically invalid."""
 
 
+class IKError(LBYRError):
+    """Target unreachable or outside joint limits."""
+
+
 class ConfigError(LBYRError):
     """Configuration violates a locked project rule (e.g. temperature != 0)."""
