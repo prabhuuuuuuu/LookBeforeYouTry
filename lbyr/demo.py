@@ -267,8 +267,36 @@ def open_wrist_wait(
             log.info("wrist: using %s", dev)
             return dev, cap, frame
         if time.perf_counter() >= t_end:
-            raise LBYRError(f"no wrist camera frame within {wait_s:.0f} s: {errors[-3:]}")
+            raise LBYRError(
+                f"no wrist camera frame within {wait_s:.0f} s: {errors[-3:] or 'no candidates'}"
+                f"\nvideo devices seen:\n{video_devices_report()}\n(use --wrist-dev /dev/videoN)"
+            )
         time.sleep(1.0)
+
+
+def video_devices_report() -> str:
+    """``v4l2-ctl --list-devices`` output, else the /sys/class/video4linux names (for the
+    wrist-camera error). Cost: one subprocess (< 2 s cap), only on the failure path."""
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            ["v4l2-ctl", "--list-devices"], capture_output=True, text=True, timeout=2.0
+        )
+        out = (r.stdout + r.stderr).strip()
+        if out:
+            return "  " + out.replace("\n", "\n  ")
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("v4l2-ctl unavailable: %s", e)
+    lines = []
+    for d in sorted(glob.glob("/sys/class/video4linux/video*")):
+        try:
+            name = Path(d, "name").read_text().strip()
+            index = Path(d, "index").read_text().strip()
+        except OSError:
+            name, index = "?", "?"
+        lines.append(f"  /dev/{Path(d).name}: {name} (index {index})")
+    return "\n".join(lines) or "  none (/sys/class/video4linux is empty)"
 
 
 class WristCapture:
@@ -362,7 +390,12 @@ class WristCapture:
     def stop(self) -> None:
         self._stop.set()
         if self._thread.is_alive():
-            self._thread.join(1.0)
+            self._thread.join(2.0)
+            if self._thread.is_alive():
+                log.warning("wrist-cam thread did not stop within 2 s")
+        if self._opened is not None:  # opened but never started
+            self._opened[0].release()
+            self._opened = None
         if self._cap is not None:
             self._cap.release()
             self._cap = None
@@ -844,47 +877,92 @@ def build_dry_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatus
 
 
 def build_real_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatus) -> Rig:
-    from lbyr.arm.serial_arm import SerialArm, detect_bridge_port, speed_for_cap
-
     cfg = AppConfig()
     joints = load_joints(cfg.arm.joints_path)
     if not joints.verified:
         raise CalibrationError(f"{cfg.arm.joints_path}: verified is false (A-7, tools/arm_gui.py)")
     poses = load_demo_poses(cfg.motion.poses_path)
-    port, found = detect_bridge_port()
-    port = args.port or port
-    if port is None:
-        raise LBYRError(f"bridge port: found {found or 'no /dev/ttyACM*'}; use --port")
-    cfg.arm.serial_port = port
-    stoppers: list[Callable[[], None]] = []
-    arm = SerialArm(cfg.arm, joints)
-    arm.connect()
-    stoppers.append(arm.close)
-    v, a = arm.set_speed(*speed_for_cap(cfg.motion.dev_speed_cap))
-    status.event(f"arm on {port}: speed {v:.0f} deg/s, {a:.0f} deg/s^2 (dev cap)")
-    if input("E-STOP within reach and tested? Type y to continue: ").strip().lower() != "y":
-        arm.close()
-        raise LBYRError("E-stop not confirmed")
+    stoppers: list[Callable[[], None]] = []  # cameras first (stop before the arm link)
+    try:
+        return _build_real_rig(args, dcfg, status, cfg, joints, poses, stoppers)
+    except BaseException:  # incl. Ctrl-C at a prompt: never exit with camera threads live
+        status.event("setup failed: stopping cameras / arm link", logging.WARNING)
+        run_stoppers(stoppers)
+        raise
 
-    # cameras
-    overhead_buf: LatestFrameBuffer[RGBDFrame] | None = None
+
+def run_stoppers(stoppers: list[Callable[[], None]]) -> None:
+    """Run every shutdown step in order; one failing step never skips the rest."""
+    for stop in stoppers:
+        try:
+            stop()
+        except Exception:
+            log.exception("shutdown step failed")
+    stoppers.clear()
+
+
+def open_overhead(
+    cfg: AppConfig, status: DemoStatus, stoppers: list[Callable[[], None]], first_s: float = 5.0
+) -> LatestFrameBuffer[RGBDFrame] | None:
+    """Start the D435 and wait for its first frame. Failure -> None (no overhead view, rules
+    plan), with the pipeline stopped and its thread joined."""
     try:
         from lbyr.perception.overhead import RealSenseOverheadCamera
 
         cam = RealSenseOverheadCamera(cfg.cameras.overhead)
         cam.start()
         stoppers.insert(0, cam.stop)
-        overhead_buf = cam.buffer
+        t_end = time.perf_counter() + first_s
+        while cam.buffer.get() is None:
+            if time.perf_counter() >= t_end:
+                stoppers.remove(cam.stop)
+                cam.stop()
+                raise LBYRError(f"no D435 frame within {first_s:.0f} s")
+            time.sleep(0.02)
+        return cam.buffer
     except Exception as e:
         status.event(f"D435 unavailable ({e}): no overhead view, rules plan", logging.ERROR)
+        return None
+
+
+def _build_real_rig(
+    args: argparse.Namespace,
+    dcfg: DemoConfig,
+    status: DemoStatus,
+    cfg: AppConfig,
+    joints: JointsCalib,
+    poses: DemoPoses,
+    stoppers: list[Callable[[], None]],
+) -> Rig:
+    from lbyr.arm.serial_arm import SerialArm, detect_bridge_port, speed_for_cap
+
+    # cameras BEFORE the arm link and the E-stop prompt: a camera failure surfaces while the
+    # servos are still unpowered. Both must deliver a first frame.
+    overhead_buf = open_overhead(cfg, status, stoppers)
     wc = cfg.cameras.wrist
     wdev = args.wrist_dev or dcfg.wrist_device
     if wdev is not None and wdev.isdigit():
         wdev = f"/dev/video{wdev}"
     dev, cap, frame = open_wrist_wait(lambda: [wdev] if wdev else _wrist_candidates(), wc)
     wrist = WristCapture(dev, wc, (cap, frame))
+    stoppers.insert(0, wrist.stop)  # before start(): releases the open capture either way
     wrist.start()
-    stoppers.insert(0, wrist.stop)
+    d435 = "first frame OK" if overhead_buf is not None else "UNAVAILABLE"
+    status.event(f"cameras: D435 {d435}; wrist {dev} first frame {frame.shape[1]}x{frame.shape[0]}")
+
+    port, found = detect_bridge_port()
+    port = args.port or port
+    if port is None:
+        raise LBYRError(f"bridge port: found {found or 'no /dev/ttyACM*'}; use --port")
+    cfg.arm.serial_port = port
+    arm = SerialArm(cfg.arm, joints)
+    arm.connect()  # closes itself on failure
+    stoppers.append(arm.close)
+    v, a = arm.set_speed(*speed_for_cap(cfg.motion.dev_speed_cap))
+    status.event(f"arm on {port}: speed {v:.0f} deg/s, {a:.0f} deg/s^2 (dev cap)")
+    if input("E-STOP within reach and tested? Type y to continue: ").strip().lower() != "y":
+        raise LBYRError("E-stop not confirmed")
+
     detect: Callable[[RGBDFrame | None], list[Detection]] = lambda f: []  # noqa: E731
     try:
         from lbyr.perception.block import BlockDetector
@@ -1162,11 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         if rig is not None:
-            for stop in rig.stoppers:
-                try:
-                    stop()
-                except Exception:
-                    log.exception("shutdown step failed")
+            run_stoppers(rig.stoppers)
         if web is not None:
             web.stop()
         listener.stop()

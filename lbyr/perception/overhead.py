@@ -218,12 +218,21 @@ class RealSenseOverheadCamera:
         return RGBDFrame(np.asanyarray(c.get_data()).copy(), depth, self._intr)
 
     def stop(self) -> None:
+        """Join the capture thread (it can sit in wait_for_frames for up to 1 s), THEN stop
+        the pipeline. Exiting with a live pipeline aborts the process in librealsense's
+        thread destructors ("terminate called without an active exception")."""
         if self._thread is not None:
-            self._thread.stop()
+            self._thread.stop(timeout=2.5)
+            if self._thread.is_alive():
+                log.warning("overhead-cam thread did not stop within 2.5 s")
             self._thread = None
         if self._pipeline is not None:
-            self._pipeline.stop()
-            self._pipeline = None
+            try:
+                self._pipeline.stop()
+            finally:
+                self._pipeline = None
+                self._align = None
+            log.info("D435 pipeline stopped")
 
 
 # --------------------------------------------------------------------------- fakes
