@@ -18,11 +18,15 @@ class FakeBoard:
         amax: float = 200.0,
         send_done: bool = True,
         answer: bool = True,
+        q_reply: str | None = None,
+        old_s_lines: bool = False,
     ) -> None:
         self.zero_us = zero_us
         self.p = FirmwarePlanner(zero_us, vmax, amax)
         self.send_done = send_done  # False: never prints DONE (dead link simulation)
         self.answer = answer  # False: silent board
+        self.q_reply = q_reply  # overrides the Q reply (old / broken firmware simulation)
+        self.old_s_lines = old_s_lines  # True: 6-field S lines (old firmware)
         self.out: queue.Queue[str] = queue.Queue()
         self.written: list[str] = []
         self.pending = False
@@ -73,11 +77,16 @@ class FakeBoard:
         if cmd == "list":
             for i, q in enumerate(self.p.j):
                 moving = int(q.attached and not self.p.settled(i))
+                if self.old_s_lines:
+                    self.say(f"S,{i + 1},{self.zero_us[i]},{q.pos:.0f},{int(q.attached)},J{i + 1}")
+                    continue
                 self.say(
                     f"S,{i + 1},{self.zero_us[i]},{q.pos:.0f},{int(q.attached)},"
                     f"{self.p.goal_of(i):.0f},{moving},Joint {i + 1}"
                 )
             self.say(f"V,{self.p.vmax_deg:.0f},{self.p.amax_deg:.0f}")
+        elif cmd == "q" and self.q_reply is not None:
+            self.say(self.q_reply)
         elif cmd == "q":
             cur = ",".join(f"{q.pos:.0f}" for q in self.p.j)
             self.say(f"Q,{int(self.p.any_moving())},{cur}")

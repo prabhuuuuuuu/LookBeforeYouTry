@@ -8,7 +8,7 @@ from fake_board import FakeBoard
 from lbyr.arm.calib import JointCalib, JointsCalib
 from lbyr.arm.fw_planner import DEFAULT_ZERO_US
 from lbyr.arm.interface import DONE, ERROR, IDLE, MOVING
-from lbyr.arm.serial_arm import SerialArm, ZeroMismatchError
+from lbyr.arm.serial_arm import FirmwareTooOldError, SerialArm, ZeroMismatchError
 from lbyr.arm.text_proto import DoneMsg, ErrMsg, OkMsg
 from lbyr.config import JOINT_NAMES, ArmConfig, MotionConfig, mock_profile
 from lbyr.errors import ConfigError, HardwareNotConfirmedError, LBYRError
@@ -42,7 +42,7 @@ def test_connect_lists_compares_zeros_and_waits_for_idle() -> None:
     arm = make(board)
     arm.connect()
     try:
-        assert board.written[0] == "list" and "q" in board.written
+        assert board.written[:2] == ["q", "list"]  # firmware probe first
         s = arm.read_state()
         assert s.feedback == "commanded" and s.load is None
         assert s.joints == pytest.approx((0.0,) * 6, abs=0.1)
@@ -61,8 +61,24 @@ def test_zero_mismatch_refuses_to_move() -> None:
 
 def test_silent_board_fails_connect() -> None:
     arm = make(FakeBoard(answer=False))
-    with pytest.raises(LBYRError, match="did not answer 'list'"):
+    with pytest.raises(LBYRError, match="did not answer 'q'"):
         arm.connect()
+
+
+@pytest.mark.parametrize(
+    "board",
+    [
+        FakeBoard(q_reply="ERR unknown command; enter help"),
+        FakeBoard(q_reply="Q,0,1500,1500"),  # malformed Q
+        FakeBoard(old_s_lines=True),  # 6-field S lines
+    ],
+    ids=["q-err", "q-malformed", "s-6-fields"],
+)
+def test_old_firmware_is_refused(board: FakeBoard) -> None:
+    arm = make(board)
+    with pytest.raises(FirmwareTooOldError, match="reflash firmware/xiao_c6_bridge/Code.ino"):
+        arm.connect()
+    assert board.closed and not any(w.startswith("m ") for w in board.written)
 
 
 def test_move_sends_one_m_in_firmware_degrees_and_gets_done() -> None:

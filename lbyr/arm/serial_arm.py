@@ -10,7 +10,11 @@ completion = the firmware's ``DONE`` line. No setpoint streaming.
 - DONE pairing: the firmware prints ``OK m`` while handling ``m`` and the next ``DONE``
   after it. A DONE that arrives before the ``OK m`` of the latest segment belongs to an
   older motion and is ignored.
-- :meth:`connect` sends ``list``, compares the board's zero pulses with
+- The port is opened with DTR/RTS low (set before ``open()``) so it never resets the board.
+- :meth:`connect` first sends ``q`` and needs a well-formed ``Q`` within 1 s; ERR, a
+  malformed Q or S lines with fewer than 8 fields mean old firmware: refuse
+  (:class:`FirmwareTooOldError`, "reflash firmware/xiao_c6_bridge/Code.ino").
+- :meth:`connect` then sends ``list``, compares the board's zero pulses with
   ``data/calib/joints.yaml`` and refuses to move on any mismatch.
 - :meth:`move_joints` converts host degrees to zero-relative degrees (sign and zero_pose_deg
   from joints.yaml) and returns the duration predicted by the firmware planner port; the
@@ -51,11 +55,18 @@ log = logging.getLogger(__name__)
 READ_TIMEOUT_S = 0.05
 WRITE_TIMEOUT_S = 0.05
 LIST_TIMEOUT_S = 2.0
+PROBE_TIMEOUT_S = 1.0  # connect: a well-formed Q reply to 'q' within this
 BOOT_SETTLE_TIMEOUT_S = 20.0  # the board homes itself at boot (staggered attach)
+S_LINE_FIELDS = 8  # S,j,zero_us,cur_us,attached,goal_us,moving,name (current Code.ino)
+FW_TOO_OLD = "bridge firmware too old: reflash firmware/xiao_c6_bridge/Code.ino"
 
 
 class ZeroMismatchError(LBYRError):
     """The board's saved zeros differ from data/calib/joints.yaml: refuse to move."""
+
+
+class FirmwareTooOldError(LBYRError):
+    """The bridge does not speak the current text protocol (q -> Q, 8-field S lines)."""
 
 
 def detect_bridge_port(pattern: str = "/dev/ttyACM*") -> tuple[str | None, list[str]]:
@@ -85,11 +96,19 @@ PortFactory = Callable[[str, int], PortLike]
 
 
 def _pyserial_port(port: str, baud: int) -> PortLike:
+    """Open WITHOUT toggling DTR/RTS: set them low before open() so opening the port never
+    resets the ESP32-C6 (a reset would re-run the boot homing)."""
     import serial  # lazy: pyserial
 
-    p: Any = serial.Serial(
-        port=port, baudrate=baud, timeout=READ_TIMEOUT_S, write_timeout=WRITE_TIMEOUT_S
-    )
+    p: Any = serial.Serial()
+    p.port = port
+    p.baudrate = baud
+    p.timeout = READ_TIMEOUT_S
+    p.write_timeout = WRITE_TIMEOUT_S
+    p.dtr = False
+    p.rts = False
+    p.open()
+    p.reset_input_buffer()  # drop stale lines so the connect probe sees only fresh replies
     return p
 
 
@@ -124,6 +143,10 @@ class SerialArm(ArmInterface):
         self._attached = [True] * NUM_JOINTS
         self._planner: FirmwarePlanner | None = None
         self._planner_t = 0.0
+        # connect probe: first reply to 'q' (None = well-formed Q, else the bad line)
+        self._probing = False
+        self._probe_bad: str | None = None
+        self._probe_done = threading.Event()
 
     # ------------------------------------------------------------ setup
     def check_confirmed(self) -> None:
@@ -147,6 +170,7 @@ class SerialArm(ArmInterface):
         self._reader = threading.Thread(target=self._read_loop, name="bridge-rx", daemon=True)
         self._reader.start()
         try:
+            self._probe_firmware()
             rows, speed = self._read_list()
             board_zero = [rows[j].zero_us for j in range(1, NUM_JOINTS + 1)]
             bad = joints.zero_mismatches(board_zero)
@@ -200,6 +224,28 @@ class SerialArm(ArmInterface):
         log.info("bridge speed set: %.0f deg/s, %.0f deg/s^2", speed.vmax_deg, speed.amax_deg)
         return speed.vmax_deg, speed.amax_deg
 
+    def _probe_firmware(self) -> None:
+        """Send ``q``; require a well-formed ``Q,...`` within PROBE_TIMEOUT_S. ERR or a
+        malformed Q means an old bridge firmware: refuse before anything else is sent."""
+        with self._lock:
+            self._probing, self._probe_bad = True, None
+            self._probe_done.clear()
+        try:
+            self._write("q")
+            answered = self._probe_done.wait(PROBE_TIMEOUT_S)
+        finally:
+            with self._lock:
+                self._probing = False
+                bad = self._probe_bad
+        if not answered:
+            raise LBYRError(
+                f"bridge did not answer 'q' within {PROBE_TIMEOUT_S:.0f} s "
+                f"({self._cfg.serial_port}); check the USB cable and that the XIAO runs "
+                f"firmware/xiao_c6_bridge (if it does: {FW_TOO_OLD})"
+            )
+        if bad is not None:
+            raise FirmwareTooOldError(f"{FW_TOO_OLD} ('q' answered {bad!r})")
+
     def _read_list(self) -> tuple[dict[int, JointLine], SpeedLine]:
         with self._lock:
             self._rows.clear()
@@ -217,6 +263,11 @@ class SerialArm(ArmInterface):
         missing = [j for j in range(1, NUM_JOINTS + 1) if j not in rows]
         if missing or speed is None:
             raise LBYRError(f"incomplete 'list' reply (missing joints {missing})")
+        old = [j for j, r in sorted(rows.items()) if r.goal_us is None or r.moving is None]
+        if old:
+            raise FirmwareTooOldError(
+                f"{FW_TOO_OLD} (S lines of joints {old} have fewer than {S_LINE_FIELDS} fields)"
+            )
         return rows, speed
 
     def _wait_boot_settled(self) -> None:
@@ -262,10 +313,23 @@ class SerialArm(ArmInterface):
                 msg = parse_line(raw)
             except ProtocolError as e:
                 log.warning("bridge: unparseable line %r (%s)", raw, e)
+                if raw.lstrip().startswith(b"Q"):
+                    self._probe_reply(raw.decode("ascii", errors="replace").strip())
                 continue
             self._handle(msg)
 
+    def _probe_reply(self, bad: str | None) -> None:
+        """First reply to the connect 'q': None = well-formed Q, else the offending line."""
+        with self._lock:
+            if self._probing and not self._probe_done.is_set():
+                self._probe_bad = bad
+                self._probe_done.set()
+
     def _handle(self, msg: Any) -> None:
+        if isinstance(msg, StatusMsg):
+            self._probe_reply(None)
+        elif isinstance(msg, ErrMsg):
+            self._probe_reply(msg.text)
         with self._lock:
             if isinstance(msg, DoneMsg):
                 self._done_seq = self._ack_seq
