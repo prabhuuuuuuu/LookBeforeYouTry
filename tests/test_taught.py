@@ -187,7 +187,7 @@ def _run(script: tuple, scene: FakeScene | None = None):  # type: ignore[no-unty
 def test_taught_episode_moves_through_the_taught_poses() -> None:
     result, stack = _run((G, G, E))
     assert result.outcome == "success"
-    t = stack.supervisor._taught
+    t = stack.supervisor.targets.executor  # type: ignore[attr-defined]
     assert t is not None
     moves = [np.asarray(m) for m in stack.arm.moves]
     grasp = t.poses.pose("zone_A_grasp")
@@ -200,7 +200,7 @@ def test_taught_slipping_twice_reorients_joint_5() -> None:
     result, stack = _run((S, S, G, G, E))
     assert result.outcome == "success"
     assert [d for _, d in result.recovery_history] == ["+15% closure", "wrist re-orient 30 deg"]
-    t = stack.supervisor._taught
+    t = stack.supervisor.targets.executor  # type: ignore[attr-defined]
     assert t is not None
     grasp = t.poses.pose("zone_A_grasp")
     assert any(
@@ -213,7 +213,7 @@ def test_taught_slipping_twice_reorients_joint_5() -> None:
 def test_taught_empty_after_lift_uses_interpolated_pre_grasp() -> None:
     result, stack = _run((G, E, G, G, E))
     assert result.recovery_history == [(FailureClass.EMPTY, "re-approach, -5 mm standoff")]
-    t = stack.supervisor._taught
+    t = stack.supervisor.targets.executor  # type: ignore[attr-defined]
     assert t is not None
     pre, grasp = t.poses.pose("zone_A_pre"), t.poses.pose("zone_A_grasp")
     f = 5.0 / t.default_standoff_mm
@@ -227,7 +227,7 @@ def test_taught_object_outside_every_zone_aborts() -> None:
 
     cfg = _fast()
     stack = build(cfg, (G, G, E), critic_delay_s=0.01)  # type: ignore[arg-type]
-    t = stack.supervisor._taught
+    t = stack.supervisor.targets.executor  # type: ignore[attr-defined]
     assert t is not None
     far = Zone("A", ((0, 0), (5, 0), (5, 5)), 200.0)
     t.poses = TP(t.poses.poses, {"A": far}, 0.0, 90.0)

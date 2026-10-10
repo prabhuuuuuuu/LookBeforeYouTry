@@ -40,6 +40,10 @@ class IKError(LBYRError):
     """Target unreachable or outside joint limits."""
 
 
+class PerceptionError(LBYRError):
+    """PERCEIVE found nothing usable (no object, no valid depth) -> PERCEPTION_FAILED."""
+
+
 class ConfigError(LBYRError):
     """Configuration violates a locked project rule (e.g. temperature != 0)."""
 

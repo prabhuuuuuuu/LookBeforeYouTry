@@ -287,6 +287,9 @@ class SkillConfig:
     transport_height_mm: float = 80.0
     place_release_height_mm: float = 15.0
     default_closure_pct: float = 80.0  # bible 11.1 example
+    # --induce-slip (trials): closure % of the FIRST grasp only. Tuning, not a hardware value:
+    # check on the bench that the block is held loosely enough to slip.
+    induced_slip_closure_pct: float = 50.0
 
 
 @dataclass

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from lbyr.ai.critic import Verdict
@@ -239,7 +240,7 @@ def test_ik_mode_still_runs_end_to_end() -> None:
     cfg = fast_cfg()
     cfg.motion.mode = "ik"
     stack = build_mock_stack(cfg, DEMO_SCRIPT, critic_delay_s=0.01)
-    assert stack.supervisor._taught is None
+    assert stack.supervisor.targets.name == "ik"
     with stack:
         result = stack.supervisor.run_episode(SPEC, timeout_s=30.0)
     assert result.outcome == "success" and result.recoveries == 1
@@ -250,9 +251,11 @@ def test_ik_mode_still_runs_end_to_end() -> None:
 def test_taught_mode_requires_poses() -> None:
     from lbyr.errors import ConfigError
     from lbyr.fsm.supervisor import Supervisor
+    from lbyr.motion.ik import MockIK
+    from lbyr.motion.targets import IKTargets
 
     stack = build_mock_stack(fast_cfg(), HAPPY)
     deps = stack.supervisor.d
-    deps.taught = None
+    deps.targets = IKTargets(stack.cfg, MockIK(stack.cfg.arm), np.eye(4))
     with pytest.raises(ConfigError, match="taught"):
         Supervisor(stack.cfg, deps)

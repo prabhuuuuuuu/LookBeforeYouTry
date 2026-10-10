@@ -13,9 +13,13 @@
 - PLAN calls the planner under its 3 s hard timeout. This blocks only the FSM thread
   while the arm is idle; the board holds position by itself.
 - Failures -> RECOVER(k) per the recovery table, else ABORT with a human-readable report.
-- ``motion.mode = "taught"`` (default, demo path): skills map to taught joint poses
-  (:mod:`lbyr.motion.taught`); the target object's zone is the zone polygon containing its
-  detection centroid. ``"ik"``: Cartesian targets from the D435 + IK (needs OQ-4, hand-eye).
+- Joint targets come from a :class:`~lbyr.motion.targets.TargetProvider` (the supervisor never
+  computes them): ``motion.mode = "taught"`` (default, demo path) = taught joint poses + zone
+  polygons; ``"ik"`` = D435 depth + hand-eye + IK (needs OQ-4).
+- Optional hooks: ``SupervisorDeps.observer`` gets one :class:`LiveEvent` per transition
+  (terminal live view); ``EpisodeSpec.preset`` carries a plan made before the episode
+  (language mode, demo intro); ``EpisodeSpec.induce_slip`` makes the first grasp use
+  ``SkillConfig.induced_slip_closure_pct`` (logged as ``induced_slip``).
 """
 
 from __future__ import annotations
@@ -30,20 +34,28 @@ from typing import Any
 import numpy as np
 
 from lbyr.ai.critic import CriticResult, CriticWorker, Verdict
-from lbyr.ai.planner import Planner, PlanRequest, SkillChain, plan_with_timeout
+from lbyr.ai.planner import Planner, PlanRequest, PlanResult, SkillChain, plan_with_timeout
 from lbyr.arm.interface import ArmInterface
-from lbyr.config import GRIPPER_INDEX, WRIST_PITCH_INDEX, AppConfig
-from lbyr.errors import ConfigError, IKError
+from lbyr.config import WRIST_PITCH_INDEX, AppConfig
+from lbyr.errors import ConfigError, IKError, PerceptionError
 from lbyr.fsm.recovery import RECOVERY_TABLE, FailureClass, RecoveryBudget, classify
 from lbyr.fsm.states import VERIFY_STATES, State, next_in_pipeline
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor, make_record
 from lbyr.motion.controller import FAULT, MotionController
-from lbyr.motion.ik import CartesianTarget, IKSolver
-from lbyr.motion.taught import TaughtExecutor, Zone
+from lbyr.motion.targets import GoalPlan, GraspAdjustments, Scene, TargetProvider, Targets
 from lbyr.perception.buffers import LatestValueBuffer
 from lbyr.perception.detector import Detection, Detector
-from lbyr.perception.geometry import locate_in_base
 from lbyr.perception.overhead import RGBDFrame
+
+__all__ = [
+    "EpisodeResult",
+    "EpisodeSpec",
+    "GraspAdjustments",
+    "LiveEvent",
+    "Supervisor",
+    "SupervisorDeps",
+    "VerdictInfo",
+]
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +66,16 @@ def _shape_str(image: np.ndarray | None) -> str | None:
     return None if image is None else f"{image.shape[1]}x{image.shape[0]}"
 
 
+def _det_dict(d: Detection) -> dict[str, Any]:
+    out: dict[str, Any] = {"id": d.id, "label": d.label, "bbox_xyxy": d.bbox_xyxy}
+    out["centroid_px"] = d.centroid
+    for k in ("yaw_deg", "xyz_cam_mm", "zone", "area_px"):
+        v = getattr(d, k, None)
+        if v is not None:
+            out[k] = v
+    return out
+
+
 PERCEIVE_MAX_WAIT_TICKS = 20
 VERIFY_WATCHDOG_MARGIN_S = 1.0
 
@@ -62,34 +84,43 @@ VERIFY_WATCHDOG_MARGIN_S = 1.0
 class EpisodeSpec:
     instruction: str
     expected_label: str | None = None  # WRONG_OBJECT re-check vs detected class
+    induce_slip: bool = False  # first grasp at SkillConfig.induced_slip_closure_pct
+    preset: PlanResult | None = None  # plan made before the episode (language mode intro)
+
+
+@dataclass(frozen=True)
+class VerdictInfo:
+    state: State
+    verdict: Verdict
+    raw_text: str | None
+    latency_ms: float
+
+
+@dataclass(frozen=True)
+class LiveEvent:
+    """One FSM transition for the terminal live view."""
+
+    t: float
+    src: State
+    dst: State
+    reason: str
+    verdict: VerdictInfo | None = None  # the Critic answer that caused this transition
+    recovery: str | None = None  # "k=1 +15% closure" on transitions out of RECOVER
 
 
 @dataclass
 class SupervisorDeps:
     arm: ArmInterface
     motion: MotionController
-    ik: IKSolver
     planner: Planner
     detector: Detector
-    overhead: LatestValueBuffer[RGBDFrame]
-    wrist: LatestValueBuffer[np.ndarray]
-    base_T_cam: np.ndarray
+    overhead: LatestValueBuffer[RGBDFrame] | None  # None = no overhead camera (--zone)
+    wrist: LatestValueBuffer[np.ndarray] | None  # None only with the Critic OFF
+    targets: TargetProvider  # joint targets: taught poses or IK (motion.mode)
     critic: CriticWorker | None  # None = "Critic OFF" baseline
     logger: EpisodeLogger | None = None
     vram: VramMonitor | None = None
-    taught: TaughtExecutor | None = None  # required when motion.mode == "taught"
-
-
-@dataclass
-class GraspAdjustments:
-    """Accumulated recovery deltas, applied on top of the planner's skill parameters."""
-
-    closure_delta_pct: float = 0.0
-    wrist_roll_deg: float = 0.0
-    lateral_offset_mm: float = 0.0
-    # EMPTY recovery "-5 mm standoff": IK mode = grasp 5 mm lower (D-8); taught mode = the
-    # pre-grasp pose moves toward the grasp pose (lbyr.motion.taught).
-    grasp_z_offset_mm: float = 0.0
+    observer: Callable[[LiveEvent], None] | None = None  # terminal live view
 
 
 @dataclass(frozen=True)
@@ -111,6 +142,11 @@ class EpisodeResult:
     verdicts: list[Verdict]
     transitions: list[Transition]
     report: str
+    verdict_log: list[VerdictInfo] = field(default_factory=list)
+    induced_slip: bool = False  # the first grasp really used the induced closure
+    planner_latency_ms: float | None = None
+    duration_s: float = 0.0
+    detections: list[Detection] = field(default_factory=list)  # last PERCEIVE
 
 
 @dataclass
@@ -119,11 +155,16 @@ class _EpisodeCtx:
     episode_id: str
     budget: RecoveryBudget
     adj: GraspAdjustments = field(default_factory=GraspAdjustments)
-    detections: dict[int, Detection] = field(default_factory=dict)
-    positions: dict[int, np.ndarray] = field(default_factory=dict)
+    scene: Scene | None = None
     chain: SkillChain | None = None
-    zone: Zone | None = None  # taught mode: zone of the target object
-    grasp_xyz: np.ndarray | None = None
+    targets: Targets | None = None
+    grasps: int = 0  # GRASP entries this episode
+    induced_active: bool = False  # current grasp uses the induced-slip closure
+    induced_used: bool = False
+    t_start: float = 0.0
+    last_verdict: VerdictInfo | None = None  # consumed by the next transition (live view)
+    last_recovery: str | None = None
+    verdict_log: list[VerdictInfo] = field(default_factory=list)
     target: dict[str, Any] | None = None
     failure: FailureClass | None = None
     failure_detail: str = ""
@@ -143,9 +184,14 @@ class Supervisor:
         cfg.validate()
         self.cfg = cfg
         self.d = deps
-        self._taught = deps.taught
-        if cfg.motion.mode == "taught" and self._taught is None:
-            raise ConfigError("motion.mode = 'taught' needs taught poses (SupervisorDeps.taught)")
+        self.targets = deps.targets
+        if deps.targets.name != cfg.motion.mode:
+            raise ConfigError(
+                f"motion.mode = {cfg.motion.mode!r} but the target provider is "
+                f"{deps.targets.name!r} (taught mode needs taught poses)"
+            )
+        if deps.critic is not None and deps.wrist is None:
+            raise ConfigError("the Critic needs the wrist camera buffer")
         self.state = State.IDLE
         self._ctx: _EpisodeCtx | None = None
         # motion bookkeeping
@@ -195,6 +241,7 @@ class Supervisor:
             spec=spec,
             episode_id=time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6],
             budget=RecoveryBudget(max_total=self.cfg.recovery.max_total_recoveries),
+            t_start=time.perf_counter(),
         )
         self.state = State.IDLE
         log.info(
@@ -205,7 +252,7 @@ class Supervisor:
         )
         self.d.motion.set_output_enabled(True)
         self.d.arm.torque(True)
-        self._record("episode_start")
+        self._record("episode_start", induce_slip=spec.induce_slip, motion_mode=self.targets.name)
         period = 1.0 / self.cfg.fsm_rate_hz
         t_end = time.perf_counter() + timeout_s
         next_t = time.perf_counter()
@@ -229,9 +276,24 @@ class Supervisor:
     def _transition(self, dst: State, reason: str) -> None:
         src = self.state
         self.state = dst
-        self.ctx.transitions.append(Transition(time.time(), src, dst, reason))
+        c = self.ctx
+        c.transitions.append(Transition(time.time(), src, dst, reason))
         log.info("FSM %-12s -> %-12s | %s", src.value, dst.value, reason)
         self._record("transition", from_state=src, reason=reason)
+        if self.d.observer is not None:
+            event = LiveEvent(
+                time.time(),
+                src,
+                dst,
+                reason,
+                c.last_verdict,
+                c.last_recovery if src is State.RECOVER else None,
+            )
+            try:
+                self.d.observer(event)
+            except Exception:  # the live view must never break the episode
+                log.exception("live view observer failed")
+        c.last_verdict = None
         nxt = self._enter[dst]()
         if nxt is not None:
             self._transition(*nxt)
@@ -258,6 +320,7 @@ class Supervisor:
         c.adj.grasp_z_offset_mm += action.standoff_delta_mm
         c.reentry = action.reentry or c.failed_state
         k = c.budget.total
+        c.last_recovery = f"k={k} {action.description}"
         log.info("RECOVER(k=%d) %s -> %s", k, action.description, c.reentry.value)
         self._record("recover", action=action.description, attempt=k)
         if action.reposition_wrist_cam:  # one-off camera move; later poses come from IK again
@@ -282,180 +345,119 @@ class Supervisor:
         return self._tick_perceive()
 
     def _tick_perceive(self) -> Next:
-        item = self.d.overhead.get()
-        if item is None:
-            self._perceive_waits += 1
-            if self._perceive_waits > PERCEIVE_MAX_WAIT_TICKS:
-                return self._fail(FailureClass.PERCEPTION_FAILED, "no overhead frame")
-            return None
-        frame = item.value
-        dets = self.d.detector.detect(frame.color)
+        frame: RGBDFrame | None = None
+        if self.d.overhead is not None:
+            item = self.d.overhead.get()
+            if item is None:
+                self._perceive_waits += 1
+                if self._perceive_waits > PERCEIVE_MAX_WAIT_TICKS:
+                    return self._fail(FailureClass.PERCEPTION_FAILED, "no overhead frame")
+                return None
+            frame = item.value
+            self._save_frame(frame.color, "overhead")
+        dets = self.d.detector.detect(frame)
         c = self.ctx
-        c.detections, c.positions = {}, {}
-        if self._taught is not None:  # taught mode: 2D detections + zones, no depth
-            c.detections = {d.id: d for d in dets}
-            if not any("zone" not in d.label for d in dets):
-                return self._fail(FailureClass.PERCEPTION_FAILED, "no object detected")
-            if not any("zone" in d.label for d in dets):
-                place = self._taught.place_detection()  # planner place target
-                c.detections[place.id] = place
-            return State.PLAN, f"{len(dets)} objects detected"
-        for det in dets:
-            u, v = det.centroid
-            p = locate_in_base(
-                u,
-                v,
-                frame.depth_mm,
-                frame.intrinsics,
-                self.d.base_T_cam,
-                self.cfg.cameras.overhead.depth_median_window,
-            )
-            if p is not None:
-                c.detections[det.id] = det
-                c.positions[det.id] = p
-        if not c.positions:
-            return self._fail(FailureClass.PERCEPTION_FAILED, "no detections with valid depth")
-        return State.PLAN, f"{len(c.positions)} objects localised"
+        self._record("detections", detections=[_det_dict(d) for d in dets])
+        c.scene = None
+        try:
+            c.scene = self.targets.scene(dets, frame)
+        except PerceptionError as e:
+            return self._fail(FailureClass.PERCEPTION_FAILED, str(e))
+        return State.PLAN, c.scene.summary
 
     def _enter_plan(self) -> Next:
         c = self.ctx
-        req = PlanRequest(c.spec.instruction, list(c.detections.values()))
-        res = plan_with_timeout(self.d.planner, req, self.cfg.planner)
+        assert c.scene is not None
+        dets = c.scene.detections
+        if c.spec.preset is not None:  # language mode: planned before the episode
+            res = c.spec.preset
+            chain = res.chain
+            if chain is not None and not {chain.approach.target_id, chain.place.target_id} <= set(
+                dets
+            ):
+                res = PlanResult(
+                    None,
+                    res.latency_ms,
+                    res.raw_text,
+                    "preset plan ids not detected now",
+                    res.trace,
+                )
+        else:
+            req = PlanRequest(c.spec.instruction, list(dets.values()))
+            res = plan_with_timeout(self.d.planner, req, self.cfg.planner)
         c.planner_latency_ms = res.latency_ms
         # Reasoning trace (prompt, raw output, parsed chain) for the dashboard.
         trace = res.trace.to_dict() if res.trace is not None else None
         self._record("reasoning_trace", plan_error=res.error, trace=trace)
         if res.chain is None:
             return self._fail(FailureClass.PLANNER_FAILED, res.error or "no plan")
-        label = c.detections[res.chain.approach.target_id].label
+        label = dets[res.chain.approach.target_id].label
         if c.spec.expected_label is not None and label != c.spec.expected_label:
             return self._fail(
                 FailureClass.WRONG_OBJECT,
                 f"planner chose {label!r}, expected {c.spec.expected_label!r}",
             )
-        if self._taught is not None:
-            try:
-                c.zone = self._taught.zone_for(c.detections[res.chain.approach.target_id])
-            except IKError as e:
-                return self._fail(FailureClass.IK_FAILED, str(e))
+        try:
+            c.targets = self.targets.bind(
+                c.scene,
+                res.chain.approach.target_id,
+                res.chain.place.target_id,
+                res.chain.approach.standoff_mm,
+            )
+        except IKError as e:
+            return self._fail(FailureClass.IK_FAILED, str(e))
         c.chain = res.chain
-        zone = f", zone {c.zone.name}" if c.zone is not None else ""
+        zone = f", zone {c.targets.zone.name}" if c.targets.zone is not None else ""
         return State.APPROACH, f"plan ok in {res.latency_ms:.0f} ms{zone}"
 
     # ================================================================ motion states
     def _closure_pct(self) -> float:
-        assert self.ctx.chain is not None
-        return min(100.0, self.ctx.chain.grasp.closure + self.ctx.adj.closure_delta_pct)
-
-    def _gripper_deg(self, closure_pct: float) -> float:
-        if self._taught is not None:
-            return self._taught.poses.gripper_deg(closure_pct)
-        return self.cfg.arm.gripper.closure_to_deg(closure_pct)
-
-    def _taught_goals(
-        self, label: str, make: Callable[[TaughtExecutor, Zone], list[np.ndarray]]
-    ) -> Next:
-        """Taught mode: build the goals with ``make`` and start the motion."""
         c = self.ctx
-        assert self._taught is not None and c.zone is not None
-        try:
-            goals = make(self._taught, c.zone)
-        except IKError as e:  # TaughtPoseError: missing pose / radius
-            return self._fail(FailureClass.IK_FAILED, f"{label}: {e}")
-        c.target = {"label": label, "zone": c.zone.name, "joints_deg": goals[-1]}
-        self._start_motion(goals)
-        return None
+        assert c.chain is not None
+        if c.induced_active:  # --induce-slip: the first grasp is deliberately loose
+            return self.cfg.skills.induced_slip_closure_pct
+        return min(100.0, c.chain.grasp.closure + c.adj.closure_delta_pct)
 
-    def _pose(self, xyz: np.ndarray, gripper_deg: float) -> np.ndarray:
-        """IK for a top-down TCP pose + gripper -> 6-joint goal (deg)."""
-        target = CartesianTarget(
-            (float(xyz[0]), float(xyz[1]), float(xyz[2])), self.ctx.adj.wrist_roll_deg
-        )
-        q = self.d.ik.solve(target, self._setpoint()[:GRIPPER_INDEX].tolist())
-        return np.array([*q, gripper_deg], dtype=float)
-
-    def _plan_goals(self, poses: list[tuple[np.ndarray, float]], label: str) -> Next:
+    def _skill_goals(self, label: str, make: Callable[[Targets, np.ndarray], GoalPlan]) -> Next:
+        """Ask the target provider for this skill's goals and start the motion."""
+        c = self.ctx
+        assert c.targets is not None
         try:
-            goals = [self._pose(xyz, g) for xyz, g in poses]
-        except IKError as e:
+            plan = make(c.targets, self._setpoint())
+        except IKError as e:  # IK failure, or a missing taught pose / radius
             return self._fail(FailureClass.IK_FAILED, f"{label}: {e}")
-        self.ctx.target = {"label": label, "xyz_mm": poses[-1][0]}
-        self._start_motion(goals)
+        c.target = {"label": label, **plan.info}
+        self._start_motion(plan.goals)
         return None
 
     def _enter_approach(self) -> Next:
-        c = self.ctx
-        assert c.chain is not None
-        if self._taught is not None:
-            a, here = c.adj, self._setpoint()
-            return self._taught_goals(
-                "grasp",
-                lambda t, z: t.approach_goals(
-                    z, here, a.wrist_roll_deg, a.lateral_offset_mm, a.grasp_z_offset_mm
-                ),
-            )
-        obj = c.positions[c.chain.approach.target_id]
-        grasp = np.array(
-            [
-                obj[0],
-                obj[1] + c.adj.lateral_offset_mm,
-                obj[2] / 2.0
-                + c.adj.grasp_z_offset_mm,  # mid-height of an object resting on the mat
-            ]
-        )
-        c.grasp_xyz = grasp
-        pre = grasp + [0.0, 0.0, c.chain.approach.standoff_mm]
-        open_deg = self._gripper_deg(0.0)
-        open_in_place = self._setpoint()
-        open_in_place[GRIPPER_INDEX] = open_deg
-        try:
-            goals = [open_in_place, self._pose(pre, open_deg), self._pose(grasp, open_deg)]
-        except IKError as e:
-            return self._fail(FailureClass.IK_FAILED, f"approach: {e}")
-        c.target = {"label": "grasp", "xyz_mm": grasp}
-        self._start_motion(goals)
-        return None
+        a = self.ctx.adj
+        return self._skill_goals("grasp", lambda t, here: self.targets.approach_goals(t, here, a))
 
     def _enter_grasp(self) -> Next:
-        goal = self._setpoint()
-        goal[GRIPPER_INDEX] = self._gripper_deg(self._closure_pct())
-        self.ctx.target = {"label": "close", "closure_pct": self._closure_pct()}
-        self._start_motion([goal])
-        return None
+        c = self.ctx
+        c.induced_active = c.spec.induce_slip and c.grasps == 0
+        c.grasps += 1
+        pct = self._closure_pct()
+        if c.induced_active:
+            c.induced_used = True
+            self._record("induced_slip", closure_pct=pct)
+            log.warning("INDUCED SLIP: first grasp closes to %.0f%% only", pct)
+        return self._skill_goals("close", lambda t, here: self.targets.grasp_goals(here, pct))
 
     def _enter_lift(self) -> Next:
-        if self._taught is not None:
-            a, pct = self.ctx.adj, self._closure_pct()
-            return self._taught_goals(
-                "lift", lambda t, z: t.lift_goals(z, pct, a.wrist_roll_deg, a.lateral_offset_mm)
-            )
-        assert self.ctx.grasp_xyz is not None
-        up = self.ctx.grasp_xyz + [0.0, 0.0, self.cfg.skills.lift_height_mm]
-        return self._plan_goals([(up, self._gripper_deg(self._closure_pct()))], "lift")
-
-    def _place_xy(self) -> np.ndarray:
-        assert self.ctx.chain is not None
-        return self.ctx.positions[self.ctx.chain.place.target_id]
+        a, pct = self.ctx.adj, self._closure_pct()
+        return self._skill_goals("lift", lambda t, here: self.targets.lift_goals(t, here, pct, a))
 
     def _enter_transport(self) -> Next:
-        if self._taught is not None:
-            pct = self._closure_pct()
-            return self._taught_goals("transport", lambda t, z: t.transport_goals(pct))
-        p = self._place_xy()
-        xyz = np.array([p[0], p[1], self.cfg.skills.transport_height_mm])
-        return self._plan_goals([(xyz, self._gripper_deg(self._closure_pct()))], "transport")
+        a, pct = self.ctx.adj, self._closure_pct()
+        return self._skill_goals(
+            "transport", lambda t, here: self.targets.transport_goals(t, here, pct, a)
+        )
 
     def _enter_place(self) -> Next:
-        if self._taught is not None:
-            pct = self._closure_pct()
-            return self._taught_goals("place", lambda t, z: t.place_goals(pct))
-        assert self.ctx.grasp_xyz is not None
-        p = self._place_xy()
-        z = p[2] + self.ctx.grasp_xyz[2] + self.cfg.skills.place_release_height_mm
-        release = np.array([p[0], p[1], z])
-        retreat = release + [0.0, 0.0, self.cfg.skills.lift_height_mm]
-        closed, opened = self._gripper_deg(self._closure_pct()), self._gripper_deg(0.0)
-        return self._plan_goals([(release, closed), (release, opened), (retreat, opened)], "place")
+        a, pct = self.ctx.adj, self._closure_pct()
+        return self._skill_goals("place", lambda t, here: self.targets.place_goals(t, here, pct, a))
 
     def _tick_motion_state(self) -> Next:
         res = self._motion_tick()
@@ -468,8 +470,12 @@ class Supervisor:
     # ================================================================ verify
     def _enter_verify(self) -> Next:
         if self.d.critic is None:
+            if self.d.wrist is not None and (w := self.d.wrist.get()) is not None:
+                self._save_frame(w.value, "raw")
+            self._save_overhead("overhead")
             self._record("verdict", verdict=None, critic_skipped=True)
             return next_in_pipeline(self.state), "Critic OFF: pass-through"
+        assert self.d.wrist is not None
         item = self.d.wrist.get()
         if item is None:
             return self._fail(FailureClass.CRITIC_UNAVAILABLE, "no wrist frame")
@@ -481,6 +487,7 @@ class Supervisor:
             time.perf_counter() + self.cfg.critic.timeout_s + VERIFY_WATCHDOG_MARGIN_S
         )
         self._save_frame(item.value, "raw")
+        self._save_overhead("overhead")
         return None
 
     def _tick_verify(self) -> Next:
@@ -498,6 +505,9 @@ class Supervisor:
         c = self.ctx
         self._pending_rid = None
         c.verdicts.append(r.verdict)
+        info = VerdictInfo(self.state, r.verdict, r.raw_text, r.latency_ms)
+        c.verdict_log.append(info)
+        c.last_verdict = info
         frame = self._save_frame(r.image_bgr, "judged") if r.image_bgr is not None else None
         self._record(
             "verdict",
@@ -606,17 +616,7 @@ class Supervisor:
         return np.asarray(self.d.motion.current().goal, dtype=float)
 
     def _safe_pose(self) -> np.ndarray | None:
-        if self._taught is not None:  # taught 'home' pose (A-3 decided per poses.yaml)
-            try:
-                return self._taught.safe_pose(float(self._setpoint()[GRIPPER_INDEX]))
-            except IKError:
-                return None
-        safe = self.cfg.arm.safe_pose_deg
-        if safe is None:
-            return None
-        goal = np.asarray(safe, dtype=float)
-        goal[GRIPPER_INDEX] = self._setpoint()[GRIPPER_INDEX]  # do not drop a held object
-        return goal
+        return self.targets.safe_pose(self._setpoint())
 
     def _start_motion(self, goals: list[np.ndarray]) -> None:
         self._goals = list(goals)
@@ -689,6 +689,11 @@ class Supervisor:
             f"{c.episode_id}/{c.frame_n:03d}_{self.state.value}_{tag}.jpg", image
         )
 
+    def _save_overhead(self, tag: str) -> None:
+        """Decision-point overhead frame (if an overhead camera runs)."""
+        if self.d.overhead is not None and (item := self.d.overhead.get()) is not None:
+            self._save_frame(item.value.color, tag)
+
     def _report(self, outcome: str) -> str:
         c = self.ctx
         path = [State.IDLE.value] + [t.dst.value for t in c.transitions]
@@ -722,4 +727,9 @@ class Supervisor:
             verdicts=list(c.verdicts),
             transitions=list(c.transitions),
             report=self._report("success" if self.state is State.DONE else "abort"),
+            verdict_log=list(c.verdict_log),
+            induced_slip=c.induced_used,
+            planner_latency_ms=c.planner_latency_ms,
+            duration_s=time.perf_counter() - c.t_start,
+            detections=list(c.scene.detections.values()) if c.scene is not None else [],
         )
