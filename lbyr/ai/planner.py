@@ -365,6 +365,21 @@ def plan_with_timeout(planner: Planner, request: PlanRequest, cfg: PlannerConfig
     )
 
 
+def plan_demo_intro(planner: QwenPlanner, request: PlanRequest, timeout_s: float) -> PlanResult:
+    """lbyr.demo intro plan: image + full schema under ``timeout_s`` (DemoConfig, 30 s),
+    strictly validated like an in-loop plan. Runs once before the motion sequence, with the
+    arm idle; never inside the FSM loop (in-loop calls keep the 3 s timeout)."""
+    return _timed_plan(
+        lambda: planner.generate_within(request, timeout_s),
+        lambda raw: raw,
+        request,
+        timeout_s,
+        backend=lambda: "qwen",
+        prompt=lambda: planner.prompt_for(request),
+        mode="demo",
+    )
+
+
 class LanguagePlanner(Protocol):
     """A model planner with the text-only compact "language mode" (QwenPlanner)."""
 
@@ -614,9 +629,9 @@ class QwenEngine(Protocol):
 
 
 class _HFQwenEngine:
-    """transformers Qwen2.5-VL-3B-Instruct, FP16, greedy. torch is imported lazily."""
+    """transformers Qwen2.5-VL-3B-Instruct, FP16 (or BF16), greedy. torch imported lazily."""
 
-    def __init__(self, path: Path, device: str) -> None:
+    def __init__(self, path: Path, device: str, dtype: str = "fp16") -> None:
         force_offline()  # edge-only: never touch the network
         import torch
         from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
@@ -625,7 +640,10 @@ class _HFQwenEngine:
         self._device = device
         self._processor: Any = AutoProcessor.from_pretrained(str(path), local_files_only=True)
         self._model: Any = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            str(path), dtype=torch.float16, device_map={"": device}, local_files_only=True
+            str(path),
+            dtype=torch.bfloat16 if dtype == "bf16" else torch.float16,
+            device_map={"": device},
+            local_files_only=True,
         ).eval()
 
     def run(
@@ -675,7 +693,7 @@ class QwenPlanner:
             if cfg.model_path is None:
                 raise ConfigError("PlannerConfig.model_path is not set (local weights only)")
             t0 = time.perf_counter()
-            engine = _HFQwenEngine(cfg.model_path, cfg.device)
+            engine = _HFQwenEngine(cfg.model_path.expanduser(), cfg.device, cfg.vl_dtype)
             log.info("Qwen2.5-VL loaded in %.1f s", time.perf_counter() - t0)
             log_cuda_allocated("Qwen2.5-VL planner")
         self._engine = engine
@@ -701,6 +719,10 @@ class QwenPlanner:
 
     def generate(self, request: PlanRequest) -> str:
         return self._generate(request, self.cfg.max_new_tokens, self.cfg.timeout_s)
+
+    def generate_within(self, request: PlanRequest, max_time_s: float) -> str:
+        """Demo intro ONLY (lbyr.demo, arm idle): full plan with its own ``max_time``."""
+        return self._generate(request, self.cfg.max_new_tokens, max_time_s)
 
     def generate_untimed(self, request: PlanRequest) -> str:
         """BENCHMARK/TOOLS ONLY: like :meth:`generate` but without the self-imposed

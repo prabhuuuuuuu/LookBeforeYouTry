@@ -193,6 +193,7 @@ class PlannerConfig:
     model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     model_path: Path | None = None  # local weights only; no downloads at runtime
     max_new_tokens: int = 256
+    vl_dtype: str = "fp16"  # Qwen2.5-VL weights dtype: "fp16" | "bf16" (lbyr.demo uses bf16)
     # "rules" (RuleBasedPlanner, no model, no GPU) | "qwen". Default rules: Qwen is NOT loaded
     # unless backend = "qwen" (measured 11.2 s per full plan on the Orin NX, bible 9.2).
     backend: str = "rules"
@@ -222,6 +223,8 @@ class PlannerConfig:
             raise ConfigError("planner.language_max_new_tokens must be >= 1")
         if self.language_backend not in LANGUAGE_BACKENDS:
             raise ConfigError(f"planner.language_backend must be one of {LANGUAGE_BACKENDS}")
+        if self.vl_dtype not in MODEL_DTYPES:
+            raise ConfigError(f"planner.vl_dtype must be one of {MODEL_DTYPES}")
         if self.language_dtype not in MODEL_DTYPES:
             raise ConfigError(f"planner.language_dtype must be one of {MODEL_DTYPES}")
         if self.qwen_min_free_ram_mb < 0.0:
@@ -347,6 +350,26 @@ class LoggingConfig:
     episodes_dir: Path = DATA_DIR / "episodes"
     log_every_tick: bool = False  # True = also log every 10 Hz FSM tick
     tegrastats_interval_ms: int = 1000
+
+
+@dataclass
+class DemoConfig:
+    """``python -m lbyr.demo`` (live demo, taught poses). Tuning values, not hardware specs."""
+
+    instruction: str = "pick up the wooden block and place it in the place zone"
+    qwen_path: Path = Path("~/models/qwen2.5-vl-3b")  # local weights only
+    qwen_dtype: str = "bf16"
+    # Demo intro plan ONLY (before the motion sequence, arm idle). Not an in-loop call.
+    qwen_timeout_s: float = 30.0
+    moondream_path: Path = Path("~/models/moondream2")
+    min_free_ram_mb: float = 1024.0  # after Moondream loads: below this, Qwen is freed
+    regrasp_step_pct: float = 15.0  # bible 13: +15% closure per re-grasp
+    max_regrasps: int = 2  # bible 10: k <= 2
+    http_host: str = "0.0.0.0"
+    http_port: int = 8000
+    # Wrist camera: None = first /dev/video* capture node that is not the D435 (OQ-7).
+    wrist_device: str | None = None
+    settle_s: float = 0.3  # wait after DONE before grabbing the wrist frame for the Critic
 
 
 @dataclass

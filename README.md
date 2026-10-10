@@ -78,6 +78,24 @@ Taught-mode recovery: +15% closure → joint 6; wrist re-orient 30° → joint 5
 joint-space segment zone_X_pre → zone_X_grasp by 5 / standoff_mm (not a straight line in
 Cartesian space; the grasp pose is unchanged).
 
+## Live demo (`python -m lbyr.demo`)
+
+```bash
+python -m lbyr.demo --dry-run --induce-slip   # rehearsal: MockArm, fake cameras, fake Critic
+python -m lbyr.demo                           # real arm + D435 + Trinet + Qwen + Moondream
+python -m lbyr.demo --induce-slip             # first grasp loose -> SLIPPING -> re-grasp +15%
+python -m lbyr.demo --no-planner              # skip Qwen (rules planner)
+```
+
+Open `http://<jetson-ip>:8000`: overhead and wrist video, FSM state, Qwen plan (raw and
+parsed), every Critic verdict with its latency, and the recovery steps. Requirements:
+`joints.yaml` with `verified: true`; `poses.yaml` with `home`, `zone_A_pre`,
+`zone_A_grasp`, `place_pre`, `place` and `gripper.open_deg/closed_deg` (closed = on the
+block; re-grasps squeeze 15% further, never past 0° = fully shut). The bridge is
+auto-detected (`--port`). The wrist camera is the first `/dev/video*` that is not the D435
+(`--wrist-dev`). The operator must type `y` to confirm the E-stop. Logs are written to
+`data/episodes/demo-<stamp>/`.
+
 ## Jetson install
 
 JetPack provides CUDA-enabled OpenCV, torch and pyrealsense2 (the last one built from
