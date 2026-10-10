@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import itertools
 import logging
-import os
 import queue
 import threading
 import time
@@ -24,6 +23,7 @@ import numpy as np
 
 from lbyr.ai.cuda_mem import log_cuda_allocated
 from lbyr.ai.imaging import bgr_to_pil
+from lbyr.ai.offline import force_offline
 from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
 from lbyr.config import CriticConfig
 from lbyr.errors import ConfigError, LBYRError
@@ -105,7 +105,7 @@ def _load_moondream2(path: Path, device: str) -> Any:
     of the image crops, so FP16 needs two things: casting the weights, and a forward
     pre-hook that casts the crops to the weight dtype. Outputs were checked to match bf16.
     """
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")  # edge-only: never touch the network
+    force_offline()  # edge-only: never touch the network
     import torch
     from transformers import AutoModelForCausalLM
 

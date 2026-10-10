@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import re
 import threading
 import time
@@ -29,6 +28,7 @@ import numpy as np
 
 from lbyr.ai.cuda_mem import log_cuda_allocated
 from lbyr.ai.imaging import bgr_to_pil
+from lbyr.ai.offline import force_offline
 from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
 from lbyr.config import PlannerConfig, SkillConfig
 from lbyr.errors import ConfigError, LBYRError, PlannerTimeoutError, PlanValidationError
@@ -396,7 +396,7 @@ class _HFQwenEngine:
     """transformers Qwen2.5-VL-3B-Instruct, FP16, greedy. torch is imported lazily."""
 
     def __init__(self, path: Path, device: str) -> None:
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")  # edge-only: never touch the network
+        force_offline()  # edge-only: never touch the network
         import torch
         from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
