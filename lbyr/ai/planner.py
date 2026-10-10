@@ -8,7 +8,11 @@ The planner NEVER outputs joint angles; IK produces joints. Contract::
         {"skill": "place", "target_id": 5}],
      "notes": "..."}
 
-Temperature 0, 3 s hard timeout (enforced by :func:`plan_with_timeout`).
+Temperature 0, 3 s hard timeout for every in-loop call (:func:`plan_with_timeout`).
+Default backend is the rule-based planner; Qwen is only loaded with ``backend = "qwen"``.
+Qwen "language mode" (:func:`plan_language`, demo intro only): text-only prompt, compact
+schema ``{"a":2,"s":40,"g":80,"p":5}``, its own ``qwen_timeout_s`` (8 s). Every path goes
+through the strict :func:`parse_skill_chain`. Each result carries a :class:`ReasoningTrace`.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 
@@ -172,6 +176,60 @@ def build_planner_prompt(request: PlanRequest, bbox_scale: float = 1.0) -> str:
     )
 
 
+# Qwen "language mode" (demo intro only): compact output, about 15-20 tokens instead of ~98.
+#   a = approach target_id, s = standoff_mm, g = grasp closure %, p = place target_id
+COMPACT_KEYS: tuple[str, ...] = ("a", "s", "g", "p")
+
+
+def build_language_prompt(
+    request: PlanRequest, standoff_mm: float = 40.0, closure_pct: float = 80.0
+) -> str:
+    """Text-only prompt: task + detections as compact JSON (id, label, pixel centre).
+    No image is sent. Defaults are the bible 11.1 example values."""
+    objs = json.dumps(
+        [
+            {"id": d.id, "label": d.label, "xy": [round(c) for c in d.centroid]}
+            for d in request.detections
+        ],
+        separators=(",", ":"),
+    )
+    return (
+        "You are a robot task planner. Output ONLY one line of minified JSON, no prose:\n"
+        '{"a":<id to pick up>,"s":<approach standoff mm>,"g":<grip closure %>,'
+        '"p":<id to place on>}\n'
+        f"Use s={standoff_mm:g} and g={closure_pct:g} unless the task says otherwise. "
+        "Use only ids from Objects. Never output joint angles.\n"
+        f"Objects (xy = pixel centre in the overhead image): {objs}\n"
+        f"Task: {request.instruction}"
+    )
+
+
+def expand_compact_plan(text: str) -> str:
+    """Strictly map the compact language-mode output to the canonical contract JSON.
+
+    Exactly the keys ``a, s, g, p`` (no notes, nothing else); values are passed through
+    unchanged so :func:`parse_skill_chain` (the only path to skills) checks types, ranges and
+    ids. Raises :class:`PlanValidationError`.
+    """
+    try:
+        obj = json.loads(_strip_code_fence(text))
+    except json.JSONDecodeError as e:
+        raise PlanValidationError(f"compact plan is not JSON: {e.msg}") from e
+    if not isinstance(obj, dict) or set(obj) != set(COMPACT_KEYS):
+        got = sorted(obj) if isinstance(obj, dict) else type(obj).__name__
+        raise PlanValidationError(f"compact plan keys must be exactly {list(COMPACT_KEYS)}: {got}")
+    return json.dumps(
+        {
+            "skill_chain": [
+                {"skill": "approach", "target_id": obj["a"], "standoff_mm": obj["s"]},
+                {"skill": "grasp", "closure": obj["g"]},
+                {"skill": "place", "target_id": obj["p"]},
+            ],
+            "notes": "",
+        }
+    )
+
+
 # ------------------------------------------------------------------ parsing
 def _strip_code_fence(text: str) -> str:
     s = text.strip()
@@ -302,6 +360,44 @@ def plan_with_timeout(planner: Planner, request: PlanRequest, cfg: PlannerConfig
         backend=lambda: _backend_name(planner),  # read after the call (fallback may switch)
         prompt=lambda: _prompt_of(planner, request),
         mode="loop",
+    )
+
+
+class LanguagePlanner(Protocol):
+    """A model planner with the text-only compact "language mode" (QwenPlanner)."""
+
+    def generate_language(self, request: PlanRequest) -> str: ...
+
+    def language_prompt_for(self, request: PlanRequest) -> str: ...
+
+
+def language_planner_of(planner: Planner) -> LanguagePlanner | None:
+    """The Qwen planner behind ``planner`` (also behind a FallbackPlanner), or None when the
+    backend is rules (then the demo intro uses :func:`plan_with_timeout` instead)."""
+    for p in (planner, getattr(planner, "primary", None)):
+        if p is not None and hasattr(p, "generate_language"):
+            return cast(LanguagePlanner, p)
+    return None
+
+
+def plan_language(planner: LanguagePlanner, request: PlanRequest, cfg: PlannerConfig) -> PlanResult:
+    """Qwen "language mode", for the demo intro ONLY (never inside the FSM loop).
+
+    Text-only prompt (no image), compact schema, at most ``cfg.language_max_new_tokens``
+    tokens, under ``cfg.qwen_timeout_s`` (default 8 s; in-loop calls keep the 3 s timeout).
+    The compact answer is expanded and then validated by :func:`parse_skill_chain` exactly
+    like an in-loop plan. Cost: no extra VRAM (same Qwen weights); measured ~11 s for the
+    ~98-token full schema at 8.7 tok/s, so ~20 compact tokens should take ~2-3 s (to measure).
+    """
+    text_only = PlanRequest(request.instruction, request.detections)
+    return _timed_plan(
+        lambda: planner.generate_language(text_only),
+        expand_compact_plan,
+        request,
+        cfg.qwen_timeout_s,
+        backend=lambda: _backend_name(planner),
+        prompt=lambda: planner.language_prompt_for(text_only),
+        mode="language",
     )
 
 
@@ -630,6 +726,25 @@ class QwenPlanner:
                 w, h = image.size
                 image = image.resize((max(28, round(w * scale)), max(28, round(h * scale))))
         prompt = build_planner_prompt(request, bbox_scale=scale)
+        return self._run(prompt, image, max_new_tokens, max_time_s)
+
+    def language_prompt_for(self, request: PlanRequest) -> str:
+        return build_language_prompt(request)
+
+    def generate_language(self, request: PlanRequest) -> str:
+        """Demo-intro "language mode": text only (``request.image_bgr`` is ignored), compact
+        schema, at most ``cfg.language_max_new_tokens`` tokens; generation stops itself after
+        ``cfg.qwen_timeout_s``. Use via :func:`plan_language` (timeout + strict parse)."""
+        return self._run(
+            self.language_prompt_for(request),
+            None,
+            self.cfg.language_max_new_tokens,
+            self.cfg.qwen_timeout_s,
+        )
+
+    def _run(
+        self, prompt: str, image: Any | None, max_new_tokens: int, max_time_s: float | None
+    ) -> str:
         with self._lock:
             t0 = time.perf_counter()
             text, n_tokens = self._engine.run(prompt, image, max_new_tokens, max_time_s)

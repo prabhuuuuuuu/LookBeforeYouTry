@@ -140,10 +140,18 @@ class PlannerConfig:
     device: str = "cuda"
     max_image_pixels: int = 640 * 480  # overhead frame is downscaled above this (latency)
     warmup_timeout_s: float = 60.0  # startup warm-up generation (first CUDA call is slow)
+    # Qwen "language mode" (demo intro ONLY, never in the FSM loop): text-only prompt, compact
+    # output schema. Its own timeout; every in-loop call keeps the 3 s ``timeout_s``.
+    qwen_timeout_s: float = 8.0
+    language_max_new_tokens: int = 64
 
     def validate(self) -> None:
         if self.temperature != 0.0:
             raise ConfigError("Planner temperature must be 0 (bible 11.1)")
+        if not 0.0 < self.qwen_timeout_s <= 30.0:
+            raise ConfigError("planner.qwen_timeout_s must be in (0, 30] s")
+        if self.language_max_new_tokens < 1:
+            raise ConfigError("planner.language_max_new_tokens must be >= 1")
         if not 0.0 < self.timeout_s <= 3.0:
             raise ConfigError("Planner timeout must be in (0, 3] s (bible 11.1)")
         if self.backend not in PLANNER_BACKENDS:
