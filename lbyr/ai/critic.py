@@ -23,6 +23,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from lbyr.ai.cuda_mem import log_cuda_allocated
+from lbyr.ai.imaging import bgr_to_pil
 from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
 from lbyr.config import CriticConfig
 from lbyr.errors import ConfigError, LBYRError
@@ -95,15 +96,6 @@ class ScriptedCritic:
         if self.delay_s:
             time.sleep(self.delay_s)
         return answer
-
-
-def bgr_to_pil(image_bgr: np.ndarray) -> Any:
-    """OpenCV-style BGR uint8 (H, W, 3) -> PIL RGB image. Pillow is imported lazily."""
-    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
-        raise ValueError(f"expected an (H, W, 3) BGR image, got shape {image_bgr.shape}")
-    from PIL import Image
-
-    return Image.fromarray(np.ascontiguousarray(image_bgr[..., ::-1]), "RGB")
 
 
 def _load_moondream2(path: Path, device: str) -> Any:

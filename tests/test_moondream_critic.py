@@ -7,7 +7,8 @@ from typing import Any
 import numpy as np
 import pytest
 
-from lbyr.ai.critic import CRITIC_PROMPT, CriticWorker, Moondream2Critic, Verdict, bgr_to_pil
+from lbyr.ai.critic import CRITIC_PROMPT, CriticWorker, Moondream2Critic, Verdict
+from lbyr.ai.imaging import bgr_to_pil
 from lbyr.config import CriticConfig
 from lbyr.errors import ConfigError, LBYRError
 

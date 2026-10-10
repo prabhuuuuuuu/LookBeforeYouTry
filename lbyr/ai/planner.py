@@ -16,18 +16,22 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 
+from lbyr.ai.cuda_mem import log_cuda_allocated
+from lbyr.ai.imaging import bgr_to_pil
 from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
 from lbyr.config import PlannerConfig, SkillConfig
-from lbyr.errors import PlannerTimeoutError, PlanValidationError
+from lbyr.errors import ConfigError, LBYRError, PlannerTimeoutError, PlanValidationError
 from lbyr.perception.detector import Detection
 
 log = logging.getLogger(__name__)
@@ -82,13 +86,22 @@ class Planner(Protocol):
 
 
 # ------------------------------------------------------------------ prompt
-def build_planner_prompt(request: PlanRequest) -> str:
-    objs = "\n".join(f"- id={d.id} label={d.label} score={d.score:.2f}" for d in request.detections)
+def build_planner_prompt(request: PlanRequest, bbox_scale: float = 1.0) -> str:
+    """Task text + detected objects (id, class, score, pixel bbox). The image is passed
+    separately. ``bbox_scale`` converts bboxes if the image given to the model was resized."""
+
+    def _bbox(d: Detection) -> str:
+        return "[" + ",".join(str(round(v * bbox_scale)) for v in d.bbox_xyxy) + "]"
+
+    objs = "\n".join(
+        f"- id={d.id} label={d.label} score={d.score:.2f} bbox_xyxy_px={_bbox(d)}"
+        for d in request.detections
+    )
     return (
-        "You are a robot task planner. Output ONLY JSON, no prose.\n"
+        "You are a robot task planner. Output ONLY minified single-line JSON, no prose.\n"
         'Schema: {"skill_chain":[{"skill":"approach","target_id":int,"standoff_mm":number},'
         '{"skill":"grasp","closure":0-100},{"skill":"place","target_id":int}],"notes":string}\n'
-        "Never output joint angles. Use only the object ids listed.\n"
+        'Use "" for notes. Never output joint angles. Use only the object ids listed.\n'
         f"Detected objects:\n{objs}\n"
         f"Instruction: {request.instruction}"
     )
@@ -361,17 +374,128 @@ def build_planner(cfg: PlannerConfig, skills: SkillConfig | None = None) -> Plan
     return FallbackPlanner(QwenPlanner(cfg), rules, cfg)
 
 
-class QwenPlanner:
-    """Qwen2.5-VL-3B-Instruct FP16 (bible 9.2: ~6.5 GB VRAM, 0.8-2 s).
+@dataclass(frozen=True)
+class GenStats:
+    new_tokens: int
+    seconds: float  # wall time of the engine call: image preprocessing + prefill + decode
 
-    TODO: implement on the Jetson with local weights only (``cfg.model_path``), greedy
-    decoding (``do_sample=False`` == temperature 0). transformers/torch imported lazily.
+    @property
+    def tokens_per_s(self) -> float:
+        return self.new_tokens / self.seconds if self.seconds > 0 else 0.0
+
+
+class QwenEngine(Protocol):
+    def run(
+        self, prompt: str, image: Any | None, max_new_tokens: int, max_time_s: float | None
+    ) -> tuple[str, int]:
+        """Greedy-decode. Returns (text, number of generated tokens)."""
+        ...
+
+
+class _HFQwenEngine:
+    """transformers Qwen2.5-VL-3B-Instruct, FP16, greedy. torch is imported lazily."""
+
+    def __init__(self, path: Path, device: str) -> None:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")  # edge-only: never touch the network
+        import torch
+        from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+        self._torch = torch
+        self._device = device
+        self._processor: Any = AutoProcessor.from_pretrained(str(path), local_files_only=True)
+        self._model: Any = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            str(path), dtype=torch.float16, device_map={"": device}, local_files_only=True
+        ).eval()
+
+    def run(
+        self, prompt: str, image: Any | None, max_new_tokens: int, max_time_s: float | None
+    ) -> tuple[str, int]:
+        content: list[dict[str, str]] = [{"type": "text", "text": prompt}]
+        if image is not None:
+            content.insert(0, {"type": "image"})
+        text = self._processor.apply_chat_template(
+            [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
+        )
+        inputs = self._processor(
+            text=[text], images=[image] if image is not None else None, return_tensors="pt"
+        ).to(self._device)
+        with self._torch.inference_mode():
+            out = self._model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,  # greedy == temperature 0
+                temperature=None,
+                top_p=None,
+                top_k=None,
+                max_time=max_time_s,  # an abandoned (timed-out) call stops itself
+            )
+        new = out[0, inputs["input_ids"].shape[1] :]
+        return self._processor.batch_decode([new], skip_special_tokens=True)[0], int(new.shape[0])
+
+
+class QwenPlanner:
+    """Qwen2.5-VL-3B-Instruct FP16 (bible 9.2: ~6.5 GB VRAM, 0.8-2 s; measured numbers in
+    the README / ``tools/bench_models.py``).
+
+    Local weights only (``cfg.model_path``). Greedy decoding (temperature 0), at most
+    ``cfg.max_new_tokens`` tokens, and generation also stops by itself after
+    ``cfg.timeout_s``. Returns the RAW text; :func:`plan_with_timeout` owns the hard timeout
+    and the strict :func:`parse_skill_chain` validation, so joint angles are never accepted.
+    ``engine`` injects a fake (tests). ``last_stats`` has the token count / time of the
+    latest call.
     """
 
-    def __init__(self, cfg: PlannerConfig) -> None:
+    def __init__(self, cfg: PlannerConfig, *, engine: QwenEngine | None = None) -> None:
         cfg.validate()
         self.cfg = cfg
-        raise NotImplementedError("QwenPlanner not implemented yet (TODO); use FakePlanner")
+        self.last_stats: GenStats | None = None
+        self._lock = threading.Lock()  # one generation at a time
+        if engine is None:
+            if cfg.model_path is None:
+                raise ConfigError("PlannerConfig.model_path is not set (local weights only)")
+            t0 = time.perf_counter()
+            engine = _HFQwenEngine(cfg.model_path, cfg.device)
+            log.info("Qwen2.5-VL loaded in %.1f s", time.perf_counter() - t0)
+            log_cuda_allocated("Qwen2.5-VL planner")
+        self._engine = engine
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        dummy = PlanRequest(
+            "pick up the block",
+            [Detection(1, "block", 0.9, (200.0, 150.0, 300.0, 250.0))],
+            np.zeros((480, 640, 3), dtype=np.uint8),
+        )
+        t0 = time.perf_counter()
+        out = run_with_timeout(
+            lambda: self._generate(dummy, 8, self.cfg.timeout_s),
+            self.cfg.warmup_timeout_s,
+            "qwen-warmup",
+        )
+        if isinstance(out, TimeoutResult):
+            raise LBYRError(f"Planner warm-up exceeded {self.cfg.warmup_timeout_s:.0f} s")
+        log.info("Planner warm-up in %.0f ms", (time.perf_counter() - t0) * 1000)
 
     def generate(self, request: PlanRequest) -> str:
-        raise NotImplementedError
+        return self._generate(request, self.cfg.max_new_tokens, self.cfg.timeout_s)
+
+    def generate_untimed(self, request: PlanRequest) -> str:
+        """BENCHMARK/TOOLS ONLY: like :meth:`generate` but without the self-imposed
+        ``max_time`` cut-off, to measure the true full-plan latency. Never use at runtime."""
+        return self._generate(request, self.cfg.max_new_tokens, None)
+
+    def _generate(self, request: PlanRequest, max_new_tokens: int, max_time_s: float | None) -> str:
+        image: Any | None = None
+        scale = 1.0
+        if request.image_bgr is not None:
+            image = bgr_to_pil(request.image_bgr)
+            w, h = image.size
+            if w * h > self.cfg.max_image_pixels:  # bound visual tokens (latency)
+                scale = math.sqrt(self.cfg.max_image_pixels / (w * h))
+                image = image.resize((max(28, round(w * scale)), max(28, round(h * scale))))
+        prompt = build_planner_prompt(request, bbox_scale=scale)
+        with self._lock:
+            t0 = time.perf_counter()
+            text, n_tokens = self._engine.run(prompt, image, max_new_tokens, max_time_s)
+            self.last_stats = GenStats(n_tokens, time.perf_counter() - t0)
+        return text
