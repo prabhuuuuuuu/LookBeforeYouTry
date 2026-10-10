@@ -127,6 +127,10 @@ class WristCameraConfig:
     """Panoculonlabs Trinet (bible 5.2). Semantic-only: never used for metric control."""
 
     device_index: int | None = None  # OQ-7: UVC vs vendor SDK / device index, unconfirmed
+    # OQ-7 alternative: stable V4L2 path (e.g. /dev/v4l/by-id/usb-...-video-index0); wins
+    # over device_index when set.
+    device_path: str | None = None
+    fourcc: str | None = None  # e.g. "MJPG" if the UVC mode needs it (OQ-8); None = default
     width: int | None = None  # OQ-8: reliable resolution on Jetson, unconfirmed (start at 720p)
     height: int | None = None  # OQ-8
     fps: int | None = None  # OQ-8
