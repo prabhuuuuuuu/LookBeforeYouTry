@@ -49,6 +49,66 @@ def parse_tegrastats_ram_mb(line: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+@dataclass(frozen=True)
+class RamReading:
+    used_mb: float
+    total_mb: float
+    source: str  # "tegrastats" | "meminfo"
+
+    @property
+    def free_mb(self) -> float:
+        return self.total_mb - self.used_mb
+
+
+def parse_tegrastats_ram(line: str) -> RamReading | None:
+    m = _TEGRA_RAM.search(line)
+    return RamReading(float(m.group(1)), float(m.group(2)), "tegrastats") if m else None
+
+
+def parse_meminfo(text: str) -> RamReading | None:
+    """``/proc/meminfo``: used = MemTotal - MemAvailable (kB -> MB)."""
+    kb: dict[str, float] = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts:
+            kb[key.strip()] = float(parts[0])
+    if "MemTotal" not in kb or "MemAvailable" not in kb:
+        return None
+    return RamReading(
+        (kb["MemTotal"] - kb["MemAvailable"]) / 1024.0, kb["MemTotal"] / 1024.0, "meminfo"
+    )
+
+
+def read_system_ram(sample_s: float = 0.6) -> RamReading | None:
+    """One system-RAM sample (the Orin's unified memory = CPU + GPU).
+
+    tegrastats first (runs ~``sample_s``, interval 100 ms), else ``/proc/meminfo``, else None.
+    Startup-only helper: it blocks for up to ``sample_s``.
+    """
+    exe = shutil.which("tegrastats")
+    if exe is not None:
+        out: str | bytes | None = None
+        try:
+            subprocess.run(
+                [exe, "--interval", "100"], capture_output=True, timeout=sample_s, check=False
+            )
+        except subprocess.TimeoutExpired as e:  # tegrastats never exits on its own
+            out = e.stdout
+        except OSError:
+            log.warning("could not run tegrastats", exc_info=True)
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        for line in reversed((out or "").splitlines()):
+            reading = parse_tegrastats_ram(line)
+            if reading is not None:
+                return reading
+    try:
+        return parse_meminfo(Path("/proc/meminfo").read_text())
+    except OSError:
+        return None
+
+
 class VramMonitor:
     """Background reader of ``tegrastats``; ``latest_mb`` is None if unavailable."""
 

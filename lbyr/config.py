@@ -145,6 +145,9 @@ class PlannerConfig:
     # output schema. Its own timeout; every in-loop call keeps the 3 s ``timeout_s``.
     qwen_timeout_s: float = 8.0
     language_max_new_tokens: int = 64
+    # Memory guard: with backend = "qwen", refuse to start the episode loop if free system RAM
+    # (unified memory) after loading Critic + Qwen is below this. Measured: ~0.8 GB free.
+    qwen_min_free_ram_mb: float = 1536.0  # 1.5 GB
 
     def validate(self) -> None:
         if self.temperature != 0.0:
@@ -153,6 +156,8 @@ class PlannerConfig:
             raise ConfigError("planner.qwen_timeout_s must be in (0, 30] s")
         if self.language_max_new_tokens < 1:
             raise ConfigError("planner.language_max_new_tokens must be >= 1")
+        if self.qwen_min_free_ram_mb < 0.0:
+            raise ConfigError("planner.qwen_min_free_ram_mb must be >= 0")
         if not 0.0 < self.timeout_s <= 3.0:
             raise ConfigError("Planner timeout must be in (0, 3] s (bible 11.1)")
         if self.backend not in PLANNER_BACKENDS:

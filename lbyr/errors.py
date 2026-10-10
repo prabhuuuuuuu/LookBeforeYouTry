@@ -44,5 +44,9 @@ class ConfigError(LBYRError):
     """Configuration violates a locked project rule (e.g. temperature != 0)."""
 
 
+class InsufficientMemoryError(LBYRError):
+    """Startup memory guard: not enough free system RAM to run the episode loop safely."""
+
+
 class PlannerTimeoutError(LBYRError):
     """A planner backend gave up within the hard timeout; reported as ``error="timeout"``."""

@@ -4,7 +4,7 @@
     python -m lbyr.main --mock --critic-off  # "Critic OFF" baseline condition
     python -m lbyr.main                      # real hardware: preflight lists open questions
 
-Exit codes: 0 = DONE, 1 = ABORT, 2 = hardware not confirmed / not implemented.
+Exit codes: 0 = DONE, 1 = ABORT, 2 = hardware not confirmed / not implemented / memory guard.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from pathlib import Path
 
 from lbyr.ai.critic import Verdict
 from lbyr.config import AppConfig, mock_profile, require
-from lbyr.errors import HardwareNotConfirmedError
+from lbyr.errors import HardwareNotConfirmedError, InsufficientMemoryError
 from lbyr.log_setup import setup_logging
 from lbyr.logging_.episodes import REQUIRED_FIELDS
 
@@ -137,6 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     listener = setup_logging(logging.DEBUG if args.verbose else logging.INFO)
     try:
         return run_mock(args) if args.mock else run_hardware(AppConfig())
+    except InsufficientMemoryError as e:  # raised by lbyr.ai.models.load_models
+        log.error("%s", e)
+        return 2
     finally:
         listener.stop()
 
