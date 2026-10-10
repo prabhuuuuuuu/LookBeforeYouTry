@@ -50,6 +50,11 @@ class FakeDetector:
         return list(self._detections)
 
 
+class FixedDetector(FakeDetector):
+    """Always returns the same detections. Used by ``--zone X``: the block is known to be
+    in taught zone X, so no overhead camera / detection runs."""
+
+
 class YoloTRTDetector:
     """YOLOv11n TensorRT INT8 backend (bible 9.2: ~0.4 GB VRAM, ~8 ms, 30 Hz).
 

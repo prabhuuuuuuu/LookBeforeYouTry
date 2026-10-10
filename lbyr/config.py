@@ -129,6 +129,42 @@ class WristCameraConfig:
 
 
 @dataclass
+class BlockDetectorConfig:
+    """Live demo detector: ONE object on a white table, no YOLO (lbyr/perception/block.py).
+
+    Tuning values, not hardware specs: check them on the real table with
+    ``python tools/overhead_snapshot.py --detect`` (prints areas / chroma, saves the mask).
+    A pixel is "object" when it is NOT white: Lab chroma >= ``lab_chroma_min`` or
+    L <= ``lab_l_max`` (OpenCV 8-bit Lab), or with ``color_space = "hsv"``:
+    S >= ``hsv_s_min`` or V <= ``hsv_v_max``.
+    """
+
+    label: str = "wood_block"  # class name the planners see
+    object_id: int = 1  # stable detection id (one object)
+    color_space: str = "lab"  # "lab" | "hsv"
+    lab_chroma_min: float = 18.0  # wood ~25-40; white table after WB lock < 10
+    lab_l_max: int = 70  # very dark pixels count as object (shadows are lighter)
+    hsv_s_min: int = 60
+    hsv_v_max: int = 60
+    morph_kernel_px: int = 5  # open + close
+    min_area_px: float = 150.0  # contour area filter (640x480)
+    max_area_px: float = 8000.0  # rejects the arm / big clutter
+    border_px: int = 8  # ignored frame margin when no workspace polygon is defined
+    depth_window_px: int = 7  # median depth window around the centroid (odd)
+    # Workspace polygon (overhead pixels). None = poses.yaml `workspace_polygon_px`
+    # (tools/define_zones.py --workspace), else the whole frame minus border_px.
+    workspace_polygon_px: tuple[tuple[float, float], ...] | None = None
+
+    def validate(self) -> None:
+        if self.color_space not in ("lab", "hsv"):
+            raise ConfigError("detector.color_space must be 'lab' or 'hsv'")
+        if not 0 < self.min_area_px < self.max_area_px:
+            raise ConfigError("detector: need 0 < min_area_px < max_area_px")
+        if self.depth_window_px < 1 or self.depth_window_px % 2 == 0:
+            raise ConfigError("detector.depth_window_px must be a positive odd integer")
+
+
+@dataclass
 class CameraConfig:
     overhead: OverheadCameraConfig = field(default_factory=OverheadCameraConfig)
     wrist: WristCameraConfig = field(default_factory=WristCameraConfig)
@@ -303,6 +339,7 @@ class LoggingConfig:
 class AppConfig:
     arm: ArmConfig = field(default_factory=ArmConfig)
     cameras: CameraConfig = field(default_factory=CameraConfig)
+    detector: BlockDetectorConfig = field(default_factory=BlockDetectorConfig)
     planner: PlannerConfig = field(default_factory=PlannerConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
     motion: MotionConfig = field(default_factory=MotionConfig)
@@ -315,6 +352,7 @@ class AppConfig:
         self.planner.validate()
         self.critic.validate()
         self.motion.validate()
+        self.detector.validate()
 
 
 def mock_profile() -> AppConfig:
