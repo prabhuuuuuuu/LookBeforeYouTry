@@ -9,10 +9,11 @@ dist/
 .ruff_cache/
 .mypy_cache/
 
-# Runtime data (never commit frames, datasets, calibration, episode logs)
+# Runtime data (never commit frames, datasets, episode logs). data/calib/ IS tracked
+# (joints.yaml, poses.yaml); calibration images and large files must not go there.
 data/frames/
 data/datasets/
-data/calib/
+data/live/
 data/episodes/
 data/bench/
 

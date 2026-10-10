@@ -1,0 +1,21 @@
+# Joint calibration for the ROT3U arm + XIAO ESP32-C6 bridge (lbyr/arm/calib.py).
+#
+# Seeded 2026-10-10 from the firmware's DEFAULT_ZERO_US fallback (Code.ino).
+# VERIFY AGAINST BOARD `list` before use: connect with tools/arm_gui.py, press
+# "Sync sliders" (sends `list`), and compare every `S,<joint>,<zero_us>,...` line with
+# zero_us below. Then set `verified: true` (and write who/when in the comment).
+# SerialArm refuses to move if any zero differs from the board.
+#
+# zero_us        saved zero pulse on the board (us)
+# sign           +1 / -1: host-frame direction vs firmware degrees (A-7, unconfirmed)
+# zero_pose_deg  host-frame angle at the zero pulse (A-7, unconfirmed; only IK needs it)
+# Taught-pose mode only needs zero_us. host_deg = zero_pose_deg + sign * firmware_deg.
+verified: false   # verified by: <name>, <date>
+us_per_deg: 11.1111   # firmware US_PER_DEG = 1000/90
+joints:
+  - {name: base_yaw,       zero_us: 1477, sign: 1, zero_pose_deg: 0.0}
+  - {name: shoulder_pitch, zero_us: 1989, sign: 1, zero_pose_deg: 0.0}
+  - {name: elbow_pitch,    zero_us: 1844, sign: 1, zero_pose_deg: 0.0}
+  - {name: wrist_pitch,    zero_us: 1223, sign: 1, zero_pose_deg: 0.0}
+  - {name: wrist_roll,     zero_us: 1467, sign: 1, zero_pose_deg: 0.0}
+  - {name: gripper,        zero_us: 1433, sign: 1, zero_pose_deg: 0.0}
