@@ -49,9 +49,9 @@ def test_box_crop_is_clipped_and_resized() -> None:
 
 
 # ------------------------------------------------------------------ dtype / compile
-def test_critic_dtype_default_unchanged_and_validated() -> None:
-    assert CriticConfig().dtype == "fp16"
-    CriticConfig(dtype="bf16").validate()
+def test_critic_dtype_default_bf16_fp16_selectable() -> None:
+    assert CriticConfig().dtype == "bf16"  # M-1
+    CriticConfig(dtype="fp16").validate()
     with pytest.raises(ConfigError):
         CriticConfig(dtype="int8").validate()
 

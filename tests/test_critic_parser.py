@@ -84,3 +84,57 @@ def test_worker_backend_exception_is_invalid() -> None:
     r = _wait_result(worker)
     worker.stop()
     assert r.verdict is Verdict.INVALID
+
+
+# ------------------------------------------------------------------ runtime crop (M-1)
+class _Recorder:
+    def __init__(self) -> None:
+        self.shapes: list[tuple[int, ...]] = []
+
+    def infer(self, image_bgr: np.ndarray, prompt: str) -> str:
+        self.shapes.append(image_bgr.shape)
+        return "GRASPED"
+
+
+def _one(cfg: CriticConfig, img: np.ndarray, pre=None):  # type: ignore[no-untyped-def]
+    rec = _Recorder()
+    worker = CriticWorker(rec, cfg, preprocess=pre)
+    worker.start()
+    try:
+        worker.submit(img, "VERIFY_GRASP")
+        return _wait_result(worker), rec
+    finally:
+        worker.stop()
+
+
+def test_defaults_are_bf16_and_378_crop() -> None:
+    cfg = CriticConfig()
+    assert (cfg.dtype, cfg.crop_enabled, cfg.crop_size_px, cfg.crop_xywh) == (
+        "bf16",
+        True,
+        378,
+        None,
+    )
+
+
+def test_worker_crops_after_preprocess_and_reports_infer_time() -> None:
+    img = np.zeros((480, 640, 3), np.uint8)
+    seen: list[tuple[int, ...]] = []
+
+    def dewarp(frame: np.ndarray) -> np.ndarray:
+        seen.append(frame.shape)
+        return frame
+
+    r, rec = _one(CriticConfig(timeout_s=1.0), img, dewarp)
+    assert seen == [(480, 640, 3)] and rec.shapes == [(378, 378, 3)]
+    assert r.image_bgr.shape == (378, 378, 3) and r.verdict is Verdict.GRASPED
+    assert r.infer_ms is not None and r.infer_ms <= r.latency_ms
+
+
+def test_worker_crop_box_and_crop_off() -> None:
+    img = np.zeros((480, 640, 3), np.uint8)
+    img[100, 200] = (9, 9, 9)
+    r, _ = _one(CriticConfig(timeout_s=1.0, crop_xywh=(200, 100, 378, 378)), img)
+    assert tuple(r.image_bgr[0, 0]) == (9, 9, 9)
+    r, rec = _one(CriticConfig(timeout_s=1.0, crop_enabled=False), img)
+    assert rec.shapes == [(480, 640, 3)]

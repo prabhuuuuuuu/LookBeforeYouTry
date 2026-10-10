@@ -2,8 +2,10 @@
 
 Event-driven: the FSM submits a request (non-blocking) and polls the verdict queue
 (non-blocking). Inference runs on the CriticWorker thread under an explicit timeout.
-Moondream2 cost (bible 9.2): ~4 GB FP16 / ~1.2 GB GGUF-Q4 VRAM, 0.3-0.8 s per query.
-Measured on the Orin NX: see ``tools/bench_models.py`` and the README.
+
+Runtime input (M-1, 2026-10-10): wrist frame -> dewarp -> 378x378 crop
+(``CriticConfig.crop_xywh``, default centred) -> Moondream2 BF16. Measured on the Orin NX
+40 W: ~4.1 GB, p50 0.85 s (1.35 s on the full 640x480 frame). See bible 9.2.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from lbyr.ai.cuda_mem import log_cuda_allocated
-from lbyr.ai.imaging import bgr_to_pil
+from lbyr.ai.imaging import bgr_to_pil, critic_crop
 from lbyr.ai.offline import force_offline
 from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
 from lbyr.config import CriticConfig
@@ -127,7 +129,7 @@ def _load_moondream2(path: Path, device: str, dtype: str = "fp16") -> Any:
 
 
 class Moondream2Critic:
-    """Moondream2 FP16 on CUDA (bible 11.2; ~4 GB VRAM, see ``tools/bench_models.py``).
+    """Moondream2 on CUDA, BF16 by default (``cfg.dtype``; bible 11.2, ~4.1 GB).
 
     Weights come from ``cfg.model_path`` only (no downloads). The model is loaded once here
     and warmed up with one dummy query (under ``cfg.warmup_timeout_s``). Decoding is greedy
@@ -155,7 +157,9 @@ class Moondream2Critic:
         self._warm_up()
 
     def _warm_up(self) -> None:
-        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        side = self.cfg.crop_size_px
+        shape = (side, side, 3) if self.cfg.crop_enabled else (480, 640, 3)
+        dummy = np.zeros(shape, dtype=np.uint8)  # same size as the runtime input
         t0 = time.perf_counter()
         out = run_with_timeout(
             lambda: self.infer(dummy, CRITIC_PROMPT), self.cfg.warmup_timeout_s, "critic-warmup"
@@ -203,11 +207,16 @@ class CriticResult:
     verdict: Verdict
     raw_text: str | None
     latency_ms: float  # submit -> verdict (includes queueing + dewarp + inference)
-    image_bgr: np.ndarray | None = None  # the (dewarped) image actually judged
+    image_bgr: np.ndarray | None = None  # the (dewarped, cropped) image actually judged
+    infer_ms: float | None = None  # backend call only (None if it never ran)
 
 
 class CriticWorker(threading.Thread):
-    """Request queue -> (dewarp) -> backend under timeout -> verdict queue."""
+    """Request queue -> (dewarp) -> crop -> backend under timeout -> verdict queue.
+
+    ``preprocess`` is the dewarp (None = raw frame). The crop is applied when
+    ``cfg.crop_enabled`` (box ``cfg.crop_xywh``, default centred, ``cfg.crop_size_px``).
+    """
 
     def __init__(
         self,
@@ -219,6 +228,7 @@ class CriticWorker(threading.Thread):
         cfg.validate()
         self._backend = backend
         self._preprocess = preprocess
+        self._cfg = cfg
         self._runner = TimeoutRunner(cfg.timeout_s, name="critic-infer")
         self._requests: queue.Queue[CriticRequest] = queue.Queue(maxsize=cfg.request_queue_size)
         self._results: queue.Queue[CriticResult] = queue.Queue()
@@ -254,10 +264,16 @@ class CriticWorker(threading.Thread):
     def _process(self, req: CriticRequest) -> CriticResult:
         image = req.image_bgr
         raw: str | None = None
+        infer_ms: float | None = None
         try:
             if self._preprocess is not None:
                 image = self._preprocess(image)
-            out = self._runner.run(lambda: self._backend.infer(image, CRITIC_PROMPT))
+            if self._cfg.crop_enabled:
+                image = critic_crop(image, self._cfg.crop_xywh, self._cfg.crop_size_px)
+            judged = image
+            t0 = time.perf_counter()
+            out = self._runner.run(lambda: self._backend.infer(judged, CRITIC_PROMPT))
+            infer_ms = (time.perf_counter() - t0) * 1000
             if isinstance(out, TimeoutResult):
                 verdict = Verdict.TIMEOUT
                 if out.busy:
@@ -269,7 +285,17 @@ class CriticWorker(threading.Thread):
             log.exception("Critic backend/preprocess failed")
             verdict = Verdict.INVALID
         latency_ms = (time.perf_counter() - req.t_submit) * 1000
-        return CriticResult(req.request_id, req.state, verdict, raw, latency_ms, image)
+        log.info(
+            "Critic %s: raw=%r -> %s (infer %s ms, total %.0f ms, input %dx%d)",
+            req.state,
+            raw,
+            verdict.value,
+            "n/a" if infer_ms is None else f"{infer_ms:.0f}",
+            latency_ms,
+            image.shape[1],
+            image.shape[0],
+        )
+        return CriticResult(req.request_id, req.state, verdict, raw, latency_ms, image, infer_ms)
 
     def stop(self, timeout: float = 1.0) -> None:
         self._stop_event.set()

@@ -10,12 +10,14 @@
 - WRONG_OBJECT (planner re-check vs detected class), max 1: re-plan
 
 Software-added classes (NOT in the bible table; see docs/OPEN_QUESTIONS.md):
-CRITIC_UNAVAILABLE (TIMEOUT/INVALID: re-query once), PLACE_FAILED, PLANNER_FAILED,
+CRITIC_UNAVAILABLE (TIMEOUT / no frame: re-query once), PLACE_FAILED, PLANNER_FAILED,
 PERCEPTION_FAILED, IK_FAILED (all 0 attempts -> ABORT).
 
 Interpretations (approved): "+15%" = +15 percentage points of closure, capped at 100;
 "wrist re-orient" = wrist roll; the 3rd SLIPPING step is unreachable while max = 2.
 Besides per-class limits, a global budget caps RECOVER(k) at k <= 2 per episode.
+INVALID (unparseable Critic answer) is handled by the supervisor before :func:`classify`:
+re-query once, then treated as OCCLUDED (M-1 decision, 2026-10-10).
 """
 
 from __future__ import annotations
@@ -101,7 +103,7 @@ RECOVERY_TABLE: dict[FailureClass, RecoveryPolicy] = {
         (RecoveryAction("re-plan", State.PLAN),),
     ),
     FailureClass.CRITIC_UNAVAILABLE: RecoveryPolicy(
-        "Critic TIMEOUT/INVALID",
+        "Critic TIMEOUT (INVALID only if it reaches classify directly)",
         1,
         (RecoveryAction("re-query Critic once", None),),
         counts_toward_total=False,

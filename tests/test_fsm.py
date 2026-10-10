@@ -186,3 +186,37 @@ def test_global_budget_caps_total() -> None:
 
 def test_gripper_index_is_last() -> None:
     assert GRIPPER_INDEX == 5
+
+
+# ---------------------------------------------------------------- INVALID policy (M-1)
+def test_invalid_requeries_once_then_continues(tmp_path: Path) -> None:
+    result, _ = run(("banana", G, G, E), log_dir=tmp_path)
+    assert result.outcome == "success" and result.recoveries == 0
+    assert result.verdicts[:2] == [Verdict.INVALID, G]
+    records = [
+        json.loads(line)
+        for line in next(tmp_path.glob("*/episodes.jsonl")).read_text().splitlines()
+    ]
+    retries = [r for r in records if r["event"] == "critic_invalid_retry"]
+    assert [r["action"] for r in retries] == ["requery"] and retries[0]["raw_text"] == "banana"
+    verdicts = [r for r in records if r["event"] == "verdict"]
+    assert verdicts[0]["raw_text"] == "banana" and verdicts[0]["verdict"] == "INVALID"
+    assert verdicts[1]["critic_input"] == "378x378" and verdicts[1]["critic_infer_ms"] >= 0
+    assert verdicts[1]["verdict_latency_ms"] >= verdicts[1]["critic_infer_ms"]
+
+
+def test_invalid_twice_is_treated_as_occluded(tmp_path: Path) -> None:
+    result, _ = run(("banana", "I see a cup", G, G, E), log_dir=tmp_path)
+    assert result.outcome == "success"
+    assert result.recovery_history == [(FailureClass.OCCLUDED, "re-position wrist cam, re-query")]
+    records = [
+        json.loads(line)
+        for line in next(tmp_path.glob("*/episodes.jsonl")).read_text().splitlines()
+    ]
+    actions = [r["action"] for r in records if r["event"] == "critic_invalid_retry"]
+    assert actions == ["requery", "treat_as_occluded"]
+
+
+def test_invalid_forever_aborts_after_occluded_budget() -> None:
+    result, _ = run(("banana",))
+    assert result.outcome == "abort" and result.failure is FailureClass.OCCLUDED

@@ -116,7 +116,9 @@ class WristCameraConfig:
     calib_path: Path = DATA_DIR / "calib" / "trinet_fisheye.yaml"  # OQ-9: produced by tools/
     dewarp_enabled: bool = True  # bible 5.2: dewarp before the VLM
     dewarp_balance: float = 0.0  # 0 = crop to valid pixels, 1 = keep full FOV
-    crop_xywh: tuple[int, int, int, int] | None = None  # OQ-12: gripper ROI, depends on mount
+    # Optional Dewarper pre-crop (rarely needed). The Critic's gripper ROI is
+    # CriticConfig.crop_xywh (OQ-12); do not set both to the same box.
+    crop_xywh: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -185,15 +187,25 @@ class CriticConfig:
     device: str = "cuda"
     max_new_tokens: int = 8  # the answer is ONE word
     warmup_timeout_s: float = 60.0  # startup warm-up query (first CUDA call is slow)
-    # "fp16" (weights cast + crop-dtype patch) | "bf16" (the model's native dtype, no patch).
-    # Speed experiment in tools/bench_models.py; default unchanged until a winner is picked.
-    dtype: str = "fp16"
+    # "bf16" (Moondream's native dtype; the Orin supports it) | "fp16" (weights cast +
+    # crop-dtype patch). M-1 resolved 2026-10-10: bf16 + 378x378 crop (0.85 s vs 1.35 s).
+    dtype: str = "bf16"
+    # Runtime input = dewarped wrist frame -> 378x378 crop (one Moondream tile).
+    crop_enabled: bool = True
+    crop_size_px: int = 378
+    # OQ-12: gripper bite-zone box (x, y, w, h) in the DEWARPED frame. None = centred square.
+    # Must be re-centred on the bite zone once the Trinet is mounted (tools/ to set it).
+    crop_xywh: tuple[int, int, int, int] | None = None
 
     def validate(self) -> None:
         if self.temperature != 0.0:
             raise ConfigError("Critic temperature must be 0 (bible 21.4)")
         if self.dtype not in CRITIC_DTYPES:
             raise ConfigError(f"critic.dtype must be one of {CRITIC_DTYPES}")
+        if self.crop_size_px < 28:
+            raise ConfigError("critic.crop_size_px is too small")
+        if self.crop_xywh is not None and (self.crop_xywh[2] <= 0 or self.crop_xywh[3] <= 0):
+            raise ConfigError("critic.crop_xywh width/height must be > 0")
         if self.timeout_s <= 0.0:
             raise ConfigError("Critic timeout must be > 0 (bible 11.2)")
         if self.max_new_tokens < 1:

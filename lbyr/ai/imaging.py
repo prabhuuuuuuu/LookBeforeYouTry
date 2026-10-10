@@ -45,8 +45,17 @@ def critic_crop(
         raise ValueError(f"crop box {box_xywh} is outside the {w}x{h} frame")
     out = image_bgr[y0:y1, x0:x1]
     if out.shape[:2] != (size_px, size_px):
-        from PIL import Image
-
-        resized = Image.fromarray(np.ascontiguousarray(out)).resize((size_px, size_px))
-        out = np.asarray(resized)
+        out = _resize_square(out, size_px)
     return np.ascontiguousarray(out)
+
+
+def _resize_square(image: np.ndarray, size_px: int) -> np.ndarray:
+    """Bilinear resize with Pillow; nearest-neighbour NumPy fallback if Pillow is missing."""
+    try:
+        from PIL import Image
+    except ImportError:
+        h, w = image.shape[:2]
+        rows = (np.arange(size_px) * h // size_px).clip(0, h - 1)
+        cols = (np.arange(size_px) * w // size_px).clip(0, w - 1)
+        return image[rows][:, cols]
+    return np.asarray(Image.fromarray(np.ascontiguousarray(image)).resize((size_px, size_px)))

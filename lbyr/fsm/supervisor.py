@@ -6,6 +6,8 @@
   Jam detection: bridge status, load threshold (if confirmed, A-4), commanded-vs-actual
   position error, motion timeout.
 - Verify states submit a Critic request and poll the verdict queue without blocking.
+  INVALID (unparseable answer): re-query once with a fresh frame, then treat as OCCLUDED
+  (logged as ``critic_invalid_retry``). TIMEOUT: re-query once, then ABORT.
 - PLAN calls the planner under its 3 s hard timeout. This blocks only the FSM thread
   while the arm is idle; the streamer keeps holding position on its own thread.
 - Failures -> RECOVER(k) per the recovery table, else ABORT with a human-readable report.
@@ -41,6 +43,12 @@ from lbyr.perception.overhead import RGBDFrame
 log = logging.getLogger(__name__)
 
 Next = tuple[State, str] | None
+
+
+def _shape_str(image: np.ndarray | None) -> str | None:
+    return None if image is None else f"{image.shape[1]}x{image.shape[0]}"
+
+
 PERCEIVE_MAX_WAIT_TICKS = 20
 VERIFY_WATCHDOG_MARGIN_S = 1.0
 
@@ -113,6 +121,7 @@ class _EpisodeCtx:
     failed_state: State | None = None
     reentry: State | None = None
     planner_latency_ms: float | None = None
+    critic_invalid_retries: int = 0  # INVALID re-queries since the last valid verdict
     verdicts: list[Verdict] = field(default_factory=list)
     transitions: list[Transition] = field(default_factory=list)
     abort_actions: list[str] = field(default_factory=list)
@@ -426,20 +435,33 @@ class Supervisor:
         return None
 
     def _on_verdict(self, r: CriticResult) -> Next:
+        c = self.ctx
         self._pending_rid = None
-        self.ctx.verdicts.append(r.verdict)
+        c.verdicts.append(r.verdict)
         frame = self._save_frame(r.image_bgr, "judged") if r.image_bgr is not None else None
         self._record(
             "verdict",
             verdict=r.verdict,
             verdict_latency_ms=r.latency_ms,
             raw_text=r.raw_text,
+            critic_infer_ms=r.infer_ms,
+            critic_input=_shape_str(r.image_bgr),
             frame=frame,
         )
         log.info("Critic %s -> %s (%.0f ms)", self.state.value, r.verdict.value, r.latency_ms)
-        failure = classify(self.state, r.verdict)
+        verdict = r.verdict
+        if verdict is Verdict.INVALID:
+            if c.critic_invalid_retries == 0:  # re-query once with a fresh frame
+                c.critic_invalid_retries = 1
+                self._record("critic_invalid_retry", action="requery", raw_text=r.raw_text)
+                return self.state, "Critic INVALID: re-query once"
+            self._record("critic_invalid_retry", action="treat_as_occluded", raw_text=r.raw_text)
+            verdict = Verdict.OCCLUDED
+        else:
+            c.critic_invalid_retries = 0
+        failure = classify(self.state, verdict)
         if failure is None:
-            return next_in_pipeline(self.state), f"Critic={r.verdict.value}"
+            return next_in_pipeline(self.state), f"Critic={verdict.value}"
         return self._fail(failure, f"Critic={r.verdict.value} in {self.state.value}")
 
     # ================================================================ terminal
