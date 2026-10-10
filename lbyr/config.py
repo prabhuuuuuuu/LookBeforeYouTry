@@ -149,12 +149,19 @@ class CriticConfig:
     model_path: Path | None = None  # local weights (FP16 or GGUF-Q4); no downloads
     lora_adapter_path: Path | None = None
     request_queue_size: int = 4
+    device: str = "cuda"
+    max_new_tokens: int = 8  # the answer is ONE word
+    warmup_timeout_s: float = 60.0  # startup warm-up query (first CUDA call is slow)
 
     def validate(self) -> None:
         if self.temperature != 0.0:
             raise ConfigError("Critic temperature must be 0 (bible 21.4)")
         if self.timeout_s <= 0.0:
             raise ConfigError("Critic timeout must be > 0 (bible 11.2)")
+        if self.max_new_tokens < 1:
+            raise ConfigError("Critic max_new_tokens must be >= 1")
+        if self.warmup_timeout_s <= 0.0:
+            raise ConfigError("Critic warmup_timeout_s must be > 0")
 
 
 @dataclass

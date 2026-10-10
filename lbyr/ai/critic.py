@@ -3,24 +3,29 @@
 Event-driven: the FSM submits a request (non-blocking) and polls the verdict queue
 (non-blocking). Inference runs on the CriticWorker thread under an explicit timeout.
 Moondream2 cost (bible 9.2): ~4 GB FP16 / ~1.2 GB GGUF-Q4 VRAM, 0.3-0.8 s per query.
+Measured on the Orin NX: see ``tools/bench_models.py`` and the README.
 """
 
 from __future__ import annotations
 
 import itertools
 import logging
+import os
 import queue
 import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from pathlib import Path
+from typing import Any, Protocol
 
 import numpy as np
 
-from lbyr.ai.timeout import TimeoutResult, TimeoutRunner
+from lbyr.ai.cuda_mem import log_cuda_allocated
+from lbyr.ai.timeout import TimeoutResult, TimeoutRunner, run_with_timeout
 from lbyr.config import CriticConfig
+from lbyr.errors import ConfigError, LBYRError
 
 log = logging.getLogger(__name__)
 
@@ -92,20 +97,84 @@ class ScriptedCritic:
         return answer
 
 
-class Moondream2Critic:
-    """Moondream2 (FP16 or GGUF-Q4 via llama.cpp), optional LoRA adapter.
+def bgr_to_pil(image_bgr: np.ndarray) -> Any:
+    """OpenCV-style BGR uint8 (H, W, 3) -> PIL RGB image. Pillow is imported lazily."""
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(f"expected an (H, W, 3) BGR image, got shape {image_bgr.shape}")
+    from PIL import Image
 
-    TODO: implement on the Jetson with local weights only (``cfg.model_path``), greedy
-    decoding (temperature 0). Heavy imports must stay lazy, inside this class.
+    return Image.fromarray(np.ascontiguousarray(image_bgr[..., ::-1]), "RGB")
+
+
+def _load_moondream2(path: Path, device: str) -> Any:
+    """Load Moondream2 from LOCAL files only, as FP16, on ``device``.
+
+    The model's remote code builds its modules in bfloat16 and hard-codes a bfloat16 cast
+    of the image crops, so FP16 needs two things: casting the weights, and a forward
+    pre-hook that casts the crops to the weight dtype. Outputs were checked to match bf16.
+    """
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")  # edge-only: never touch the network
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model: Any = AutoModelForCausalLM.from_pretrained(
+        str(path), trust_remote_code=True, dtype=torch.float16, local_files_only=True
+    )
+    model = model.to(torch.float16).to(device).eval()
+    try:
+        patch_emb = model.model.vision["patch_emb"]
+    except (AttributeError, KeyError, TypeError) as e:
+        raise LBYRError(
+            f"{path}: unexpected Moondream2 remote-code layout (need the 2025-06-21 revision)"
+        ) from e
+    patch_emb.register_forward_pre_hook(lambda mod, args: (args[0].to(mod.weight.dtype),))
+    return model
+
+
+class Moondream2Critic:
+    """Moondream2 FP16 on CUDA (bible 11.2; ~4 GB VRAM, see ``tools/bench_models.py``).
+
+    Weights come from ``cfg.model_path`` only (no downloads). The model is loaded once here
+    and warmed up with one dummy query (under ``cfg.warmup_timeout_s``). Decoding is greedy
+    (temperature 0, ``max_tokens = cfg.max_new_tokens``). ``infer`` returns the raw answer
+    text; the verdict is produced by :func:`parse_verdict` in :class:`CriticWorker`, which
+    also enforces ``cfg.timeout_s`` around every call.
+
+    ``model`` injects an already-built object with Moondream's ``query`` API (tests).
     """
 
-    def __init__(self, cfg: CriticConfig) -> None:
+    def __init__(self, cfg: CriticConfig, *, model: Any | None = None) -> None:
         cfg.validate()
+        if cfg.lora_adapter_path is not None:
+            raise NotImplementedError("Moondream2 LoRA adapter loading is not implemented yet")
         self.cfg = cfg
-        raise NotImplementedError("Moondream2Critic not implemented yet (TODO); use ScriptedCritic")
+        self._lock = threading.Lock()  # one query at a time: the KV cache is shared state
+        if model is None:
+            if cfg.model_path is None:
+                raise ConfigError("CriticConfig.model_path is not set (local weights only)")
+            t0 = time.perf_counter()
+            model = _load_moondream2(cfg.model_path, cfg.device)
+            log.info("Moondream2 loaded in %.1f s", time.perf_counter() - t0)
+            log_cuda_allocated("Moondream2 Critic")
+        self._model = model
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        t0 = time.perf_counter()
+        out = run_with_timeout(
+            lambda: self.infer(dummy, CRITIC_PROMPT), self.cfg.warmup_timeout_s, "critic-warmup"
+        )
+        if isinstance(out, TimeoutResult):
+            raise LBYRError(f"Critic warm-up exceeded {self.cfg.warmup_timeout_s:.0f} s")
+        log.info("Critic warm-up: %r in %.0f ms", out, (time.perf_counter() - t0) * 1000)
 
     def infer(self, image_bgr: np.ndarray, prompt: str) -> str:
-        raise NotImplementedError
+        image = bgr_to_pil(image_bgr)
+        settings = {"temperature": self.cfg.temperature, "max_tokens": self.cfg.max_new_tokens}
+        with self._lock:
+            result = self._model.query(image, prompt, settings=settings)
+        return str(result["answer"]).strip()
 
 
 # ------------------------------------------------------------------ worker
