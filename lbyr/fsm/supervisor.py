@@ -294,7 +294,9 @@ class Supervisor:
         req = PlanRequest(c.spec.instruction, list(c.detections.values()))
         res = plan_with_timeout(self.d.planner, req, self.cfg.planner)
         c.planner_latency_ms = res.latency_ms
-        self._record("plan", raw_plan=res.raw_text, plan_error=res.error)
+        # Reasoning trace (prompt, raw output, parsed chain) for the dashboard.
+        trace = res.trace.to_dict() if res.trace is not None else None
+        self._record("reasoning_trace", plan_error=res.error, trace=trace)
         if res.chain is None:
             return self._fail(FailureClass.PLANNER_FAILED, res.error or "no plan")
         label = c.detections[res.chain.approach.target_id].label

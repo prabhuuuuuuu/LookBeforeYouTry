@@ -19,8 +19,8 @@ import math
 import re
 import threading
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -72,17 +72,82 @@ class PlanRequest:
 
 
 @dataclass(frozen=True)
+class ReasoningTrace:
+    """What the planner was given and what it said, logged as the ``reasoning_trace``
+    episode event (for the dashboard). ``prompt`` is None for no-model backends (rules)."""
+
+    backend: str  # "rules" | "qwen" | "fake" | class name
+    mode: str  # "loop" (in-FSM, 3 s timeout) | "language" (Qwen demo intro)
+    instruction: str
+    detections: list[dict[str, Any]]
+    prompt: str | None
+    raw_output: str | None
+    chain: dict[str, Any] | None  # parsed chain in the canonical contract form
+    error: str | None
+    latency_ms: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class PlanResult:
     chain: SkillChain | None
     latency_ms: float
     raw_text: str | None
     error: str | None = None  # "timeout" or a validation message
+    trace: ReasoningTrace | None = None
 
 
 class Planner(Protocol):
     def generate(self, request: PlanRequest) -> str:
         """Return the raw model text (expected to be the JSON contract)."""
         ...
+
+
+def chain_to_dict(chain: SkillChain) -> dict[str, Any]:
+    """SkillChain -> the canonical bible 11.1 JSON contract (as a dict)."""
+    return {
+        "skill_chain": [
+            {
+                "skill": "approach",
+                "target_id": chain.approach.target_id,
+                "standoff_mm": chain.approach.standoff_mm,
+            },
+            {"skill": "grasp", "closure": chain.grasp.closure},
+            {"skill": "place", "target_id": chain.place.target_id},
+        ],
+        "notes": chain.notes,
+    }
+
+
+def _detections_summary(dets: Sequence[Detection]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": d.id,
+            "label": d.label,
+            "score": round(d.score, 3),
+            "bbox_xyxy_px": [round(v) for v in d.bbox_xyxy],
+        }
+        for d in dets
+    ]
+
+
+def _backend_name(planner: object) -> str:
+    return str(getattr(planner, "backend_name", type(planner).__name__))
+
+
+def _prompt_of(planner: object, request: PlanRequest) -> str | None:
+    """The prompt a model backend would send for ``request`` (None for rules/fake)."""
+    fn = getattr(planner, "prompt_for", None)
+    if fn is None:
+        return None
+    try:
+        out = fn(request)
+    except Exception:  # the trace must never break planning
+        log.exception("could not build the planner prompt for the trace")
+        return None
+    return out if isinstance(out, str) else None
 
 
 # ------------------------------------------------------------------ prompt
@@ -177,29 +242,74 @@ def parse_skill_chain(text: str, known_ids: set[int] | None = None) -> SkillChai
     )
 
 
-def plan_with_timeout(planner: Planner, request: PlanRequest, cfg: PlannerConfig) -> PlanResult:
-    """Call the planner under the hard timeout, then strictly validate its JSON."""
+def _timed_plan(
+    call: Callable[[], str],
+    to_canonical: Callable[[str], str],
+    request: PlanRequest,
+    timeout_s: float,
+    *,
+    backend: Callable[[], str],
+    prompt: Callable[[], str | None],
+    mode: str,
+) -> PlanResult:
+    """Run ``call`` under ``timeout_s``; ``to_canonical`` maps its raw text to the canonical
+    contract, which ONLY :func:`parse_skill_chain` turns into skills. Always returns a
+    :class:`PlanResult` with a :class:`ReasoningTrace`."""
     t0 = time.perf_counter()
+    raw: str | None = None
+    chain: SkillChain | None = None
+    error: str | None = None
     try:
-        out = run_with_timeout(lambda: planner.generate(request), cfg.timeout_s, "planner")
+        out = run_with_timeout(call, timeout_s, f"planner-{mode}")
     except PlannerTimeoutError:  # the planner's own single-flight timeout (FallbackPlanner)
-        return PlanResult(None, (time.perf_counter() - t0) * 1000, None, "timeout")
+        error = "timeout"
     except Exception as e:  # backend crash -> treated like invalid output
         log.exception("planner backend raised")
-        return PlanResult(None, (time.perf_counter() - t0) * 1000, None, f"backend error: {e}")
+        error = f"backend error: {e}"
+    else:
+        if isinstance(out, TimeoutResult):
+            error = "timeout"
+        else:
+            raw = out
     latency_ms = (time.perf_counter() - t0) * 1000
-    if isinstance(out, TimeoutResult):
-        return PlanResult(None, latency_ms, None, "timeout")
-    try:
-        chain = parse_skill_chain(out, {d.id for d in request.detections})
-    except PlanValidationError as e:
-        return PlanResult(None, latency_ms, out, str(e))
-    return PlanResult(chain, latency_ms, out)
+    if raw is not None:
+        try:
+            chain = parse_skill_chain(to_canonical(raw), {d.id for d in request.detections})
+        except PlanValidationError as e:
+            error = str(e)
+    trace = ReasoningTrace(
+        backend=backend(),
+        mode=mode,
+        instruction=request.instruction,
+        detections=_detections_summary(request.detections),
+        prompt=prompt(),
+        raw_output=raw,
+        chain=chain_to_dict(chain) if chain is not None else None,
+        error=error,
+        latency_ms=latency_ms,
+    )
+    return PlanResult(chain, latency_ms, raw, error, trace)
+
+
+def plan_with_timeout(planner: Planner, request: PlanRequest, cfg: PlannerConfig) -> PlanResult:
+    """In-loop planning: call the planner under the 3 s hard timeout (``cfg.timeout_s``),
+    then strictly validate its JSON. The result carries a :class:`ReasoningTrace`."""
+    return _timed_plan(
+        lambda: planner.generate(request),
+        lambda raw: raw,
+        request,
+        cfg.timeout_s,
+        backend=lambda: _backend_name(planner),  # read after the call (fallback may switch)
+        prompt=lambda: _prompt_of(planner, request),
+        mode="loop",
+    )
 
 
 # ------------------------------------------------------------------ backends
 class FakePlanner:
     """Deterministic planner for mock mode: pick the first non-zone object, place on a zone."""
+
+    backend_name = "fake"
 
     def __init__(
         self, closure: float = 80.0, standoff_mm: float = 40.0, delay_s: float = 0.0
@@ -269,6 +379,8 @@ class RuleBasedPlanner:
     Cost: pure Python, microseconds, no VRAM.
     """
 
+    backend_name = "rules"
+
     def __init__(self, closure: float = 80.0, standoff_mm: float = 40.0) -> None:
         self.closure = closure
         self.standoff_mm = standoff_mm
@@ -327,6 +439,17 @@ class FallbackPlanner:
     @property
     def active_backend(self) -> str:
         return self._names[1] if self._switched else self._names[0]
+
+    @property
+    def backend_name(self) -> str:
+        return self.active_backend
+
+    @property
+    def primary(self) -> Planner:
+        return self._primary
+
+    def prompt_for(self, request: PlanRequest) -> str | None:
+        return _prompt_of(self._fallback if self._switched else self._primary, request)
 
     @property
     def consecutive_timeouts(self) -> int:
@@ -476,6 +599,8 @@ class QwenPlanner:
             raise LBYRError(f"Planner warm-up exceeded {self.cfg.warmup_timeout_s:.0f} s")
         log.info("Planner warm-up in %.0f ms", (time.perf_counter() - t0) * 1000)
 
+    backend_name = "qwen"
+
     def generate(self, request: PlanRequest) -> str:
         return self._generate(request, self.cfg.max_new_tokens, self.cfg.timeout_s)
 
@@ -484,14 +609,25 @@ class QwenPlanner:
         ``max_time`` cut-off, to measure the true full-plan latency. Never use at runtime."""
         return self._generate(request, self.cfg.max_new_tokens, None)
 
+    def _image_scale(self, request: PlanRequest) -> float:
+        if request.image_bgr is None:
+            return 1.0
+        h, w = request.image_bgr.shape[:2]
+        if w * h > self.cfg.max_image_pixels:  # bound visual tokens (latency)
+            return math.sqrt(self.cfg.max_image_pixels / (w * h))
+        return 1.0
+
+    def prompt_for(self, request: PlanRequest) -> str:
+        """The exact text prompt :meth:`generate` sends for ``request`` (reasoning trace)."""
+        return build_planner_prompt(request, bbox_scale=self._image_scale(request))
+
     def _generate(self, request: PlanRequest, max_new_tokens: int, max_time_s: float | None) -> str:
         image: Any | None = None
-        scale = 1.0
+        scale = self._image_scale(request)
         if request.image_bgr is not None:
             image = bgr_to_pil(request.image_bgr)
-            w, h = image.size
-            if w * h > self.cfg.max_image_pixels:  # bound visual tokens (latency)
-                scale = math.sqrt(self.cfg.max_image_pixels / (w * h))
+            if scale != 1.0:
+                w, h = image.size
                 image = image.resize((max(28, round(w * scale)), max(28, round(h * scale))))
         prompt = build_planner_prompt(request, bbox_scale=scale)
         with self._lock:

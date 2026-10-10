@@ -127,6 +127,16 @@ def test_valid_output_goes_through_strict_parser() -> None:
     assert res.chain is not None and res.chain.place.target_id == 5
 
 
+def test_trace_has_the_exact_prompt_sent_raw_output_and_chain() -> None:
+    eng = FakeEngine()
+    cfg = PlannerConfig(max_image_pixels=320 * 240)
+    res = plan_with_timeout(QwenPlanner(cfg, engine=eng), _req(), cfg)
+    t = res.trace
+    assert t is not None and t.backend == "qwen" and t.mode == "loop"
+    assert t.prompt == eng.calls[-1]["prompt"]  # includes the bbox rescale
+    assert t.raw_output == GOOD and t.chain == json.loads(GOOD)
+
+
 def test_joint_angles_and_hallucinated_ids_are_rejected() -> None:
     cfg = PlannerConfig()
     obj = json.loads(GOOD)

@@ -165,6 +165,34 @@ def test_reset_returns_to_primary() -> None:
     assert fb.active_backend == "qwen"
 
 
+# ------------------------------------------------------------------ reasoning trace
+def test_rules_trace_has_inputs_raw_and_chain_but_no_prompt() -> None:
+    res = _plan("put the acrylic block on the place zone")
+    t = res.trace
+    assert t is not None and t.backend == "rules" and t.mode == "loop" and t.prompt is None
+    assert t.instruction == "put the acrylic block on the place zone"
+    assert [d["id"] for d in t.detections] == [1, 2, 3, 5]
+    assert t.raw_output == res.raw_text and t.error is None
+    assert t.chain is not None and t.chain["skill_chain"][0]["target_id"] == 2
+    assert t.to_dict()["chain"] == t.chain
+
+
+def test_trace_on_timeout_and_after_fallback_switch() -> None:
+    fb, primary, cfg = _fb(n=2)
+    primary.delay_s = 0.5
+    first = plan_with_timeout(fb, REQ, cfg)
+    assert first.trace is not None and first.trace.error == "timeout"
+    assert first.trace.backend == "qwen" and first.trace.raw_output is None
+    second = plan_with_timeout(fb, REQ, cfg)  # answered by rules after the switch
+    assert second.trace is not None and second.trace.backend == "rules"
+    assert second.trace.chain is not None
+
+
+def test_default_backend_is_rules() -> None:
+    assert PlannerConfig().backend == "rules"
+    assert isinstance(build_planner(PlannerConfig()), RuleBasedPlanner)
+
+
 # ------------------------------------------------------------------ config / factory
 def test_build_planner_rules_needs_no_torch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "torch", None)  # import torch -> ImportError

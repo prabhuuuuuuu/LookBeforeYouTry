@@ -133,7 +133,9 @@ class PlannerConfig:
     model_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
     model_path: Path | None = None  # local weights only; no downloads at runtime
     max_new_tokens: int = 256
-    backend: str = "qwen"  # "qwen" | "rules" (RuleBasedPlanner, no model, no GPU)
+    # "rules" (RuleBasedPlanner, no model, no GPU) | "qwen". Default rules: Qwen is NOT loaded
+    # unless backend = "qwen" (measured 11.2 s per full plan on the Orin NX, bible 9.2).
+    backend: str = "rules"
     fallback_after_timeouts: int = 3  # qwen -> rules after this many timeouts in a row
     device: str = "cuda"
     max_image_pixels: int = 640 * 480  # overhead frame is downscaled above this (latency)

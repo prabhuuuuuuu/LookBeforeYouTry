@@ -62,6 +62,12 @@ def test_happy_path_reaches_done(tmp_path: Path) -> None:
     assert all(all(k in r for k in REQUIRED_FIELDS) for r in records)
     assert records[-1]["outcome"] == "success"
     assert any(r.get("verdict") == "GRASPED" for r in records)
+    traces = [r for r in records if r["event"] == "reasoning_trace"]
+    assert len(traces) == 1
+    trace = traces[0]["trace"]
+    assert trace["backend"] == "fake" and trace["mode"] == "loop"
+    assert trace["raw_output"] and trace["chain"]["skill_chain"][0]["skill"] == "approach"
+    assert {d["id"] for d in trace["detections"]} >= {trace["chain"]["skill_chain"][0]["target_id"]}
 
 
 def test_slipping_then_grasped_triggers_exactly_one_recovery() -> None:
