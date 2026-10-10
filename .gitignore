@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data (never commit frames, datasets, calibration, episode logs)
+data/frames/
+data/datasets/
+data/calib/
+data/episodes/
+
+# Model weights
+*.engine
+*.onnx
+*.gguf
+*.safetensors
+*.pt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
