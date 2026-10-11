@@ -7,10 +7,13 @@ parameterized recovery instead of retrying blindly. Everything runs on a Jetson 
 There are no cloud calls.
 
 Awign Hackathon 2026, Physical AI track. Project bible: `docs/LookBeforeYouTry-context.md`.
+Repository: https://github.com/prabhuuuuuuu/LookBeforeYouTry
 
 ```
-Planner proposes skill chain -> arm executes -> wrist camera verifies
--> Critic: GRASPED | SLIPPING | EMPTY | OCCLUDED -> FSM recovers (k <= 2) or aborts safely
+Operator instruction ("move the block from A to the place zone")
+-> Qwen2.5-VL-3B picks move(from, to) among taught locations (strict JSON, never joints)
+-> arm executes taught poses -> wrist camera verifies
+-> Critic: GRASPED | SLIPPING | EMPTY | OCCLUDED -> re-grasp +15% (k <= 2) or abort safely
 ```
 
 ## Quick start (laptop, no hardware)
@@ -22,24 +25,35 @@ pytest
 python -m lbyr.main --mock               # one episode: SLIPPING -> +15% closure -> DONE
 python -m lbyr.main --mock --critic-off  # baseline condition
 python -m lbyr.main --mock --script SLIPPING,SLIPPING,SLIPPING   # ends in ABORT + report
+python -m lbyr.demo --dry-run --induce-slip                       # live-demo path, simulated
+python -m lbyr.demo --dry-run --task "move the block from B to A" # language prompting, simulated
 ```
+
+`pytest`: 3 tests (`test_config`, `test_taught`, `test_text_proto` "seeded" checks) assert
+the original unverified calibration templates and fail now that `data/calib/` holds the
+real, verified rig values. Everything else passes without hardware.
 
 Logs go to `data/episodes/<session>/episodes.jsonl`, and decision-point frames go to `frames/`.
 
 Running without `--mock` performs a hardware preflight and lists every open question that
 still blocks real-hardware runs (see `docs/OPEN_QUESTIONS.md`).
 
-## Status
+## Status (2026-10-11)
 
 | Area | State |
 |---|---|
 | Config, FSM + recovery, logging, MockArm (firmware planner port), MotionController (one `m` per segment + DONE, PP-1), taught-pose mode | Implemented and tested |
+| Bridge firmware (XIAO ESP32-C6, text protocol: `DONE`, `q`, extended `S`) + `tools/arm_gui.py` | Running on the board. `data/calib/joints.yaml` verified against the board zeros; `poses.yaml` taught (`home`, `zone_A_*`, `place_*`, gripper open -40° / closed 0°) |
+| SerialArm | Runs on the real board: no DTR/RTS toggling (it reset the ESP32-C6), `q` probe on connect, zeros check, old-firmware refusal, 1 s write timeout, `q` polled only while a move is active, LINK fault only after 3 failed polls/reads in a row or the DONE timeout |
+| Live demo `python -m lbyr.demo` | Brought up on the rig (arm + D435 + Trinet + Qwen2.5-VL + Moondream2), under active testing. Language prompting (web text box / `--task`), web view, episode logs, wrist snapshots |
+| Cameras | D435 overhead (exposure / WB lock, block detector) and Trinet wrist (MJPG 1080p30, raw-JPEG decode, auto-reconnect after USB drops) both open before the arm link; Trinet dewarp needs `trinet_fisheye.yaml` (OQ-9, else raw) |
+| Moondream2Critic (BF16, 378x378 crop), QwenPlanner (Qwen2.5-VL-3B), Qwen3-1.7B language mode, RuleBasedPlanner, `tools/bench_models.py` | Verified on the Orin NX (`pytest -m jetson`). Critic accuracy on real wrist frames is NOT measured yet |
 | Fisheye dewarp, metric geometry, Umeyama hand-eye solve | Implemented and tested |
-| SerialArm (firmware text protocol, zeros checked against `data/calib/joints.yaml`) | Implemented; tested against a fake board and the real sketch compiled on the host (`tests/fw_sim/`). Not yet run on the real board |
-| IkpyIK, Trinet capture | Gated on open hardware questions (OQ-4, OQ-6..12, A-7) |
-| Moondream2Critic (BF16, 378x378 crop at runtime), RuleBasedPlanner (default), Qwen3-1.7B text planner for language mode, QwenPlanner (Qwen2.5-VL, opt-in), memory guard, `reasoning_trace` log event, `tools/bench_models.py` | Implemented; verified on the Orin NX (`pytest -m jetson`). Trials use the rules planner. Critic accuracy on real wrist frames is NOT measured yet. Language-mode planner: Qwen3-1.7B (M-2 closed) |
-| YOLOv11n TensorRT | Stub (TODO, lazy imports) |
-| Bridge firmware (XIAO ESP32-C6, PWM, text protocol: `DONE`, `q`, extended `S`) + `tools/arm_gui.py` (sliders, Save pose as / Go to pose) | Firmware changes NOT yet flashed / tested on the board. `data/calib/joints.yaml` is seeded from the firmware defaults and must be verified against the board's `list` (`verified: true`). `data/calib/poses.yaml` is empty: teach the poses |
+| IkpyIK (IK motion mode) | Gated on open hardware questions (OQ-4); the demo uses taught poses |
+| YOLOv11n TensorRT | Stub (TODO); the demo uses the classical BlockDetector |
+
+Open items: location polygons (`polygon_px`) and table-relative descriptions in
+`poses.yaml`; Critic accuracy on real wrist frames; Trinet fisheye calibration.
 
 ## Layout
 
@@ -56,21 +70,24 @@ data/       calib/ is tracked (joints.yaml, poses.yaml); frames/, datasets/, epi
 ## Motion and taught poses (demo path)
 
 The bridge firmware is the trajectory generator (PP-1). The host sends ONE `m` per motion
-segment and waits for the firmware's `DONE`. The `MotionController` thread polls `q` at
-20 Hz. If no DONE arrives within predicted × 1.5 + 0.5 s, that is a LINK fault and the
-episode aborts. The predicted duration comes from a Python port of the firmware planner
-(`lbyr/arm/fw_planner.py`); `MockArm` runs the same port, so mock timing matches the board.
+segment and waits for the firmware's `DONE`. While a segment is active, the
+`MotionController` thread polls `q` at 20 Hz (idle: no serial traffic). A failed poll is
+logged and retried; 3 failures in a row, or no DONE within predicted × 1.5 + 0.5 s, is a
+LINK fault and the episode aborts. The predicted duration comes from a Python port of the
+firmware planner (`lbyr/arm/fw_planner.py`); `MockArm` runs the same port, so mock timing
+matches the board.
 
-Bring-up on the real arm:
+Bring-up on the real arm (done on our rig; repeat after re-flashing or re-assembly):
 
 1. Flash `firmware/xiao_c6_bridge/Code.ino` (adds `DONE`, `q` and the extended `S` line).
 2. `python tools/arm_gui.py` → Connect → "Sync sliders". Compare every `S,<j>,<zero_us>,...`
    line with `data/calib/joints.yaml`; fix if needed, then set `verified: true`.
    `SerialArm` refuses to move if the board's zeros differ from the file.
 3. Teach the poses: move with the sliders, then "Save pose as..." with the names `home`,
-   `zone_A_pre`, `zone_A_grasp`, `place_pre`, `place`. Use "Go to pose" to check each one.
-4. Edit `data/calib/poses.yaml`: `gripper.open_deg` / `closed_deg` (slider 6 values), and per
-   zone `polygon_px` (overhead image pixels) and `radius_mm` (base axis to zone centre).
+   `zone_A_pre`, `zone_A_grasp`, `place_pre`, `place` (and `zone_B_pre` / `zone_B_grasp`
+   for a location B). Use "Go to pose" to check each one.
+4. Edit `data/calib/poses.yaml`: `gripper.open_deg` / `closed_deg` (slider 6 values) and the
+   `locations` section (below). For `lbyr.main` also per zone `polygon_px` and `radius_mm`.
 5. `python -m lbyr.main` lists anything still missing (preflight).
 
 Taught-mode recovery: +15% closure → joint 6; wrist re-orient 30° → joint 5; lateral 10 mm
@@ -81,20 +98,62 @@ Cartesian space; the grasp pose is unchanged).
 ## Live demo (`python -m lbyr.demo`)
 
 ```bash
-python -m lbyr.demo --dry-run --induce-slip   # rehearsal: MockArm, fake cameras, fake Critic
 python -m lbyr.demo                           # real arm + D435 + Trinet + Qwen + Moondream
+python -m lbyr.demo --task "move the block from A to the place zone"   # Enter runs it
 python -m lbyr.demo --induce-slip             # first grasp loose -> SLIPPING -> re-grasp +15%
-python -m lbyr.demo --no-planner              # skip Qwen (rules planner)
+python -m lbyr.demo --rehearsal               # real arm + cameras, rules planner, fake Critic
+python -m lbyr.demo --planner rules           # real Critic, no Qwen
+python -m lbyr.demo --critic-off              # baseline: no verification
+python -m lbyr.demo --dry-run --induce-slip   # MockArm, fake cameras, fake Critic
 ```
 
-Open `http://<jetson-ip>:8000`: overhead and wrist video, FSM state, Qwen plan (raw and
-parsed), every Critic verdict with its latency, and the recovery steps. Requirements:
-`joints.yaml` with `verified: true`; `poses.yaml` with `home`, `zone_A_pre`,
-`zone_A_grasp`, `place_pre`, `place` and `gripper.open_deg/closed_deg` (closed = on the
-block; re-grasps squeeze 15% further, never past 0° = fully shut). The bridge is
-auto-detected (`--port`). The wrist camera is the first `/dev/video*` that is not the D435
-(`--wrist-dev`). The operator must type `y` to confirm the E-stop. Logs are written to
-`data/episodes/demo-<stamp>/`.
+Startup order: D435 and Trinet open and deliver a first frame, then the arm link, then the
+operator confirms the E-stop (`y`), then Qwen2.5-VL and Moondream2 load (both stay
+resident). Nothing moves until an instruction or Enter. A setup failure stops the camera
+threads and the RealSense pipeline cleanly (exit code 2).
+
+**Web view** `http://<jetson-ip>:8000`: overhead + wrist video, an instruction box with a
+Run button (disabled while an episode runs; new submissions get "busy"), a large outcome
+line (SUCCESS / NONE + reason / ERROR / ABORT), the planner actually used (qwen or rules
+fallback) with its raw and parsed output, every Critic verdict with its latency, the
+recovery steps, RAM and the event log. `GET /snapshot` saves the wrist frame + Critic crop.
+Anyone who can reach the page can start motion: keep it on the lab network.
+
+**Terminal** (between episodes, same queue as the web page): Enter = run (`--task` if
+given, else A -> place), `s` = run with induced slip, `w` = wrist snapshot, `q` = quit, any
+other text = an instruction.
+
+**Language prompting.** Qwen2.5-VL-3B gets the overhead image, the instruction, the
+`locations` list (name + description) and the block location from the detector, and must
+answer strict JSON: `{"action":"move","from":"A","to":"place","reason":"..."}` or
+`{"action":"none","reason":"..."}` (greedy, 30 s timeout). It answers "none" only when no
+block is visible or the instruction names an unlisted place. Location-like names that are
+not taught ("zone C") are refused before Qwen is called, listing the valid names. Planning
+happens before any motion; invalid output or "none" moves nothing. A move runs from.pre →
+from.grasp → close → VERIFY_GRASP → from.pre → VERIFY_HOLD → to.pre → to.grasp → open →
+home with the usual re-grasp recovery.
+
+Locations (`data/calib/poses.yaml`):
+
+```yaml
+locations:
+  A:     {description: "left side of the table", pre: zone_A_pre, grasp: zone_A_grasp}
+  place: {description: "right side of the table", pre: place_pre, grasp: place}
+  # optional per location: polygon_px: [[u, v], ...]  (overhead pixels, >= 3 points):
+  # outlined and labelled on Qwen's image, and used to report where the block is
+```
+
+Write descriptions as the operator sees the table; printed letters on the table also
+help Qwen. Without polygons the block location is reported as "unknown".
+
+**Robustness.** The Trinet can drop off USB and re-enumerate (up to ~20 s): startup waits
+up to 45 s; mid-run the Critic waits 5 s for a fresh frame, else the verdict is OCCLUDED
+(re-queried once, then a safe retreat home). Requirements: `joints.yaml` with
+`verified: true`; taught poses with `gripper.open_deg/closed_deg` (closed = on the block;
+re-grasps squeeze 15% further, never past 0° = fully shut). The bridge is auto-detected
+(`--port`); the wrist camera is the first non-D435 `/dev/video*` (`--wrist-dev`, prefer a
+`/dev/v4l/by-id/...` path). Logs (`data/episodes/demo-<stamp>/episodes.jsonl`) record the
+instruction, Qwen's prompt and raw output, the parsed action, every verdict and the outcome.
 
 ## Jetson install
 
@@ -177,7 +236,8 @@ Planner config (bible 9.2 / 11.1, v1.4):
   (`critic_invalid_retry` event).
 - Every plan is logged as a `reasoning_trace` event in `episodes.jsonl` (prompt, raw output,
   parsed chain).
-- Memory guard: `load_models` logs system RAM (tegrastats) at startup and after each load.
+- Memory guard (`lbyr.main`; the live demo only warns, see below): `load_models` logs
+  system RAM (tegrastats) at startup and after each load.
   With `backend: qwen` or `language_mode`, it refuses to start if less than
   `planner.qwen_min_free_ram_mb` (1.5 GB) is free.
 
@@ -200,5 +260,11 @@ Pinning the clocks (GPU to 1173 MHz, about 3x) gave only ~10%. All models decode
 (HF `generate`), not compute. Post-hackathon option: a llama.cpp / TensorRT-LLM backend for
 the language planner. Not for now.
 
-Trials use the rules planner (Qwen2.5-VL never meets the 3 s in-loop timeout here). Critic
-accuracy on real wrist frames is NOT measured yet.
+`lbyr.main` trials use the rules planner (Qwen2.5-VL never meets the 3 s in-loop timeout
+here). The live demo uses Qwen2.5-VL once per instruction, arm idle, 30 s timeout.
+
+Live demo, Qwen2.5-VL-3B + Moondream2 both resident (bf16, observed on the rig
+2026-10-11): ~14.5 GB of system RAM used, under 1 GB free. The demo warns below 0.8 GB free
+instead of refusing. Unloading Qwen did not return memory on the Jetson (RAM stayed ~14.5
+GB after "freed"), and a reload costs ~11 s, so Qwen stays loaded for the whole session.
+Critic accuracy on real wrist frames is NOT measured yet.
