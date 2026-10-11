@@ -11,8 +11,16 @@ HOW TO USE (on the Jetson; OFFLINE: no arm, and NOT while lbyr.demo is running)
         python tools/train_critic_probe.py --limit 2             # smoke test (2 per class/split)
         python tools/train_critic_probe.py --crop 0.2,0.1,0.6,0.8
         python tools/train_critic_probe.py --reuse-emb runs/critic_probe_<ts>/emb.pt
+        python tools/train_critic_probe.py --extra ~/critic_auto   # + auto-labelled crops
     Data: <data>/{GRASPED,SLIPPING,EMPTY,OCCLUDED}/*.{jpg,jpeg,png} (default ~/critic_raw).
     Per class the filenames are SORTED: the first 30 = train, the last 15 = test.
+    --extra: <extra>/<CLASS>/<episode>_<name>.jpg (tools/autolabel.py, cloud labels, 378x378
+    runtime crops). Split BY EPISODE (seeded shuffle of the episode ids): 80% of the episodes
+    -> added to train, 20% -> "runtime-test". Two probes are trained (without / with the extra
+    train images) and both are scored on the original test set and on the runtime-test split.
+    The probe WITH --extra is the one saved; the previous ~/models/critic_probe.pt is first
+    backed up to critic_probe_v1.pt (never overwritten once it exists; every run also keeps a
+    copy in its run dir).
 
 WHAT IT DOES
     1. Loads each image (cv2.imread; None or mean < 5 -> lbyr decode_wrist_jpeg). 1920x1080
@@ -70,9 +78,10 @@ log = logging.getLogger("train_critic_probe")
 class Sample:
     path: Path
     label: str
-    split: str  # "train" | "test"
+    split: str  # "train" | "test" | "extra_train" | "rt_test" (--extra)
     condition: str = ""  # e.g. bright/dim/side, parsed from s<n>_<LABEL>_<obj>_<cond>_...
     image: np.ndarray | None = field(default=None, repr=False)  # post-crop BGR
+    episode: str = ""  # --extra: episode id (filename prefix before the first "_")
 
 
 # ------------------------------------------------------------------ data
@@ -95,6 +104,40 @@ def list_samples(root: Path, n_train: int, n_test: int, limit: int | None) -> li
         for split, group in (("train", train), ("test", test)):
             out += [Sample(p, label, split, _condition(p, label)) for p in group]
     return out
+
+
+def list_extra(
+    root: Path, test_frac: float, seed: int, limit: int | None
+) -> tuple[list[Sample], list[str], list[str]]:
+    """Auto-labelled crops, split BY EPISODE: (samples, train episodes, runtime-test episodes).
+
+    Episode id = filename prefix before the first "_" (``<episode>_<name>.jpg``). The sorted
+    episode ids are shuffled with ``seed``; round(test_frac * n) of them (at least 1 when there
+    are >= 2, never all) form the runtime-test split, so no episode is on both sides."""
+    import random
+
+    files: list[tuple[Path, str, str]] = []
+    for label in CLASSES:
+        group = sorted(p for p in (root / label).glob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
+        files += [(p, label, p.stem.split("_", 1)[0]) for p in group]
+    if not files:
+        raise SystemExit(f"--extra: no images in {root}/<CLASS>/")
+    episodes = sorted({e for _, _, e in files})
+    random.Random(seed).shuffle(episodes)
+    n_test = min(len(episodes) - 1, max(1, round(test_frac * len(episodes))))
+    test_eps = set(episodes[:n_test]) if len(episodes) >= 2 else set()
+    if not test_eps:
+        print(f"WARNING: --extra has {len(episodes)} episode(s): no runtime-test split")
+    out: list[Sample] = []
+    per: Counter[tuple[str, str]] = Counter()
+    for p, label, ep in files:
+        split = "rt_test" if ep in test_eps else "extra_train"
+        if limit is not None and per[(label, split)] >= limit:
+            continue
+        per[(label, split)] += 1
+        out.append(Sample(p, label, split, episode=ep))
+    train_eps = sorted(set(episodes) - test_eps)
+    return out, train_eps, sorted(test_eps)
 
 
 def _condition(path: Path, label: str) -> str:
@@ -386,6 +429,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"probe file (default {DEFAULT_OUT}; with --limit: <run dir>/critic_probe.pt)",
     )
+    ap.add_argument(
+        "--extra",
+        type=Path,
+        default=None,
+        help="auto-labelled class folders (tools/autolabel.py, e.g. ~/critic_auto)",
+    )
+    ap.add_argument(
+        "--extra-test-frac", type=float, default=0.2, help="--extra episodes held out (0.2)"
+    )
     ap.add_argument("--runs-dir", type=Path, default=REPO / "runs")
     ap.add_argument("--reuse-emb", type=Path, default=None, help="emb.pt from an earlier run")
     ap.add_argument("--steps", type=int, default=500)
@@ -428,10 +480,25 @@ def main(argv: list[str] | None = None) -> int:
     print(f"run dir: {run_dir}\ncrop box: {box or 'centred square'} -> {ccfg.crop_size_px} px")
 
     samples = list_samples(data, args.train, args.test, args.limit)
+    extra_eps: tuple[list[str], list[str]] = ([], [])
+    if args.extra is not None:
+        if not 0.0 < args.extra_test_frac < 1.0:
+            raise SystemExit("--extra-test-frac must be in (0, 1)")
+        extra, tr_eps, rt_eps = list_extra(
+            args.extra.expanduser(), args.extra_test_frac, args.seed, args.limit
+        )
+        extra_eps = (tr_eps, rt_eps)
+        samples += extra
+        print(f"--extra: {len(extra)} images, {len(tr_eps)} train episodes, "
+              f"{len(rt_eps)} runtime-test episodes {rt_eps}")  # fmt: skip
     facts = preprocess(samples, box, ccfg.crop_size_px)
     train = [s for s in samples if s.split == "train"]
     test = [s for s in samples if s.split == "test"]
     print(f"train {len(train)}, test {len(test)}; dewarp: {facts['dewarp']}")
+    if args.extra is not None:
+        n_xtr = sum(s.split == "extra_train" for s in samples)
+        n_rt = sum(s.split == "rt_test" for s in samples)
+        print(f"extra train {n_xtr}, runtime-test {n_rt}")
 
     # -- model (runtime loader, bf16) + embeddings
     model: Any = None
@@ -467,13 +534,22 @@ def main(argv: list[str] | None = None) -> int:
         run_dir / "emb.pt",
     )
 
-    # -- probe
-    idx_tr = [i for i, s in enumerate(samples) if s.split == "train"]
-    idx_te = [i for i, s in enumerate(samples) if s.split == "test"]
-    y_tr = torch.tensor([CLASSES.index(samples[i].label) for i in idx_tr])
-    probe = train_probe(emb[idx_tr], y_tr, args.steps, args.lr, args.weight_decay, args.seed)
-    print(f"probe: train acc {probe['train_acc']:.3f}, final loss {probe['final_loss']:.4f}")
+    # -- probe(s): without --extra (original train) and, with --extra, original + extra train
+    def idx(split: str) -> list[int]:
+        return [i for i, s in enumerate(samples) if s.split == split]
+
+    def fit(ids: list[int]) -> dict[str, Any]:
+        y = torch.tensor([CLASSES.index(samples[i].label) for i in ids])
+        return train_probe(emb[ids], y, args.steps, args.lr, args.weight_decay, args.seed)
+
+    idx_tr, idx_te, idx_xtr, idx_rt = idx("train"), idx("test"), idx("extra_train"), idx("rt_test")
+    probe = base = fit(idx_tr)
+    print(f"probe: train acc {base['train_acc']:.3f}, final loss {base['final_loss']:.4f}")
+    if args.extra is not None:
+        probe = fit(idx_tr + idx_xtr)
+        print(f"probe+extra: train acc {probe['train_acc']:.3f} (n={len(idx_tr) + len(idx_xtr)})")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_probe(out_path, run_dir) if args.extra is not None else None
     torch.save(
         {
             "weights": probe["weights"],  # (4, 1152); logits = ((e - mean) / std) @ W.T + b
@@ -486,17 +562,26 @@ def main(argv: list[str] | None = None) -> int:
             "embed_fn_name": EMBED_FN_NAME,
             "model_path": str(model_path),
             "dtype": "bf16",
-            "n_train": len(idx_tr),
+            "n_train": len(idx_tr) + (len(idx_xtr) if args.extra is not None else 0),
+            "extra": str(args.extra) if args.extra is not None else None,
+            "extra_train_episodes": extra_eps[0],
             "created": ts,
         },
         out_path,
     )
-    print(f"probe saved: {out_path}")
-    probe_preds, probe_lat = [], []
-    for i in idx_te:
-        t0 = time.perf_counter()
-        probe_preds.append(CLASSES[probe_predict(probe, emb[i])])
-        probe_lat.append(emb_lat[i] + (time.perf_counter() - t0) * 1000)
+    print(f"probe{'+extra' if args.extra is not None else ''} saved: {out_path}")
+    if backup:
+        print(backup)
+
+    def predict(p: dict[str, Any], ids: list[int]) -> tuple[list[str], list[float]]:
+        preds, lat = [], []
+        for i in ids:
+            t0 = time.perf_counter()
+            preds.append(CLASSES[probe_predict(p, emb[i])])
+            lat.append(emb_lat[i] + (time.perf_counter() - t0) * 1000)
+        return preds, lat
+
+    probe_preds, probe_lat = predict(base, idx_te)
 
     # -- zero-shot (same model object, runtime Critic wrapper + warm-up)
     zs: list[tuple[str, str, float]] = []
@@ -510,27 +595,45 @@ def main(argv: list[str] | None = None) -> int:
     # -- outputs
     labels = [s.label for s in test]
     results = [("probe", probe_preds, probe_lat)]
+    extra_preds: list[str] = []
+    rt: list[tuple[str, list[str], list[float]]] = []  # runtime-test split (--extra)
+    if args.extra is not None:
+        extra_preds, extra_lat = predict(probe, idx_te)
+        results.append(("probe+extra", extra_preds, extra_lat))
+        if idx_rt:
+            rt = [("probe", *predict(base, idx_rt)), ("probe+extra", *predict(probe, idx_rt))]
     if zs:
         results.append(("zeroshot", [p for p, _, _ in zs], [ms for _, _, ms in zs]))
     import cv2
 
-    for method, preds, _ in results:
-        for s, p in zip(test, preds, strict=True):
-            if p != s.label and s.image is not None:
-                name = f"{method}_{s.label}_as_{p}_{s.path.stem}.jpg"
-                cv2.imwrite(str(run_dir / "misclassified" / name), s.image)
+    rt_samples = [samples[i] for i in idx_rt]
+    for group, res in ((test, results), (rt_samples, rt)):
+        for method, preds, _ in res:
+            for s, p in zip(group, preds, strict=True):
+                if p != s.label and s.image is not None:
+                    tag = "rt_" if s.split == "rt_test" else ""
+                    name = f"{tag}{method}_{s.label}_as_{p}_{s.path.stem}.jpg"
+                    cv2.imwrite(str(run_dir / "misclassified" / name), s.image)
     with (run_dir / "predictions.csv").open("w", newline="") as f:
         wr = csv.writer(f)
         wr.writerow(
-            ["path", "label", "condition", "probe", "probe_ms", "zeroshot", "zs_raw", "zs_ms"]
-        )
+            ["path", "split", "label", "condition", "probe", "probe_ms", "probe_extra", "zeroshot",
+             "zs_raw", "zs_ms"]
+        )  # fmt: skip
         for k, s in enumerate(test):
             z = zs[k] if zs else ("", "", float("nan"))
             wr.writerow(
-                [s.path, s.label, s.condition, probe_preds[k], f"{probe_lat[k]:.1f}", z[0], z[1],
-                 f"{z[2]:.1f}"]
+                [s.path, "test", s.label, s.condition, probe_preds[k], f"{probe_lat[k]:.1f}",
+                 extra_preds[k] if extra_preds else "", z[0], z[1], f"{z[2]:.1f}"]
+            )  # fmt: skip
+        for k, s in enumerate(rt_samples):
+            wr.writerow(
+                [s.path, "rt_test", s.label, s.episode, rt[0][1][k], f"{rt[0][2][k]:.1f}",
+                 rt[1][1][k], "", "", ""]
             )  # fmt: skip
     md = summary_md(args, facts, box, samples, probe, out_path, results, labels, ccfg.timeout_s)
+    if args.extra is not None:
+        md += extra_md(args, samples, extra_eps, results, labels, rt, backup)
     (run_dir / "summary.md").write_text("\n".join(md) + "\n")
     print("\n".join(md))
     print(f"\nwrote {run_dir / 'summary.md'}")
@@ -578,7 +681,11 @@ def summary_md(
             + " |"
         )
     md.append("")
-    lat_label = {"probe": "vision encoder + head", "zeroshot": "full Moondream query"}
+    lat_label = {
+        "probe": "vision encoder + head",
+        "probe+extra": "vision encoder + head",
+        "zeroshot": "full Moondream query",
+    }
     rows = []
     for method, preds, lat in results:
         sec, r = method_report(method, lat_label[method], labels, preds, lat)
@@ -596,6 +703,74 @@ def summary_md(
         "Latency excludes image load, dewarp and crop (identical for both, ~1-3 ms). "
         "Misclassified test images (post-crop): `misclassified/`. Per-image: `predictions.csv`.",
     ]
+    return md
+
+
+def backup_probe(out_path: Path, run_dir: Path) -> str | None:
+    """Before overwriting ``out_path``: copy it to ``<stem>_v1.pt`` next to it (only if that
+    does not exist yet, so v1 stays the first probe) and always into ``run_dir``."""
+    import shutil
+
+    if not out_path.is_file():
+        return None
+    shutil.copy2(out_path, run_dir / f"previous_{out_path.name}")
+    v1 = out_path.with_name(f"{out_path.stem}_v1{out_path.suffix}")
+    if v1.exists():
+        return f"previous probe kept in {run_dir / f'previous_{out_path.name}'} ({v1} exists)"
+    shutil.copy2(out_path, v1)
+    return f"previous probe backed up to {v1}"
+
+
+def extra_md(
+    args: argparse.Namespace,
+    samples: list[Sample],
+    extra_eps: tuple[list[str], list[str]],
+    results: list[tuple[str, list[str], list[float]]],
+    labels: list[str],
+    rt: list[tuple[str, list[str], list[float]]],
+    backup: str | None,
+) -> list[str]:
+    """--extra section: split composition, then accuracy of both probes on both test sets."""
+    tr_eps, rt_eps = extra_eps
+    md = [
+        "",
+        f"# --extra `{args.extra}` (auto-labelled runtime crops, split by episode)",
+        "",
+        f"- Episodes: {len(tr_eps)} train, {len(rt_eps)} runtime-test ({', '.join(rt_eps)}); "
+        f"held-out fraction {args.extra_test_frac}, seed {args.seed}",
+        "- Runtime-test labels are the CLOUD labeller's, not human ground truth: (b) measures "
+        "agreement with the cloud labels on unseen episodes.",
+        f"- Saved: the probe trained WITH --extra. {backup or 'No previous probe file.'}",
+        "",
+        "| class | extra train | runtime-test |",
+        "|---|---|---|",
+    ]
+    for c in CLASSES:
+        n_tr = sum(s.label == c and s.split == "extra_train" for s in samples)
+        n_rt = sum(s.label == c and s.split == "rt_test" for s in samples)
+        md.append(f"| {c} | {n_tr} | {n_rt} |")
+    rt_labels = [s.label for s in samples if s.split == "rt_test"]
+    for method, preds, lat in rt:
+        sec, _ = method_report(f"{method} on the runtime-test split", "vision encoder + head",
+                               rt_labels, preds, lat)  # fmt: skip
+        md += ["", *sec]
+
+    def acc(lab: list[str], preds: list[str]) -> str:
+        if not lab:
+            return "n/a"
+        ok = sum(a == b for a, b in zip(lab, preds, strict=True))
+        return f"{ok / len(lab):.3f} ({ok}/{len(lab)})"
+
+    orig = {m: p for m, p, _ in results}
+    on_rt = {m: p for m, p, _ in rt}
+    md += [
+        "## With vs without --extra (4-class accuracy)",
+        "",
+        "| probe | (a) original test | (b) runtime-test |",
+        "|---|---|---|",
+    ]
+    for m, name in (("probe", "without --extra"), ("probe+extra", "with --extra")):
+        md.append(f"| {name} | {acc(labels, orig[m])} | {acc(rt_labels, on_rt.get(m, []))} |")
     return md
 
 

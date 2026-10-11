@@ -42,7 +42,10 @@ FAILED (<class> at <state>). Poses: data/calib/poses.yaml (zero-relative degrees
 Critic backends: probe (default when ~/models/critic_probe.pt exists: Moondream2 vision
 encoder + logistic head, verdict + probabilities, max p < 0.55 = LOW_CONF -> re-query) |
 moondream (zero-shot text) | scripted (no model; --script, e.g.
-"VERIFY_GRASP=EMPTY:0.91,GRASPED:0.95;TRANSPORT=GRASPED,SLIPPING:0.78,SLIPPING:0.81") | off.
+"VERIFY_GRASP=EMPTY:0.91,GRASPED:0.95;TRANSPORT=GRASPED,SLIPPING:0.78,SLIPPING:0.81") | off |
+cloud (OPT-IN, owner-approved exception to edge-only: Anthropic Messages API via urllib, key
+from $ANTHROPIC_API_KEY, --cloud-model; checkpoints only, NO continuous monitor; HTTP failure
+-> TIMEOUT -> re-query; lbyr/ai/critic_cloud.py).
 
 Cost: Qwen2.5-VL-3B bf16 ~6.5 GB, one plan (~11 s, 30 s cap) before the motion; Moondream2
 bf16 ~4.1 GB either way; probe ~90 ms per verdict (monitor ~7 Hz), zero-shot ~0.85 s
@@ -101,6 +104,7 @@ from lbyr.arm.interface import ArmInterface
 from lbyr.config import (
     GRIPPER_INDEX,
     AppConfig,
+    CloudCriticConfig,
     DemoConfig,
     WristCameraConfig,
     mock_profile,
@@ -798,6 +802,7 @@ class Rig:
     wrist_fresh: Callable[[], np.ndarray | None] | None = None  # on-demand decode (real)
     preprocess: Callable[[np.ndarray], np.ndarray] | None = None  # Critic dewarp (if any)
     no_qwen_why: str = "--planner rules"  # shown when the rules planner is used
+    monitor_enabled: bool = True  # False: checkpoints only (cloud Critic), no LIFT/TRANSPORT
 
     def wrist_frame(self) -> np.ndarray | None:
         """Newest full wrist frame: decoded on demand on the real Trinet."""
@@ -857,7 +862,7 @@ class Demo:
         verdicts (never waits on them); a DROP halts the arm and raises DemoAbort."""
         seg = self.motion.command(self.r.joints.fw_to_host_deg(q_fw.tolist()))
         self.q = q_fw.copy()
-        critic = self.r.critic if monitor is not None else None
+        critic = self.r.critic if monitor is not None and self.r.monitor_enabled else None
         if critic is None or monitor is None:
             self._wait_segment(seg, what)
             return
@@ -1419,7 +1424,11 @@ def build_dry_rig(args: argparse.Namespace, dcfg: DemoConfig, status: DemoStatus
     cfg.arm = replace(cfg.arm, joint_min_deg=tuple(lo))
     arm = MockArm(cfg.arm, initial_deg=mock_demo_poses().poses["home"])
     arm.connect()
-    backend = None if args.critic == "off" else scripted_critic(args, dcfg)
+    backend: CriticBackend | None = None
+    if args.critic == "cloud":
+        backend = cloud_critic(args, cfg, status)
+    elif args.critic != "off":
+        backend = scripted_critic(args, dcfg)
     return _finish_rig(
         args, cfg, dcfg, status, arm, mock_joints(), mock_demo_poses(),
         overhead.buffer, wrist.buffer, lambda f: [
@@ -1559,6 +1568,8 @@ def _build_real_rig(
         backend = Moondream2Critic(replace(cfg.critic, model_path=mpath))
     elif args.critic == "scripted":
         backend = scripted_critic(args, dcfg)
+    elif args.critic == "cloud":
+        backend = cloud_critic(args, cfg, status)
     free = ram(status, f"after Critic ({args.critic}) setup")
     if free is not None and free < dcfg.warn_free_ram_mb:  # warn only: Qwen stays resident
         status.event(
@@ -1578,6 +1589,29 @@ def _build_real_rig(
     rig.wrist_fresh = wrist.fresh
     rig.no_qwen_why = no_qwen_why
     return rig
+
+
+def cloud_critic(args: argparse.Namespace, cfg: AppConfig, status: DemoStatus) -> CriticBackend:
+    """OPT-IN cloud Critic (owner-approved exception to edge-only). Raises the worker's
+    CriticConfig.timeout_s to cover two HTTP attempts + the retry pause, and makes one
+    startup request (a bad key / unknown model refuses setup before any motion)."""
+    from lbyr.ai.critic_cloud import CloudCritic
+
+    ccfg = CloudCriticConfig(model=args.cloud_model)
+    backend = CloudCritic(ccfg)  # key from the environment only; never logged
+    cfg.critic = replace(cfg.critic, timeout_s=ccfg.worst_case_s + 1.0)
+    status.event(
+        f"CLOUD Critic {ccfg.model} (checkpoints only, no continuous monitor; "
+        f"{ccfg.timeout_s:.0f} s/attempt, worker timeout {cfg.critic.timeout_s:.0f} s): "
+        "checking the API...",
+        logging.WARNING,
+    )
+    reply = backend.check(cfg.critic.crop_size_px)
+    if reply.text is None:
+        status.event(f"cloud Critic check failed ({reply.error}); continuing", logging.WARNING)
+    else:
+        status.event(f"cloud Critic OK: {reply.text!r} in {reply.latency_ms:.0f} ms")
+    return backend
 
 
 def scripted_critic(args: argparse.Namespace, dcfg: DemoConfig) -> ScriptedCritic:
@@ -1641,10 +1675,13 @@ def _finish_rig(
     stoppers = [*([critic.stop] if critic else []), vram.stop, logger.stop, *stoppers]
     status.event(f"episode log: {logger.jsonl_path}")
     planner = "qwen2.5-vl (resident)" if qwen is not None else "rules"
-    status.set(mode=f"planner={planner} critic={args.critic} {'DRY RUN' if args.dry_run else ''}")
+    model = getattr(backend, "model_label", None)
+    label = f"{args.critic} ({model})" if model else args.critic
+    status.set(mode=f"planner={planner} critic={label} {'DRY RUN' if args.dry_run else ''}")
     return Rig(
         cfg, dcfg, arm, joints, poses, overhead, wrist, detect, critic, qwen, logger, vram,
         status, stoppers, preprocess=preprocess,
+        monitor_enabled=not getattr(backend, "checkpoints_only", False),
     )  # fmt: skip
 
 
@@ -1805,10 +1842,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-planner", action="store_true", help="same as --planner rules")
     p.add_argument(
         "--critic",
-        choices=("probe", "moondream", "scripted", "off"),
+        choices=("probe", "moondream", "scripted", "off", "cloud"),
         default=None,
         help="probe (default if --probe-path exists, else moondream; dry-run: scripted) | "
-        "moondream (zero-shot text) | scripted (fake, no model) | off (baseline)",
+        "moondream (zero-shot text) | scripted (fake, no model) | off (baseline) | "
+        "cloud (OPT-IN Anthropic API, $ANTHROPIC_API_KEY, checkpoints only)",
+    )
+    p.add_argument(
+        "--cloud-model",
+        default=CloudCriticConfig().model,
+        help=f"--critic cloud model (default {CloudCriticConfig().model})",
     )
     p.add_argument(
         "--probe-path",
@@ -1911,7 +1954,8 @@ def main(argv: list[str] | None = None) -> int:
         log.info("web view on http://%s:%d", dcfg.http_host, web.port)
         if args.critic_note:
             status.event(args.critic_note, logging.WARNING)
-        status.event(f"Critic backend: {args.critic}")
+        cloud = f" ({args.cloud_model})" if args.critic == "cloud" else ""
+        status.event(f"Critic backend: {args.critic}{cloud}")
         try:
             build = build_dry_rig if args.dry_run else build_real_rig
             rig = build(args, dcfg, status)

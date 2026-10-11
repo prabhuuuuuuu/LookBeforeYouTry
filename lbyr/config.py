@@ -345,6 +345,39 @@ class MotionConfig:
 
 
 @dataclass
+class CloudCriticConfig:
+    """OPT-IN cloud Critic (Anthropic Messages API, stdlib urllib). Owner-approved exception
+    to the edge-only rule (CLAUDE.md rule 1, 2026-10-11): never a default, never in the
+    continuous monitor (checkpoints only), plus offline labelling (tools/autolabel.py).
+    The key is read from the environment only and never logged or written to disk."""
+
+    model: str = "claude-haiku-5-5"
+    url: str = "https://api.anthropic.com/v1/messages"
+    api_version: str = "2023-06-01"
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    max_tokens: int = 10
+    temperature: float = 0.0  # LOCKED like every VLM call (rule 6); dropped if the model rejects it
+    # claude-haiku-5-5 thinks by default and spends all max_tokens on thinking (empty text)
+    disable_thinking: bool = True
+    timeout_s: float = 15.0  # per HTTP attempt
+    retry_delay_s: float = 2.0  # one retry on 429 / 5xx (incl. 529 overloaded)
+    jpeg_quality: int = 90
+
+    @property
+    def worst_case_s(self) -> float:
+        """Two attempts + the retry pause: the CriticWorker timeout must cover this."""
+        return 2 * self.timeout_s + self.retry_delay_s
+
+    def validate(self) -> None:
+        if self.temperature != 0.0:
+            raise ConfigError("cloud Critic temperature must be 0")
+        if self.timeout_s <= 0 or self.retry_delay_s < 0 or self.max_tokens < 1:
+            raise ConfigError("cloud Critic: timeout_s > 0, retry_delay_s >= 0, max_tokens >= 1")
+        if not 1 <= self.jpeg_quality <= 100:
+            raise ConfigError("cloud Critic: jpeg_quality must be 1..100")
+
+
+@dataclass
 class RecoveryConfig:
     max_total_recoveries: int = 2  # bible 10: RECOVER(k), k <= 2 per episode
     occluded_wrist_pitch_delta_deg: float = 10.0  # tuning, NOT from bible: cam re-position step

@@ -4,7 +4,8 @@
 planner + deterministic IK motion stack) with an asynchronous visual Critic (Moondream2 on a
 wrist-mounted Trinet camera) that verifies grasps at FSM checkpoints and picks a
 parameterized recovery instead of retrying blindly. Everything runs on a Jetson Orin 16GB.
-There are no cloud calls.
+The runtime makes no cloud calls by default. One opt-in exception exists for the cloud
+Critic and offline auto-labelling (see "Cloud Critic and auto-labelling").
 
 Awign Hackathon 2026, Physical AI track. Project bible: `docs/LookBeforeYouTry-context.md`.
 Repository: https://github.com/prabhuuuuuuu/LookBeforeYouTry
@@ -258,6 +259,41 @@ zero-shot query (Orin NX, smoke test).
 ```bash
 python tools/train_critic_probe.py --limit 2   # smoke test (probe saved in the run dir)
 python tools/train_critic_probe.py             # full run
+```
+
+### Cloud Critic and auto-labelling (OPT-IN, needs network)
+
+The owner approved this exception to the edge-only rule on 2026-10-11. It is never a
+default, and the edge-only runtime path is unchanged. It uses the Anthropic Messages API
+through stdlib `urllib` (no SDK, no new dependencies, `lbyr/ai/critic_cloud.py`). The key is
+read from `$ANTHROPIC_API_KEY` only and is never logged or written to disk. Each request
+sends the 378x378 crop as a base64 JPEG with a fixed one-word prompt, `max_tokens` 10,
+thinking disabled (claude-haiku-5-5 otherwise spends all 10 tokens thinking), and a 15 s
+timeout. Temperature 0 is sent but dropped automatically if the model rejects it
+(claude-haiku-5-5 does). A 429/5xx response is retried once after 2 s. Any other failure
+becomes TIMEOUT, which goes through the usual re-query and then a safe abort. Cost: no VRAM,
+about 1-1.5 s per call (network).
+
+- `python -m lbyr.demo --critic cloud [--cloud-model M]`: checkpoints only (VERIFY_GRASP /
+  VERIFY_HOLD / VERIFY_PLACE), with **no** continuous LIFT/TRANSPORT monitor and therefore
+  no DROP detection. The page shows `critic=cloud (<model>)`. One startup request checks
+  the key and model, and a 4xx refuses setup before anything moves.
+- `tools/autolabel.py` labels the saved demo crops (`data/episodes/demo-*/frames/**/*_crop_*.jpg`;
+  `--dry-run` episodes are skipped) and writes `runs/autolabel_<ts>/labels.csv`, appended
+  and flushed after every image. `--resume` retries only TIMEOUT/INVALID rows; `--rate`
+  defaults to 30 req/min. Each labelled crop is copied to
+  `~/critic_auto/<cloud_verdict>/<episode>_<name>.jpg`, and the tool prints per-class
+  counts and the runtime-vs-cloud agreement matrix.
+- `tools/train_critic_probe.py --extra ~/critic_auto` splits the extra images **by
+  episode** (80% added to train, 20% held out as runtime-test). It reports accuracy on the
+  original test set and on runtime-test, with and without the extra data. It saves the
+  probe trained with the extra data, backing up the previous probe to `critic_probe_v1.pt`.
+  Runtime-test labels are cloud labels, not human ground truth.
+
+```bash
+python tools/autolabel.py --limit 2                 # smoke test (2 requests)
+python tools/autolabel.py --resume                  # label the rest (continues the latest run)
+python tools/train_critic_probe.py --extra ~/critic_auto
 ```
 
 Planner config (bible 9.2 / 11.1, v1.4):
