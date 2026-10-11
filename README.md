@@ -130,8 +130,34 @@ answer strict JSON: `{"action":"move","from":"A","to":"place","reason":"..."}` o
 block is visible or the instruction names an unlisted place. Location-like names that are
 not taught ("zone C") are refused before Qwen is called, listing the valid names. Planning
 happens before any motion; invalid output or "none" moves nothing. A move runs from.pre →
-from.grasp → close → VERIFY_GRASP → from.pre → VERIFY_HOLD → to.pre → to.grasp → open →
-home with the usual re-grasp recovery.
+from.grasp → close → VERIFY_GRASP → from.pre (LIFT, monitored) → VERIFY_HOLD → to.pre
+(TRANSPORT, monitored) → to.grasp → open → VERIFY_PLACE → home with the usual re-grasp
+recovery.
+
+**Critic backend and grasp monitoring.** `--critic probe` is the default when
+`~/models/critic_probe.pt` exists (`tools/train_critic_probe.py`; `--probe-path`). It loads
+Moondream2 once and runs only the vision encoder and a logistic head on the 378x378 crop:
+verdict, all 4 probabilities, ~90 ms. If the max probability is below 0.55 the verdict is
+LOW_CONF, which goes through the usual re-query path. Without the file the demo falls back
+to `moondream` (zero-shot text, unchanged) and shows a warning on the page.
+During LIFT and TRANSPORT the Critic worker re-runs back-to-back on the latest wrist frame
+while the FSM waits for DONE; the motion thread never waits on it. Two consecutive
+SLIPPING/EMPTY verdicts with p >= 0.6 count as a **DROP** (`DemoConfig.drop_consecutive`,
+`drop_min_prob`). The bridge's `m` pre-empts a running move (Code.ino `moveSynced` replaces
+the targets), so the demo halts by sending an `m` to the current position from `q`, opens
+the gripper there, and returns home. A dropped block is not re-grasped. After the release,
+VERIFY_PLACE expects EMPTY; GRASPED/SLIPPING logs `FAILURE: object stuck in gripper`.
+Each verdict (state, verdict, 4 probabilities, latency, crop JPEG path) is written to
+`episodes.jsonl` and shown on the page. Failure lines start with `FAILURE:` (red, also in
+the FAILURES panel), and the episode ends with SUCCESS / RECOVERED (n re-grasps) /
+FAILED (<class> at <state>). The dry run exercises all of this with scripted per-state
+verdicts (`VERDICT:p`):
+
+```bash
+python -m lbyr.demo --dry-run --script "VERIFY_GRASP=EMPTY:0.91,GRASPED:0.95"         # RECOVERED
+python -m lbyr.demo --dry-run --script "TRANSPORT=GRASPED:0.9,SLIPPING:0.78,SLIPPING:0.81"  # DROP
+python -m lbyr.demo --dry-run --script "VERIFY_PLACE=GRASPED:0.93"                    # stuck
+```
 
 Locations (`data/calib/poses.yaml`):
 
@@ -225,8 +251,8 @@ Critic linear probe (offline: no arm I/O, refuses to run while `lbyr.demo` is ru
 to 1920x1080 frames, mean-pools the Moondream2 vision-encoder patch features (global 378 tile),
 trains a 4-class logistic regression (plain torch) to `~/models/critic_probe.pt`, and compares
 it with the zero-shot `CRITIC_PROMPT` on the same test split. Output:
-`runs/critic_probe_<ts>/{summary.md,predictions.csv,emb.pt,misclassified/}`. The probe is NOT
-wired into the runtime. Cost: same ~4.1 GB as the Critic; encoder + head ~86 ms vs ~0.8 s per
+`runs/critic_probe_<ts>/{summary.md,predictions.csv,emb.pt,misclassified/}`. Used by
+`lbyr.demo --critic probe` (the embedding function lives in `lbyr/ai/critic_probe.py`). Cost: same ~4.1 GB as the Critic; encoder + head ~86 ms vs ~0.8 s per
 zero-shot query (Orin NX, smoke test).
 
 ```bash

@@ -9,13 +9,71 @@ from lbyr.demo import main
 def test_demo_dry_run_induced_slip(tmp_path: Path) -> None:
     assert main(["--dry-run", "--induce-slip", "--log-dir", str(tmp_path), "--http-port", "0"]) == 0
     recs = [json.loads(x) for x in next(tmp_path.glob("*/episodes.jsonl")).read_text().splitlines()]
-    assert [r["verdict"] for r in recs if r["event"] == "verdict"] == [
+    assert [r["verdict"] for r in recs if r["event"] == "verdict" and not r.get("monitor")] == [
         "SLIPPING",
         "GRASPED",
         "GRASPED",
+        "EMPTY",  # VERIFY_PLACE
     ]
     assert sum(r["event"] == "recover" for r in recs) == 1
     assert recs[-1]["outcome"] == "success"
+    assert recs[-1]["outcome_label"] == "RECOVERED" and recs[-1]["regrasps"] == 1
+
+
+def _dry(tmp_path: Path, script: str) -> tuple[int, list[dict]]:
+    rc = main(["--dry-run", "--script", script, "--log-dir", str(tmp_path), "--http-port", "0"])
+    recs = [json.loads(x) for x in next(tmp_path.glob("*/episodes.jsonl")).read_text().splitlines()]
+    return rc, recs
+
+
+def test_demo_empty_at_verify_grasp_then_grasped_is_recovered(tmp_path: Path) -> None:
+    rc, recs = _dry(tmp_path, "VERIFY_GRASP=EMPTY:0.91,GRASPED:0.95;VERIFY_HOLD=GRASPED:0.9")
+    assert rc == 0
+    fails = [r for r in recs if r["event"] == "failure"]
+    assert [r["report"] for r in fails] == ["EMPTY at VERIFY_GRASP (EMPTY 0.91) -> re-grasp 1/2"]
+    verdicts = [r for r in recs if r["event"] == "verdict"]
+    assert all(set(r["probs"]) == {"GRASPED", "SLIPPING", "EMPTY", "OCCLUDED"} for r in verdicts)
+    assert all(r["frame"].endswith(".jpg") for r in verdicts)
+    mon = {r["critic_state"] for r in verdicts if r["monitor"] and not r.get("late")}
+    assert mon == {"LIFT", "TRANSPORT"}
+    end = recs[-1]
+    assert end["outcome_label"] == "RECOVERED"
+    assert end["result"] == "RECOVERED (1 re-grasp): A -> place"
+
+
+def test_demo_drop_during_transport_halts_and_retreats_open(tmp_path: Path) -> None:
+    rc, recs = _dry(tmp_path, "TRANSPORT=GRASPED:0.9,SLIPPING:0.78,SLIPPING:0.81")
+    assert rc == 1
+    assert any(r["event"] == "drop_halt" and r["halt"].startswith("m to the current") for r in recs)
+    fails = [r for r in recs if r["event"] == "failure"]
+    assert [r["report"] for r in fails] == ["DROP during TRANSPORT (SLIPPING 0.78, 0.81) -> abort"]
+    labels = [r["target"]["label"] for r in recs if r["event"] == "segment_done"]
+    assert not any(x.startswith(("place_pre", "place @")) for x in labels)  # never arrived
+    assert labels[-3:] == ["halt (drop)", "open gripper (drop abort)", "home (abort, gripper open)"]
+    end = recs[-1]
+    assert end["outcome_label"] == "FAILED"
+    assert end["result"].startswith("FAILED (DROP at TRANSPORT)")
+    assert end["closure_pct"] == 0.0
+
+
+def test_demo_object_stuck_at_verify_place(tmp_path: Path) -> None:
+    rc, recs = _dry(tmp_path, "VERIFY_PLACE=GRASPED:0.93")
+    assert rc == 1
+    fails = [r for r in recs if r["event"] == "failure"]
+    stuck = "object stuck in gripper (GRASPED 0.93 at VERIFY_PLACE)"
+    assert [r["report"] for r in fails] == [stuck]
+    end = recs[-1]
+    assert end["outcome"] == "failed"
+    assert end["result"].startswith("FAILED (GRASPED at VERIFY_PLACE)")
+    assert [r["target"]["label"] for r in recs if r["event"] == "segment_done"][-1] == "home @ 0%"
+
+
+def test_demo_low_conf_requeries_then_aborts(tmp_path: Path) -> None:
+    rc, recs = _dry(tmp_path, "VERIFY_GRASP=GRASPED:0.50")
+    assert rc == 1
+    v = [r["verdict"] for r in recs if r["event"] == "verdict" and not r.get("monitor")]
+    assert v == ["LOW_CONF", "LOW_CONF"]
+    assert recs[-1]["result"].startswith("FAILED (LOW_CONF at VERIFY_GRASP)")
 
 
 def test_demo_dry_run_task_moves_from_to(tmp_path: Path) -> None:

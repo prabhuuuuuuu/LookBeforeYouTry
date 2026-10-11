@@ -15,7 +15,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -40,9 +40,72 @@ class Verdict(str, Enum):
     OCCLUDED = "OCCLUDED"
     TIMEOUT = "TIMEOUT"  # no answer within CriticConfig.timeout_s
     INVALID = "INVALID"  # unparseable answer or backend error
+    LOW_CONF = "LOW_CONF"  # class probabilities given, max < CriticConfig.low_conf_threshold
 
 
 MODEL_CLASSES = (Verdict.GRASPED, Verdict.SLIPPING, Verdict.EMPTY, Verdict.OCCLUDED)
+
+
+@dataclass(frozen=True)
+class CriticOutput:
+    """Structured backend answer (backends with ``classify``: probe, scripted).
+
+    ``probs`` = softmax probability per MODEL_CLASSES value (None = the backend has none,
+    e.g. zero-shot text). The worker turns a max probability below
+    ``CriticConfig.low_conf_threshold`` into LOW_CONF (:func:`apply_confidence`)."""
+
+    verdict: Verdict
+    raw_text: str
+    probs: dict[str, float] | None = None
+
+
+def apply_confidence(verdict: Verdict, probs: dict[str, float] | None, threshold: float) -> Verdict:
+    """LOW_CONF when probabilities exist and the largest is below ``threshold``."""
+    if probs and verdict in MODEL_CLASSES and max(probs.values()) < threshold:
+        return Verdict.LOW_CONF
+    return verdict
+
+
+def parse_script(text: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Scripted-Critic spec -> (default sequence, per-state sequences).
+
+    ``"SLIPPING,GRASPED"`` = one sequence for every state (the old form).
+    ``"VERIFY_GRASP=EMPTY:0.91,GRASPED;TRANSPORT=GRASPED,SLIPPING:0.78,SLIPPING:0.81"`` =
+    per-state sequences (``;``-separated; a part without ``STATE=`` is the default).
+    An entry is ``VERDICT`` or ``VERDICT:p`` (p = probability of that class; the other three
+    share 1 - p). Each sequence repeats its last entry."""
+    default: list[str] = []
+    per_state: dict[str, list[str]] = {}
+    for part in (p.strip() for p in text.split(";")):
+        if not part:
+            continue
+        state, sep, body = part.partition("=")
+        items = [x.strip().upper() for x in (body if sep else part).split(",") if x.strip()]
+        for it in items:
+            word, _, p = it.partition(":")
+            if word not in Verdict.__members__:
+                raise ValueError(f"unknown verdict {word!r} in script entry {it!r}")
+            if p and not 0.0 <= float(p) <= 1.0:
+                raise ValueError(f"probability out of [0, 1] in script entry {it!r}")
+        if not items:
+            raise ValueError(f"empty script part {part!r}")
+        if sep:
+            per_state[state.strip().upper()] = items
+        else:
+            default = items
+    return default, per_state
+
+
+def scripted_output(entry: str) -> CriticOutput:
+    """``"EMPTY:0.91"`` -> EMPTY with probs {EMPTY: 0.91, others 0.03}; ``"EMPTY"`` -> no probs."""
+    word, _, p = entry.partition(":")
+    verdict = parse_verdict(word)
+    probs = None
+    if p:
+        pf = float(p)
+        probs = {c.value: (pf if c.value == word else (1.0 - pf) / 3.0) for c in MODEL_CLASSES}
+    return CriticOutput(verdict, entry, probs)
+
 
 # LOCKED prompt contract (bible 11.2). Do not edit without updating the bible.
 CRITIC_PROMPT = (
@@ -79,25 +142,49 @@ class ScriptedCritic:
     """Test/mock backend: returns scripted answers in order (last one repeats).
 
     ``delay_s`` simulates inference latency (e.g. 2 s to stress the non-blocking design).
+    ``per_state`` (``classify`` only): own sequence per requesting state, e.g. the monitor
+    states LIFT / TRANSPORT, whose call count depends on timing; other states use ``script``.
+    Entries may carry a probability (``"SLIPPING:0.78"``, see :func:`scripted_output`).
     """
 
-    def __init__(self, script: Sequence[Verdict | str], delay_s: float = 0.0) -> None:
+    def __init__(
+        self,
+        script: Sequence[Verdict | str],
+        delay_s: float = 0.0,
+        per_state: Mapping[str, Sequence[str]] | None = None,
+    ) -> None:
         if not script:
             raise ValueError("script must not be empty")
         self._script = [s.value if isinstance(s, Verdict) else s for s in script]
+        self._per_state = {k: list(v) for k, v in (per_state or {}).items() if v}
         self._i = 0
+        self._state_i: dict[str, int] = {}
         self._lock = threading.Lock()
         self.delay_s = delay_s
         self.calls = 0
 
-    def infer(self, image_bgr: np.ndarray, prompt: str) -> str:
+    def _next(self, state: str | None) -> str:
         with self._lock:
-            answer = self._script[min(self._i, len(self._script) - 1)]
-            self._i += 1
             self.calls += 1
+            if state is not None and state in self._per_state:
+                seq, i = self._per_state[state], self._state_i.get(state, 0)
+                self._state_i[state] = i + 1
+            else:
+                seq, i = self._script, self._i
+                self._i += 1
+            return seq[min(i, len(seq) - 1)]
+
+    def infer(self, image_bgr: np.ndarray, prompt: str) -> str:
+        answer = self._next(None).partition(":")[0]
         if self.delay_s:
             time.sleep(self.delay_s)
         return answer
+
+    def classify(self, image_bgr: np.ndarray, state: str) -> CriticOutput:
+        entry = self._next(state)
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        return scripted_output(entry)
 
 
 def _load_moondream2(path: Path, device: str, dtype: str = "fp16") -> Any:
@@ -198,6 +285,7 @@ class CriticRequest:
     image_bgr: np.ndarray  # raw wrist frame (dewarped by the worker)
     state: str  # FSM state that asked
     t_submit: float
+    monitor: bool = False  # produced by the continuous monitor, not submitted by the FSM
 
 
 @dataclass(frozen=True)
@@ -209,6 +297,14 @@ class CriticResult:
     latency_ms: float  # submit -> verdict (includes queueing + dewarp + inference)
     image_bgr: np.ndarray | None = None  # the (dewarped, cropped) image actually judged
     infer_ms: float | None = None  # backend call only (None if it never ran)
+    probs: dict[str, float] | None = None  # per MODEL_CLASSES value (classify backends)
+    monitor: bool = False  # continuous-monitor result (see CriticWorker.start_monitor)
+
+
+@dataclass(frozen=True)
+class _Monitor:
+    state: str
+    source: Callable[[], np.ndarray | None]
 
 
 class CriticWorker(threading.Thread):
@@ -217,6 +313,15 @@ class CriticWorker(threading.Thread):
     ``preprocess`` is the dewarp (None = raw frame). The crop is applied when
     ``cfg.crop_enabled`` (box ``cfg.crop_box_norm``, default centred square), resized to
     ``cfg.crop_size_px``.
+
+    Backends with ``classify(image, state) -> CriticOutput`` (probe, scripted) are called
+    through it (verdict + probs; max prob < ``cfg.low_conf_threshold`` -> LOW_CONF); others
+    through ``infer(image, CRITIC_PROMPT)`` + :func:`parse_verdict`.
+
+    Continuous monitor (:meth:`start_monitor`): while no FSM request is queued, the worker
+    re-runs back-to-back on ``source()`` (latest wrist frame) and posts results with
+    ``monitor=True``. Everything stays on this thread: the FSM only polls, the motion
+    thread is never involved.
     """
 
     def __init__(
@@ -235,8 +340,27 @@ class CriticWorker(threading.Thread):
         self._results: queue.Queue[CriticResult] = queue.Queue()
         self._ids = itertools.count(1)
         self._stop_event = threading.Event()
+        self._monitor: _Monitor | None = None
+        self._monitor_lock = threading.Lock()
 
     # ---- FSM-facing, non-blocking API
+    def start_monitor(self, state: str, source: Callable[[], np.ndarray | None]) -> None:
+        """Judge ``source()`` back-to-back (results tagged ``monitor=True``, ``state``) until
+        :meth:`stop_monitor`. ``source`` runs on the worker thread (it may wait for a fresh
+        frame); None = no frame, retried after 50 ms. Non-blocking."""
+        with self._monitor_lock:
+            self._monitor = _Monitor(state, source)
+
+    def stop_monitor(self) -> None:
+        """Stop monitoring (non-blocking). A call already in flight still posts its result."""
+        with self._monitor_lock:
+            self._monitor = None
+
+    @property
+    def monitoring(self) -> str | None:
+        with self._monitor_lock:
+            return self._monitor.state if self._monitor is not None else None
+
     def submit(self, image_bgr: np.ndarray, state: str) -> int | None:
         """Queue a verification request. Returns its id, or None if the queue is full."""
         req = CriticRequest(next(self._ids), image_bgr, state, time.perf_counter())
@@ -256,16 +380,44 @@ class CriticWorker(threading.Thread):
     # ---- worker thread
     def run(self) -> None:
         while not self._stop_event.is_set():
+            with self._monitor_lock:
+                mon = self._monitor
             try:
-                req = self._requests.get(timeout=0.1)
+                if mon is None:
+                    req = self._requests.get(timeout=0.1)
+                else:  # FSM requests first, then one monitor round
+                    req = self._requests.get_nowait()
             except queue.Empty:
-                continue
+                if mon is None:
+                    continue
+                monitor_req = self._monitor_request(mon)
+                if monitor_req is None:
+                    self._stop_event.wait(0.05)
+                    continue
+                req = monitor_req
             self._results.put(self._process(req))
+
+    def _monitor_request(self, mon: _Monitor) -> CriticRequest | None:
+        t0 = time.perf_counter()
+        try:
+            frame = mon.source()
+        except Exception:
+            log.exception("Critic monitor frame source failed")
+            return None
+        with self._monitor_lock:
+            if self._monitor is not mon:  # stopped / restarted while waiting for the frame
+                return None
+        if frame is None:
+            log.debug("Critic monitor %s: no frame", mon.state)
+            return None
+        return CriticRequest(next(self._ids), frame, mon.state, t0, monitor=True)
 
     def _process(self, req: CriticRequest) -> CriticResult:
         image = req.image_bgr
         raw: str | None = None
         infer_ms: float | None = None
+        probs: dict[str, float] | None = None
+        classify = getattr(self._backend, "classify", None)
         try:
             if self._preprocess is not None:
                 image = self._preprocess(image)
@@ -273,12 +425,18 @@ class CriticWorker(threading.Thread):
                 image = critic_crop(image, self._cfg.crop_box_norm, self._cfg.crop_size_px)
             judged = image
             t0 = time.perf_counter()
-            out = self._runner.run(lambda: self._backend.infer(judged, CRITIC_PROMPT))
+            if classify is not None:
+                out: Any = self._runner.run(lambda: classify(judged, req.state))
+            else:
+                out = self._runner.run(lambda: self._backend.infer(judged, CRITIC_PROMPT))
             infer_ms = (time.perf_counter() - t0) * 1000
             if isinstance(out, TimeoutResult):
                 verdict = Verdict.TIMEOUT
                 if out.busy:
                     log.warning("Critic backend still busy with an abandoned call")
+            elif isinstance(out, CriticOutput):
+                raw, probs = out.raw_text, out.probs
+                verdict = apply_confidence(out.verdict, probs, self._cfg.low_conf_threshold)
             else:
                 raw = out
                 verdict = parse_verdict(out)
@@ -286,9 +444,11 @@ class CriticWorker(threading.Thread):
             log.exception("Critic backend/preprocess failed")
             verdict = Verdict.INVALID
         latency_ms = (time.perf_counter() - req.t_submit) * 1000
-        log.info(
-            "Critic %s: raw=%r -> %s (infer %s ms, total %.0f ms, input %dx%d)",
+        log.log(
+            logging.DEBUG if req.monitor else logging.INFO,
+            "Critic %s%s: raw=%r -> %s (infer %s ms, total %.0f ms, input %dx%d)",
             req.state,
+            " [monitor]" if req.monitor else "",
             raw,
             verdict.value,
             "n/a" if infer_ms is None else f"{infer_ms:.0f}",
@@ -296,7 +456,10 @@ class CriticWorker(threading.Thread):
             image.shape[1],
             image.shape[0],
         )
-        return CriticResult(req.request_id, req.state, verdict, raw, latency_ms, image, infer_ms)
+        return CriticResult(
+            req.request_id, req.state, verdict, raw, latency_ms, image, infer_ms, probs,
+            req.monitor,
+        )  # fmt: skip
 
     def stop(self, timeout: float = 1.0) -> None:
         self._stop_event.set()

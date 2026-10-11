@@ -140,7 +140,7 @@ def classify(state: State, verdict: Verdict) -> FailureClass | None:
     """Map (verify state, verdict) to a failure class, or None for success."""
     if verdict is Verdict.OCCLUDED:
         return FailureClass.OCCLUDED
-    if verdict in (Verdict.TIMEOUT, Verdict.INVALID):
+    if verdict in (Verdict.TIMEOUT, Verdict.INVALID, Verdict.LOW_CONF):
         return FailureClass.CRITIC_UNAVAILABLE
     return _VERDICT_MAP[state][verdict]
 

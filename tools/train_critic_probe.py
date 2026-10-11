@@ -52,11 +52,12 @@ from typing import Any
 
 import numpy as np
 
+from lbyr.ai.critic_probe import EMBED_FN_NAME, make_embed_fn  # shared with the runtime
+
 CLASSES = ("GRASPED", "SLIPPING", "EMPTY", "OCCLUDED")  # == lbyr.ai.critic.MODEL_CLASSES
 OTHER = "OTHER"  # zero-shot INVALID / TIMEOUT
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 RUNTIME_SIZE = (1920, 1080)  # Trinet capture size the runtime crop is defined for
-EMBED_FN_NAME = "moondream2_vis_enc_global378_meanpool729_v1"
 DEFAULT_DATA = Path("~/critic_raw")
 DEFAULT_MODEL = Path("~/models/moondream2")
 DEFAULT_OUT = Path("~/models/critic_probe.pt")
@@ -165,29 +166,6 @@ def preprocess(
 
 
 # ------------------------------------------------------------------ embeddings
-def make_embed_fn(model: Any) -> Callable[[np.ndarray], Any]:
-    """BGR image -> float32 (1152,) CPU tensor. EMBED_FN_NAME; keep both in sync.
-
-    Moondream's own ``prepare_crops`` (same normalization as ``query``), then ``_vis_enc`` on
-    the GLOBAL crop only (index 0: the image resized to 378x378; for a 378x378 input this is
-    the input itself), then the mean over the 729 patch tokens of the post-LN output.
-    """
-    import torch
-
-    from lbyr.ai.imaging import bgr_to_pil
-
-    inner = model.model
-    prepare_crops = sys.modules[type(inner).__module__].prepare_crops
-
-    def embed(image_bgr: np.ndarray) -> torch.Tensor:
-        with torch.inference_mode():
-            crops, _ = prepare_crops(bgr_to_pil(image_bgr), inner.config.vision, inner.device)
-            feats = inner._vis_enc(crops[:1])  # (1, 729, 1152)
-            return feats[0].float().mean(dim=0).cpu()
-
-    return embed
-
-
 def extract_embeddings(
     embed: Callable[[np.ndarray], Any], samples: list[Sample], timeout_s: float
 ) -> tuple[Any, list[float]]:

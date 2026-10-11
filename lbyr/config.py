@@ -276,10 +276,15 @@ class CriticConfig:
     # mounted Trinet (lbyr.demo --crop overrides it). Keep it square in PIXELS: on 16:9,
     # x1 - x0 = (y1 - y0) * 9 / 16, else the resize stretches the image.
     crop_box_norm: tuple[float, float, float, float] | None = None
+    # Backends that return class probabilities (linear probe, scripted "X:p"): a max softmax
+    # probability below this is LOW_CONF (the re-query path, like TIMEOUT / INVALID).
+    low_conf_threshold: float = 0.55
 
     def validate(self) -> None:
         if self.temperature != 0.0:
             raise ConfigError("Critic temperature must be 0 (bible 21.4)")
+        if not 0.0 <= self.low_conf_threshold <= 1.0:
+            raise ConfigError("critic.low_conf_threshold must be in [0, 1]")
         if self.dtype not in CRITIC_DTYPES:
             raise ConfigError(f"critic.dtype must be one of {CRITIC_DTYPES}")
         if self.crop_size_px < 28:
@@ -380,6 +385,14 @@ class DemoConfig:
     # qwen_timeout_s. ~60 tokens for the JSON + one-sentence reason.
     task_max_new_tokens: int = 96
     moondream_path: Path = Path("~/models/moondream2")
+    # Linear probe on Moondream2 vision embeddings (tools/train_critic_probe.py). If this
+    # file exists, `--critic probe` is the default; else moondream (zero-shot) + a warning.
+    probe_path: Path = Path("~/models/critic_probe.pt")
+    # Continuous grasp monitor during LIFT / TRANSPORT: this many CONSECUTIVE monitor
+    # verdicts that are SLIPPING / EMPTY with probability >= drop_min_prob (or no
+    # probabilities: zero-shot) = DROP. Any other verdict resets the streak.
+    drop_consecutive: int = 2
+    drop_min_prob: float = 0.6
     # Qwen stays resident (loaded once): unloading does not return memory on the Jetson
     # (RAM stayed ~14.5 GB used after "freed Qwen") and a reload costs ~11 s. Below this
     # free RAM after both models load: WARNING only, never a refusal.
@@ -390,6 +403,14 @@ class DemoConfig:
     induce_slip_gripper_deg: float = -22.0
     # Rehearsal / --critic scripted: verdicts returned in order (last repeats).
     scripted_verdicts: tuple[str, ...] = ("GRASPED",)
+    # Per-state scripted defaults (overridden by --script STATE=...): the monitor states get
+    # their own sequence (their call count depends on timing); VERIFY_PLACE expects EMPTY.
+    scripted_state_verdicts: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("LIFT", ("GRASPED:0.95",)),
+        ("TRANSPORT", ("GRASPED:0.95",)),
+        ("VERIFY_PLACE", ("EMPTY:0.95",)),
+    )
+    scripted_delay_s: float = 0.05  # fake inference latency (the probe measures ~90 ms)
     snapshot_dir: Path = Path("runs")  # 'w' key / GET /snapshot: runs/<ts>/snap_<n>_*.jpg
     max_regrasps: int = 2  # bible 10: k <= 2
     http_host: str = "0.0.0.0"

@@ -26,14 +26,28 @@ other text = an instruction.
 Web view: http://<jetson>:8000 (overhead + wrist MJPEG, instruction box, state, plan, verdicts).
 
 Sequence (one ``m`` per segment, DONE awaited via the MotionController, PP-1):
-home -> zone_A_pre -> zone_A_grasp -> close -> VERIFY_GRASP -> lift (zone_A_pre) ->
-VERIFY_HOLD -> place_pre -> place -> open -> home. SLIPPING / EMPTY: re-open, re-grasp
-at +15% closure (beyond closed_deg, never past 0 = fully shut), at most 2 times, then
-abort to home holding the gripper. Poses: data/calib/poses.yaml (zero-relative degrees).
+home -> zone_A_pre -> zone_A_grasp -> close -> VERIFY_GRASP -> LIFT (zone_A_pre, monitored)
+-> VERIFY_HOLD -> TRANSPORT (place_pre, monitored) -> place -> open -> VERIFY_PLACE -> home.
+SLIPPING / EMPTY at a verify: re-open, re-grasp at +15% closure (beyond closed_deg, never
+past 0 = fully shut), at most 2 times, then abort to home holding the gripper.
+Monitored segments: the Critic worker judges the latest wrist frame back-to-back while the
+FSM waits for DONE; 2 consecutive SLIPPING / EMPTY (p >= 0.6) = DROP -> halt (an ``m`` to the
+current position from ``q``: the firmware's ``m`` pre-empts a running move), then abort home
+with the gripper OPEN (a dropped block is not re-grasped). VERIFY_PLACE expects EMPTY; still
+GRASPED / SLIPPING = "FAILURE: object stuck in gripper". Every verdict (state, verdict, the 4
+probabilities, latency, crop path) goes to episodes.jsonl and the web page; failure lines
+start with "FAILURE:" (red); the episode end line is SUCCESS / RECOVERED (n re-grasps) /
+FAILED (<class> at <state>). Poses: data/calib/poses.yaml (zero-relative degrees).
+
+Critic backends: probe (default when ~/models/critic_probe.pt exists: Moondream2 vision
+encoder + logistic head, verdict + probabilities, max p < 0.55 = LOW_CONF -> re-query) |
+moondream (zero-shot text) | scripted (no model; --script, e.g.
+"VERIFY_GRASP=EMPTY:0.91,GRASPED:0.95;TRANSPORT=GRASPED,SLIPPING:0.78,SLIPPING:0.81") | off.
 
 Cost: Qwen2.5-VL-3B bf16 ~6.5 GB, one plan (~11 s, 30 s cap) before the motion; Moondream2
-bf16 ~4.1 GB, ~0.85 s per verify (bible 9.2). MJPEG encode ~3 ms per frame per viewer (CPU).
-Exit codes: 0 = DONE, 1 = ABORT, 2 = setup refused (hardware / calibration / models).
+bf16 ~4.1 GB either way; probe ~90 ms per verdict (monitor ~7 Hz), zero-shot ~0.85 s
+(bible 9.2). Monitor: one 378x378 JPEG per verdict (logger thread). MJPEG ~3 ms/frame/viewer.
+Exit codes: 0 = DONE, 1 = ABORT / FAILED, 2 = setup refused (hardware / calibration / models).
 """
 
 from __future__ import annotations
@@ -57,7 +71,14 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from lbyr.ai.critic import CriticBackend, CriticWorker, ScriptedCritic, Verdict
+from lbyr.ai.critic import (
+    CriticBackend,
+    CriticResult,
+    CriticWorker,
+    ScriptedCritic,
+    Verdict,
+    parse_script,
+)
 from lbyr.ai.imaging import critic_crop
 from lbyr.ai.planner import (
     PlanRequest,
@@ -88,7 +109,7 @@ from lbyr.config import (
 from lbyr.errors import CalibrationError, LBYRError, PlanValidationError
 from lbyr.log_setup import setup_logging
 from lbyr.logging_.episodes import EpisodeLogger, VramMonitor, make_record, read_system_ram
-from lbyr.motion.controller import FAULT, MotionController
+from lbyr.motion.controller import FAULT, MOVING, MotionController
 from lbyr.motion.taught import point_in_polygon
 from lbyr.perception.buffers import LatestFrameBuffer
 from lbyr.perception.detector import Detection
@@ -100,10 +121,52 @@ log = logging.getLogger("lbyr.demo")
 REQUIRED = ("home", "zone_A_pre", "zone_A_grasp", "place_pre", "place")
 BLOCK_ID, PLACE_ID = 1, 900
 GOOD = (Verdict.GRASPED, Verdict.SLIPPING, Verdict.EMPTY)  # decisive Critic answers
+NOT_HELD = (Verdict.SLIPPING, Verdict.EMPTY)
+VERDICTS_SHOWN = 60  # web CRITIC panel keeps the newest N (jsonl keeps all)
 
 
 class DemoAbort(LBYRError):
-    """Stop the sequence and retreat to home."""
+    """Stop the sequence and retreat to home.
+
+    ``failure_class`` / ``failure_state`` name the failure for the end line ("FAILED (EMPTY
+    at VERIFY_GRASP)"); None = derived from the message (LINK) and the current state.
+    ``open_gripper``: retreat with the gripper open (DROP: nothing left to hold)."""
+
+    def __init__(
+        self,
+        msg: str,
+        failure_class: str | None = None,
+        failure_state: str | None = None,
+        open_gripper: bool = False,
+    ) -> None:
+        super().__init__(msg)
+        self.failure_class = failure_class
+        self.failure_state = failure_state
+        self.open_gripper = open_gripper
+
+
+def fmt_vote(verdict: str, probs: Mapping[str, float] | None) -> str:
+    """Short vote text: ``EMPTY 0.91``; LOW_CONF shows its top class; no probs: the verdict."""
+    if not probs:
+        return verdict
+    top = verdict if verdict in probs else max(probs, key=lambda k: probs[k])
+    return f"{top} {probs[top]:.2f}"
+
+
+def _probs_str(probs: Mapping[str, float] | None) -> str:
+    """All 4 probabilities: ``[GRASPED 0.03 SLIPPING 0.78 ...]``; ``[no probs]`` (zero-shot)."""
+    if not probs:
+        return "[no probs]"
+    return "[" + " ".join(f"{k} {v:.2f}" for k, v in probs.items()) + "]"
+
+
+def fmt_votes(votes: list[CriticResult]) -> str:
+    """DROP votes: "SLIPPING 0.78, 0.81" (same class) or "SLIPPING 0.78, EMPTY 0.81"."""
+    names = {v.verdict.value for v in votes}
+    if len(names) == 1 and all(v.probs for v in votes):
+        name = names.pop()
+        return f"{name} " + ", ".join(f"{(v.probs or {})[name]:.2f}" for v in votes)
+    return ", ".join(fmt_vote(v.verdict.value, v.probs) for v in votes)
 
 
 # ------------------------------------------------------------------ poses
@@ -277,6 +340,7 @@ class DemoStatus:
     plan: dict[str, Any] = field(default_factory=dict)
     verdicts: list[dict[str, Any]] = field(default_factory=list)
     recovery: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)  # this episode's "FAILURE: ..." lines
     events: list[str] = field(default_factory=list)
     ram: str = "n/a"
     closure_pct: float | None = None
@@ -300,9 +364,12 @@ class DemoStatus:
             self.events.append(f"{time.strftime('%H:%M:%S')} {msg}")
             del self.events[:-40]
 
-    def add(self, key: str, item: Any) -> None:
+    def add(self, key: str, item: Any, keep: int | None = None) -> None:
         with self._lock:
-            getattr(self, key).append(item)
+            items = getattr(self, key)
+            items.append(item)
+            if keep is not None:
+                del items[:-keep]
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -549,7 +616,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>LBYR live</tit
 body{background:#111;color:#ddd;font:14px monospace;margin:10px}
 img{width:49%;border:1px solid #444}#st{font-size:28px;color:#4f4}
 .box{border:1px solid #444;padding:6px;margin:6px 0;white-space:pre-wrap}
-.SLIPPING,.EMPTY,.ABORT{color:#f55}.GRASPED,.DONE{color:#4f4}.OCCLUDED,.TIMEOUT{color:#fa0}
+.SLIPPING,.EMPTY,.ABORT,.FAILED,.fail{color:#f55}.GRASPED,.DONE,.ok{color:#4f4}
+.OCCLUDED,.TIMEOUT,.LOW_CONF,.INVALID{color:#fa0}.fail{font-weight:bold}.recovered{color:#cf4}
 input{background:#222;color:#eee;border:1px solid #555;font:16px monospace;width:60%}
 button{font:16px monospace}#tmsg{color:#fa0}button:disabled{opacity:.4}
 .big{font-size:26px;font-weight:bold;white-space:pre-wrap}.running{color:#8cf}
@@ -560,9 +628,13 @@ maxlength="300"> <button id="go" onclick="runTask()">Run</button> <span id="tmsg
 <div><a href="/snapshot" target="_blank" style="color:#8cf">snapshot</a> &nbsp;
 <span id="mode"></span></div><div>State: <span id="st">?</span> &nbsp; closure <span
 id="cl"></span> &nbsp; RAM <span id="ram"></span></div><div class="box" id="plan"></div>
-<div class="box" id="ver"></div>
+<div class="box fail" id="fl"></div><div class="box" id="ver"></div>
 <div class="box" id="rec"></div><div class="box" id="ev"></div><script>
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function pr(p){return p?' ['+Object.entries(p).map(([k,v])=>k+' '+v.toFixed(2)).join(' ')+']':''}
+function cls(l){return l.includes('FAILURE:')||l.includes('episode FAILED')?'fail':
+(l.includes('episode SUCCESS')||l.includes('episode RECOVERED')?'ok':'')}
+function line(l){const c=cls(l);return c?'<span class="'+c+'">'+esc(l)+'</span>':esc(l)}
 async function runTask(){if(go.disabled)return;go.disabled=true;
 try{const r=await fetch('/task',{method:'POST',
 headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:task.value})});
@@ -578,10 +650,12 @@ const p=s.plan||{};plan.innerHTML=(s.result?'<div class="big '+esc(s.result_kind
 esc(s.result)+'</div>':'')+'<b>PLAN</b> planner: '+esc(p.backend||'-')+' &nbsp; '+
 (p.instruction?'instruction: '+esc(p.instruction)+'\\n':'')+
 esc(p.note||'')+'\\nraw: '+esc(p.raw||'-')+'\\nparsed: '+esc(p.parsed||'-');
-ver.innerHTML='<b>CRITIC</b>\\n'+s.verdicts.map(v=>esc(v.state)+': <span class="'+
-v.verdict+'">'+v.verdict+'</span> ('+v.latency_ms.toFixed(0)+' ms) raw='+esc(v.raw)).join('\\n');
+fl.innerHTML='<b>FAILURES</b>\\n'+(s.failures.map(esc).join('\\n')||'-');
+ver.innerHTML='<b>CRITIC</b>\\n'+s.verdicts.slice(-14).map(v=>esc(v.state)+(v.monitor?
+' (monitor)':'')+': <span class="'+esc(v.verdict)+'">'+esc(v.verdict)+'</span>'+esc(pr(v.probs))+
+' ('+v.latency_ms.toFixed(0)+' ms) '+esc(v.frame||('raw='+v.raw))).join('\\n');
 rec.innerHTML='<b>RECOVERY</b>\\n'+esc(s.recovery.join('\\n')||'-');
-ev.innerHTML='<b>LOG</b>\\n'+esc(s.events.slice(-12).join('\\n'))}catch(e){}}
+ev.innerHTML='<b>LOG</b>\\n'+s.events.slice(-16).map(line).join('\\n')}catch(e){}}
 setInterval(tick,500);tick();</script></body></html>"""
 
 
@@ -747,6 +821,10 @@ class Demo:
         self.frame_n = 0
         self.end_fields: dict[str, Any] = {}  # instruction / parsed action for episode_end
         self.move_desc = ""
+        self.regrasps = 0
+        self.failure: tuple[str, str] | None = None  # (class, state) of the episode's failure
+        self.place_note = ""  # e.g. "place unverified (LOW_CONF)"
+        self.last_vote = ""  # the latest verify answer for FAILURE lines ("EMPTY 0.91")
 
     # ---- logging
     def rec(self, event: str, **kw: Any) -> None:
@@ -761,10 +839,10 @@ class Demo:
         }
         self.r.logger.log(make_record(**{**fields, **kw}))
 
-    def frame(self, image: np.ndarray, tag: str) -> str:
+    def frame(self, image: np.ndarray, tag: str, state: str | None = None) -> str:
         self.frame_n += 1
         return self.r.logger.save_frame(
-            f"{self.episode_id}/{self.frame_n:03d}_{self.s.state}_{tag}.jpg", image
+            f"{self.episode_id}/{self.frame_n:03d}_{state or self.s.state}_{tag}.jpg", image
         )
 
     def state(self, name: str, note: str = "") -> None:
@@ -773,22 +851,90 @@ class Demo:
         self.rec("transition", reason=note)
 
     # ---- motion: one segment, wait for DONE (the motion thread dispatches + polls)
-    def move(self, q_fw: np.ndarray, what: str) -> None:
+    def move(self, q_fw: np.ndarray, what: str, monitor: str | None = None) -> None:
+        """One segment; returns at DONE. ``monitor`` (LIFT / TRANSPORT): the Critic worker
+        judges the latest wrist frame back-to-back meanwhile and this loop polls its
+        verdicts (never waits on them); a DROP halts the arm and raises DemoAbort."""
         seg = self.motion.command(self.r.joints.fw_to_host_deg(q_fw.tolist()))
         self.q = q_fw.copy()
-        t_end = time.perf_counter() + 120.0
+        critic = self.r.critic if monitor is not None else None
+        if critic is None or monitor is None:
+            self._wait_segment(seg, what)
+            return
+        streak: list[CriticResult] = []
+        critic.start_monitor(monitor, self.r.wrist_frame)
+        self.rec("monitor_start", monitor_state=monitor, target={"label": what})
+        try:
+            self._wait_segment(seg, what, lambda: self._watch(critic, seg, monitor, streak))
+        finally:
+            critic.stop_monitor()
+            self.rec("monitor_stop", monitor_state=monitor)
+
+    def _wait_segment(
+        self, seg: int, what: str, tick: Callable[[], None] | None = None, limit_s: float = 120.0
+    ) -> None:
+        t_end = time.perf_counter() + limit_s
         while time.perf_counter() < t_end:
+            if tick is not None:
+                tick()
             ms = self.motion.current()
             if ms.seg_id == seg and ms.phase == FAULT:
-                raise DemoAbort(f"LINK: {what}: {ms.fault}")
+                raise DemoAbort(f"LINK: {what}: {ms.fault}", "LINK")
             if ms.seg_id == seg and ms.done:
                 self.rec("segment_done", target={"label": what})
                 return
             time.sleep(0.02)
-        raise DemoAbort(f"{what}: no DONE within 120 s")
+        raise DemoAbort(f"{what}: no DONE within {limit_s:.0f} s", "LINK")
 
-    def pose(self, name: str, closure: float) -> None:
-        self.move(self.r.poses.pose(name, closure), f"{name} @ {closure:.0f}%")
+    def _watch(
+        self, critic: CriticWorker, seg: int, state: str, streak: list[CriticResult]
+    ) -> None:
+        """Drain the verdict queue (non-blocking); log every verdict; DROP check."""
+        d = self.r.dcfg
+        while (res := critic.poll()) is not None:
+            if not (res.monitor and res.state == state):  # stale (earlier request/monitor)
+                self.log_verdict(res, res.state, late=True)
+                continue
+            self.log_verdict(res, state)
+            p = (res.probs or {}).get(res.verdict.value)
+            if res.verdict in NOT_HELD and (p is None or p >= d.drop_min_prob):
+                streak.append(res)
+            else:
+                streak.clear()
+            if len(streak) >= d.drop_consecutive:
+                critic.stop_monitor()
+                self._halt_for_drop(seg)
+                raise DemoAbort(
+                    f"DROP during {state} ({fmt_votes(streak)}) -> abort",
+                    "DROP",
+                    state,
+                    open_gripper=True,
+                )
+
+    def _halt_for_drop(self, seg: int) -> None:
+        """Stop the running segment. firmware/xiao_c6_bridge/Code.ino: ``m`` -> moveSynced()
+        -> setTarget() REPLACES every joint's target while it moves (one DONE, for the newest
+        command), i.e. a new ``m`` pre-empts. So: command the current (commanded) position
+        from the latest ``q`` (<= 1 poll period old; the joints brake at the planner's
+        acceleration limit and settle there). A segment that already finished is left
+        alone (a segment not yet dispatched is superseded: latest-value buffer)."""
+        ms = self.motion.current()
+        if ms.seg_id == seg and ms.phase != MOVING:
+            self.s.event("DROP: segment already finished, no halt needed", logging.WARNING)
+            self.rec("drop_halt", halt="none: segment already finished")
+            return
+        st = self.r.arm.read_state()
+        cur = list(st.commanded or st.joints)
+        age_ms = (time.perf_counter() - st.t) * 1000
+        self.s.event(f"DROP: halting at the current position (q {age_ms:.0f} ms old)",
+                     logging.WARNING)  # fmt: skip
+        halt = self.motion.command(cur)
+        self.q = np.asarray(self.r.joints.host_to_fw_deg(cur), dtype=float)
+        self.rec("drop_halt", halt="m to the current position from q", q_age_ms=age_ms)
+        self._wait_segment(halt, "halt (drop)", limit_s=30.0)
+
+    def pose(self, name: str, closure: float, monitor: str | None = None) -> None:
+        self.move(self.r.poses.pose(name, closure), f"{name} @ {closure:.0f}%", monitor)
 
     def grip(self, closure: float, what: str) -> None:
         q = self.q.copy()
@@ -796,19 +942,67 @@ class Demo:
         self.s.set(closure_pct=closure)
         self.move(q, f"{what} gripper {closure:.0f}% ({q[GRIPPER_INDEX]:.1f} deg)")
 
+    # ---- Critic logging: every verdict -> jsonl + web (state, verdict, probs, latency, crop)
+    def log_verdict(self, res: CriticResult, state: str, **kw: Any) -> str | None:
+        crop = (
+            self.frame(res.image_bgr, f"crop_{res.verdict.value}", state)
+            if res.image_bgr is not None
+            else None
+        )
+        self.s.add(
+            "verdicts",
+            {"state": state, "verdict": res.verdict.value, "latency_ms": res.latency_ms,
+             "raw": res.raw_text, "probs": res.probs, "frame": crop, "monitor": res.monitor},
+            VERDICTS_SHOWN,
+        )  # fmt: skip
+        text = (
+            f"Critic {state}{' [monitor]' if res.monitor else ''}"
+            f"{' [late]' if kw.get('late') else ''}: {res.verdict.value}"
+            f" {_probs_str(res.probs)} ({res.latency_ms:.0f} ms) crop={crop}"
+        )
+        if res.monitor or kw.get("late"):  # ~7 Hz while monitoring: CRITIC panel + log only
+            log.info("%s", text)
+        else:
+            self.s.event(text)
+        self.rec(
+            "verdict",
+            verdict=res.verdict,
+            verdict_latency_ms=res.latency_ms,
+            critic_state=state,
+            probs=res.probs,
+            raw_text=res.raw_text,
+            critic_infer_ms=res.infer_ms,
+            monitor=res.monitor,
+            frame=crop,
+            **kw,
+        )
+        return crop
+
+    def failure_line(self, cls: str, state: str, text: str, final: bool) -> None:
+        """Log ``FAILURE: <text>`` (red on the page, FAILURES panel) + a jsonl ``failure``."""
+        if final:
+            self.failure = (cls, state)
+        self.s.add("failures", f"FAILURE: {text}")
+        self.s.event(f"FAILURE: {text}", logging.ERROR if final else logging.WARNING)
+        self.rec("failure", failure_class=cls, failure_state=state, report=text, final=final)
+
     # ---- Critic: submit + poll (never a blocking wait on the model)
-    def verify(self, state: str) -> Verdict:
+    def verify(self, state: str, passthrough: Verdict = Verdict.GRASPED) -> Verdict:
+        """Judge one fresh wrist frame. OCCLUDED / INVALID / TIMEOUT / LOW_CONF: re-query
+        once. Critic OFF: returns ``passthrough``. Sets ``last_vote`` for FAILURE lines."""
         self.state(state)
         time.sleep(self.r.dcfg.settle_s)  # frame after the gripper settled
         verdict = Verdict.INVALID
-        for attempt in range(2):  # OCCLUDED / INVALID / TIMEOUT: re-query once
+        for attempt in range(2):
             img = self.r.wrist_frame()  # real Trinet: waits <= fresh_frame_timeout_s
             if img is None and self.r.critic is not None:  # wrist dropped / re-enumerating
                 verdict = Verdict.OCCLUDED
                 why = "no fresh wrist frame (camera reconnecting?)"
+                self.last_vote = "no wrist frame"
                 self.s.add(
                     "verdicts", {"state": state, "verdict": verdict.value, "latency_ms": 0.0,
-                                 "raw": why},
+                                 "raw": why, "probs": None, "frame": None, "monitor": False},
+                    VERDICTS_SHOWN,
                 )  # fmt: skip
                 self.s.event(f"Critic {state}: {why} -> OCCLUDED", logging.WARNING)
                 self.rec("verdict", verdict=verdict, raw_text=None, no_frame=True, attempt=attempt)
@@ -819,45 +1013,39 @@ class Demo:
             if self.r.critic is None:  # Critic OFF baseline (D-7): pass through, verdict null
                 self.s.add(
                     "verdicts",
-                    {"state": state, "verdict": "OFF", "latency_ms": 0.0, "raw": "pass-through"},
-                )
+                    {"state": state, "verdict": "OFF", "latency_ms": 0.0, "raw": "pass-through",
+                     "probs": None, "frame": None, "monitor": False},
+                    VERDICTS_SHOWN,
+                )  # fmt: skip
                 self.s.event(f"Critic OFF: {state} passes through")
                 self.rec("verdict", verdict=None, critic_skipped=True, frame_raw=raw_path)
-                return Verdict.GRASPED
+                return passthrough
             assert img is not None  # None was handled above (Critic on)
             rid = self.r.critic.submit(img, state)
             if rid is None:
-                raise DemoAbort("Critic queue full")
+                raise DemoAbort("Critic queue full", "CRITIC", state)
             deadline = time.perf_counter() + self.r.cfg.critic.timeout_s + 1.0
             res = None
             while res is None and time.perf_counter() < deadline:
                 r = self.r.critic.poll()
-                if r is not None and r.request_id == rid:
-                    res = r
-                else:
+                if r is None:
                     time.sleep(0.02)
-            verdict = res.verdict if res is not None else Verdict.TIMEOUT
-            lat = res.latency_ms if res is not None else 0.0
-            raw = res.raw_text if res is not None else None
-            judged = (
-                self.frame(res.image_bgr, "judged")
-                if res is not None and res.image_bgr is not None
-                else None
-            )
-            self.s.add(
-                "verdicts",
-                {"state": state, "verdict": verdict.value, "latency_ms": lat, "raw": raw},
-            )
-            self.s.event(f"Critic {state}: {verdict.value} ({lat:.0f} ms, raw={raw!r})")
-            self.rec(
-                "verdict",
-                verdict=verdict,
-                verdict_latency_ms=lat,
-                raw_text=raw,
-                frame=judged,
-                frame_raw=raw_path,
-                attempt=attempt,
-            )
+                elif r.request_id == rid:
+                    res = r
+                else:  # a late monitor result / an earlier timed-out request
+                    self.log_verdict(r, r.state, late=True)
+            if res is None:
+                verdict = Verdict.TIMEOUT
+                tmo = self.r.cfg.critic.timeout_s + 1.0
+                self.last_vote = f"no answer within {tmo:.0f} s"
+                self.s.event(f"Critic {state}: TIMEOUT (no answer within {tmo:.0f} s)",
+                             logging.WARNING)  # fmt: skip
+                self.rec("verdict", verdict=verdict, critic_state=state, frame_raw=raw_path,
+                         attempt=attempt)  # fmt: skip
+            else:
+                verdict = res.verdict
+                self.last_vote = fmt_vote(verdict.value, res.probs)
+                self.log_verdict(res, state, frame_raw=raw_path, attempt=attempt)
             if verdict in GOOD:
                 return verdict
         return verdict
@@ -1023,9 +1211,11 @@ class Demo:
         invalid output or "none" -> nothing moves. None: the default A -> place episode."""
         r, d = self.r, self.r.dcfg
         self.episode_id = time.strftime("%Y%m%d-%H%M%S")
+        self.regrasps, self.failure, self.place_note, self.last_vote = 0, None, "", ""
         self.s.set(
             verdicts=[],
             recovery=[],
+            failures=[],
             outcome=None,
             closure_pct=0.0,
             episode=self.s.episode + 1,
@@ -1070,57 +1260,89 @@ class Demo:
                     f"INDUCED SLIP: first grasp at {g:.0f} deg ({closure:.0f}%) only",
                     logging.WARNING,
                 )
-            regrasps = 0
+            mx = d.max_regrasps
             while True:
                 self.state("GRASP", f"closure {closure:.0f}%")
                 self.grip(closure, "close")
-                v = self.verify("VERIFY_GRASP")
+                at = "VERIFY_GRASP"
+                v = self.verify(at)
                 if v is Verdict.GRASPED:
                     self.state("LIFT")
-                    self.pose(src.pre, closure)
-                    v = self.verify("VERIFY_HOLD")
+                    self.pose(src.pre, closure, monitor="LIFT")
+                    at = "VERIFY_HOLD"
+                    v = self.verify(at)
                     if v is Verdict.GRASPED:
                         break
-                if v not in (Verdict.SLIPPING, Verdict.EMPTY):
-                    raise DemoAbort(f"Critic {v.value} after a re-query")
-                if regrasps >= d.max_regrasps:
-                    raise DemoAbort(f"Critic {v.value}: re-grasp budget exhausted ({regrasps})")
-                regrasps += 1
-                closure = base + d.regrasp_step_pct * regrasps
-                step = f"k={regrasps}: {v.value} -> re-open, re-grasp at {closure:.0f}%"
+                what = f"{v.value} at {at} ({self.last_vote})"
+                if v not in NOT_HELD:
+                    raise DemoAbort(f"{what} after a re-query -> abort", v.value, at)
+                if self.regrasps >= mx:
+                    raise DemoAbort(
+                        f"{what} -> abort (re-grasp budget {mx}/{mx} used)", v.value, at
+                    )
+                self.regrasps += 1
+                self.failure_line(v.value, at, f"{what} -> re-grasp {self.regrasps}/{mx}", False)
+                closure = base + d.regrasp_step_pct * self.regrasps
+                step = f"k={self.regrasps}: {v.value} -> re-open, re-grasp at {closure:.0f}%"
                 self.s.add("recovery", step)
                 self.state("RECOVER", step)
-                self.rec("recover", action=step, attempt=regrasps)
+                self.rec("recover", action=step, attempt=self.regrasps)
                 at_grasp = r.poses.poses[src.grasp][:GRIPPER_INDEX]
                 if not np.allclose(self.q[:GRIPPER_INDEX], at_grasp):
                     self.pose(src.grasp, self.s.closure_pct or 0.0)  # back down, holding
                 self.grip(0.0, "re-open")
             self.state("TRANSPORT")
-            self.pose(dst.pre, closure)
+            self.pose(dst.pre, closure, monitor="TRANSPORT")
             self.state("PLACE")
             self.pose(dst.grasp, closure)
             self.grip(0.0, "release")
+            v = self.verify("VERIFY_PLACE", passthrough=Verdict.EMPTY)
+            if v in (Verdict.GRASPED, Verdict.SLIPPING):
+                self.failure_line(
+                    v.value, "VERIFY_PLACE",
+                    f"object stuck in gripper ({self.last_vote} at VERIFY_PLACE)", True,
+                )  # fmt: skip
+            elif v is not Verdict.EMPTY:
+                self.place_note = f"place unverified ({v.value}: {self.last_vote})"
+                self.s.event(f"VERIFY_PLACE inconclusive: {self.place_note}", logging.WARNING)
             self.state("HOME")
             self.pose("home", 0.0)
+            if self.failure is not None:
+                self.finish("failed", "object stuck in gripper after release")
+                return False
             self.finish("success")
             return True
         except DemoAbort as e:
-            self.abort(str(e))
+            self.abort(e)
             return False
 
-    def abort(self, why: str) -> None:
+    def abort(self, e: DemoAbort) -> None:
+        why = str(e)
+        link = e.failure_class == "LINK" or "LINK" in why
+        cls = e.failure_class or ("LINK" if link else "ABORT")
+        at = e.failure_state or self.s.state
+        text = why if e.failure_class not in (None, "LINK") else f"{cls} at {at}: {why} -> abort"
+        self.failure_line(cls, at, text, True)
         self.state("ABORT", why)
         try:
-            if "LINK" in why:
+            if link:
                 self.r.arm.stop()  # unreliable link: brake and hold, no more motion
                 self.s.event("LINK fault: stop sent, servos hold. Keep the E-stop in reach.")
+            elif e.open_gripper:  # DROP: nothing to hold; open where we stopped, then home
+                q = self.q.copy()
+                q[GRIPPER_INDEX] = self.r.poses.gripper_deg(0.0)
+                self.s.set(closure_pct=0.0)
+                self.move(q, "open gripper (drop abort)")
+                q = np.asarray(self.r.poses.poses["home"], dtype=float).copy()
+                q[GRIPPER_INDEX] = self.r.poses.gripper_deg(0.0)
+                self.move(q, "home (abort, gripper open)")
             else:
                 g = self.q[GRIPPER_INDEX]  # keep the gripper: a held block is not dropped
                 q = np.asarray(self.r.poses.poses["home"], dtype=float).copy()
                 q[GRIPPER_INDEX] = g
                 self.move(q, "home (abort)")
-        except Exception as e:
-            self.s.event(f"retreat failed: {e}; stop", logging.ERROR)
+        except Exception as ex:
+            self.s.event(f"retreat failed: {ex}; stop", logging.ERROR)
             try:
                 self.r.arm.stop()
             except Exception:
@@ -1128,13 +1350,38 @@ class Demo:
         self.finish("abort", why)
 
     def finish(self, outcome: str, why: str = "") -> None:
-        """outcome: success | abort | none (planner declined) | rejected (invalid plan)."""
-        state = {"success": "DONE", "abort": "ABORT"}.get(outcome, "NO ACTION")
-        head = {"success": "SUCCESS", "abort": "ABORT", "none": "NONE"}.get(outcome, "ERROR")
-        text = f"{head}: {self.move_desc}" if outcome == "success" else f"{head}: {why}"
-        self.s.set(outcome=outcome, state=state, result=text, result_kind=outcome)
-        self.s.event(f"episode {outcome.upper()} {why}".strip())
-        self.rec("episode_end", outcome=outcome, report=why or None, **self.end_fields)
+        """outcome: success | abort | failed (arm home, e.g. object stuck) | none (planner
+        declined) | rejected (invalid plan). End line: SUCCESS / RECOVERED (n re-grasps) /
+        FAILED (<class> at <state>)."""
+        state = {"success": "DONE", "abort": "ABORT", "failed": "FAILED"}.get(outcome, "NO ACTION")
+        kind = outcome
+        if outcome == "success":
+            n = self.regrasps
+            label = "RECOVERED" if n else "SUCCESS"
+            head = f"RECOVERED ({n} re-grasp{'s' if n != 1 else ''})" if n else "SUCCESS"
+            text = f"{head}: {self.move_desc}" + (f"; {self.place_note}" if self.place_note else "")
+            kind = "recovered" if n else "success"
+        elif outcome in ("abort", "failed"):
+            cls, at = self.failure or ("ABORT", self.s.state)
+            label = "FAILED"
+            text = f"FAILED ({cls} at {at}): {why.removesuffix(' -> abort')}"
+            kind = "abort"
+        else:
+            label = {"none": "NONE"}.get(outcome, "ERROR")
+            text = f"{label}: {why}"
+        self.s.set(outcome=outcome, state=state, result=text, result_kind=kind)
+        self.s.event(f"episode {text}", logging.ERROR if label == "FAILED" else logging.INFO)
+        self.rec(
+            "episode_end",
+            outcome=outcome,
+            outcome_label=label,
+            result=text,
+            report=why or None,
+            regrasps=self.regrasps,
+            failure_class=self.failure[0] if self.failure else None,
+            failure_state=self.failure[1] if self.failure else None,
+            **self.end_fields,
+        )
 
 
 def _trace(res: PlanResult) -> dict[str, Any]:
@@ -1298,7 +1545,13 @@ def _build_real_rig(
             status.event(f"Qwen load failed ({e}): rules planner", logging.ERROR)
         ram(status, "after Qwen load")
     backend: CriticBackend | None = None
-    if args.critic == "moondream":
+    if args.critic == "probe":
+        status.event(f"loading Moondream2 (bf16) + Critic probe {args.probe_path}...")
+        from lbyr.ai.critic_probe import ProbeCritic
+
+        mpath = dcfg.moondream_path.expanduser()
+        backend = ProbeCritic(replace(cfg.critic, model_path=mpath), args.probe_path.expanduser())
+    elif args.critic == "moondream":
         status.event("loading Moondream2 (bf16)...")
         from lbyr.ai.critic import Moondream2Critic
 
@@ -1328,18 +1581,23 @@ def _build_real_rig(
 
 
 def scripted_critic(args: argparse.Namespace, dcfg: DemoConfig) -> ScriptedCritic:
-    """Fake Critic (no model): --script, else SLIPPING,GRASPED with --induce-slip, else
-    DemoConfig.scripted_verdicts."""
+    """Fake Critic (no model). Default sequence (verify states): --script, else
+    SLIPPING,GRASPED with --induce-slip, else DemoConfig.scripted_verdicts. Per-state
+    sequences: DemoConfig.scripted_state_verdicts (LIFT / TRANSPORT GRASPED, VERIFY_PLACE
+    EMPTY), overridden by --script "STATE=..." parts (see parse_script)."""
+    per_state = {k: list(v) for k, v in dcfg.scripted_state_verdicts}
+    default: list[str] = []
     if args.script:
-        script = [v.strip().upper() for v in args.script.split(",") if v.strip()]
+        try:
+            default, given = parse_script(args.script)
+        except ValueError as e:
+            raise LBYRError(f"--script: {e}") from e
+        per_state.update(given)
     elif args.induce_slip:
-        script = ["SLIPPING", "GRASPED"]
-    else:
-        script = list(dcfg.scripted_verdicts)
-    bad = [v for v in script if v not in Verdict.__members__]
-    if bad:
-        raise LBYRError(f"--script: unknown verdicts {bad}")
-    return ScriptedCritic(script, delay_s=0.2)
+        default = ["SLIPPING", "GRASPED"]
+    return ScriptedCritic(
+        default or list(dcfg.scripted_verdicts), delay_s=dcfg.scripted_delay_s, per_state=per_state
+    )
 
 
 def _finish_rig(
@@ -1364,6 +1622,14 @@ def _finish_rig(
             raise LBYRError("--crop needs x0,y0,x1,y1 (normalized 0..1)")
         cfg.critic = replace(cfg.critic, crop_box_norm=(box[0], box[1], box[2], box[3]))
     status.event(f"Critic crop box (normalized): {cfg.critic.crop_box_norm or 'centred square'}")
+    trained = getattr(backend, "trained_crop", cfg.critic.crop_box_norm)
+    if trained != cfg.critic.crop_box_norm:
+        status.event(
+            f"Critic probe was trained on crop {trained or 'centred square'}, runtime crop is "
+            f"{cfg.critic.crop_box_norm or 'centred square'}: accuracy may drop (retrain or "
+            "pass the training box with --crop)",
+            logging.WARNING,
+        )
     critic = None
     if backend is not None:
         critic = CriticWorker(backend, cfg.critic, preprocess=preprocess)
@@ -1539,9 +1805,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-planner", action="store_true", help="same as --planner rules")
     p.add_argument(
         "--critic",
-        choices=("moondream", "scripted", "off"),
+        choices=("probe", "moondream", "scripted", "off"),
         default=None,
-        help="moondream (default; dry-run: scripted) | scripted (fake, no model) | off (baseline)",
+        help="probe (default if --probe-path exists, else moondream; dry-run: scripted) | "
+        "moondream (zero-shot text) | scripted (fake, no model) | off (baseline)",
+    )
+    p.add_argument(
+        "--probe-path",
+        type=Path,
+        default=d.probe_path,
+        help=f"Critic probe file (tools/train_critic_probe.py; default {d.probe_path})",
     )
     p.add_argument("--critic-off", action="store_true", help="same as --critic off (baseline)")
     p.add_argument(
@@ -1573,11 +1846,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             p.error(f"--task: {e}")
     if args.no_planner or args.rehearsal or args.dry_run:
         args.planner = "rules"
+    args.critic_note = None  # shown on the page + log at startup (fallback warning)
     if args.critic is None:
-        args.critic = "scripted" if (args.rehearsal or args.dry_run) else "moondream"
+        if args.rehearsal or args.dry_run:
+            args.critic = "scripted"
+        elif args.probe_path.expanduser().is_file():
+            args.critic = "probe"
+        else:
+            args.critic = "moondream"
+            args.critic_note = (
+                f"WARNING: no Critic probe at {args.probe_path} -> zero-shot Moondream2 "
+                "(slower, less accurate). Train one: python tools/train_critic_probe.py"
+            )
     if args.critic_off:
         args.critic = "off"
-    if args.dry_run and args.critic == "moondream":
+    if args.dry_run and args.critic in ("moondream", "probe"):
         p.error("--dry-run never loads models: use --critic scripted or off")
     return args
 
@@ -1626,6 +1909,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         web.start()
         log.info("web view on http://%s:%d", dcfg.http_host, web.port)
+        if args.critic_note:
+            status.event(args.critic_note, logging.WARNING)
+        status.event(f"Critic backend: {args.critic}")
         try:
             build = build_dry_rig if args.dry_run else build_real_rig
             rig = build(args, dcfg, status)
