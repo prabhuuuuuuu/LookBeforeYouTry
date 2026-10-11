@@ -219,6 +219,21 @@ python tools/bench_models.py --critic-only --critic-crop    # full frame vs 378x
 python tools/bench_models.py --planner-models qwen3-1.7b --combined
 ```
 
+Critic linear probe (offline: no arm I/O, refuses to run while `lbyr.demo` is running):
+`tools/train_critic_probe.py` reads `~/critic_raw/{GRASPED,SLIPPING,EMPTY,OCCLUDED}/*.{jpg,png}`
+(sorted per class: first 30 train, last 15 test), applies the runtime dewarp + `critic_crop`
+to 1920x1080 frames, mean-pools the Moondream2 vision-encoder patch features (global 378 tile),
+trains a 4-class logistic regression (plain torch) to `~/models/critic_probe.pt`, and compares
+it with the zero-shot `CRITIC_PROMPT` on the same test split. Output:
+`runs/critic_probe_<ts>/{summary.md,predictions.csv,emb.pt,misclassified/}`. The probe is NOT
+wired into the runtime. Cost: same ~4.1 GB as the Critic; encoder + head ~86 ms vs ~0.8 s per
+zero-shot query (Orin NX, smoke test).
+
+```bash
+python tools/train_critic_probe.py --limit 2   # smoke test (probe saved in the run dir)
+python tools/train_critic_probe.py             # full run
+```
+
 Planner config (bible 9.2 / 11.1, v1.4):
 
 - `planner.backend: rules | qwen`, default **rules**. Qwen is only loaded with `qwen`.
